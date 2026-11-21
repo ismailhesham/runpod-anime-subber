@@ -419,10 +419,20 @@ def burn_and_compress_native(
             v_args += ["-multipass", "fullres"]  # better quality at the same size
         if "-bf" in caps:
             v_args += ["-bf", "3"]  # B-frames shrink anime encodes noticeably
+        if "-rc-lookahead" in caps:
+            v_args += ["-rc-lookahead", "20"]  # lookahead = noticeably better quality-per-bit
+        if "-tune" in caps:
+            v_args += ["-tune", "hq"]
         if codec == "hevc_nvenc":
             v_args += ["-tag:v", "hvc1"]
+    elif codec == "libx265":
+        # اختيار صريح من الواجهة: وضع «أصغر حجم» — x265 على المعالج بأبطأ إعداد عملي.
+        v_args = ["-c:v", "libx265", "-preset", "slow", "-crf", str(cq), "-pix_fmt", "yuv420p",
+                  "-x265-params", "aq-mode=3", "-tag:v", "hvc1"]
+        if log_cb:
+            log_cb("وضع أصغر حجم: x265 على المعالج (preset slow) — أبطأ بكثير من كرت الشاشة.")
     else:
-        cpu_codec = "libx265" if "hevc" in codec else "libx264"
+        cpu_codec = "libx265" if ("hevc" in codec or "x265" in codec) else "libx264"
         if log_cb:
             log_cb(f"NVENC unavailable; falling back to {cpu_codec}.")
         v_args = ["-c:v", cpu_codec, "-preset", "medium", "-crf", str(cq), "-pix_fmt", "yuv420p"]
