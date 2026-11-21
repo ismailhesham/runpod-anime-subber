@@ -1,16 +1,21 @@
+import hashlib
+import html
 import inspect
 import json
 import os
+import queue
 import re
 import shutil
+import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import gradio as gr
 
 from media_ops import (
+    VIDEO_EXTENSIONS,
     burn_and_compress_native,
     download_torrent_or_url,
     upload_to_doodstream,
@@ -28,12 +33,13 @@ from subtitles_ai import (
 BASE_DIR = Path(__file__).resolve().parent
 FONTS_DIR = BASE_DIR / "fonts"
 STORAGE_ROOT = Path(os.environ.get("RUNPOD_OUTPUT_ROOT", "/workspace/outputs"))
-TEMP_ROOT = Path(os.environ.get("RUNPOD_TEMP_ROOT", "/workspace/tmp_downloads"))
+RAW_CACHE_ROOT = Path(os.environ.get("RUNPOD_RAW_CACHE", "/workspace/raw_episodes"))
+LEGACY_TEMP_ROOT = Path(os.environ.get("RUNPOD_TEMP_ROOT", "/workspace/tmp_downloads"))
 SETTINGS_FILE = Path(os.environ.get("RUNPOD_SETTINGS_FILE", "/workspace/subber_settings.json"))
 
 
 # ==============================================================================
-# SHADOW BLADE THEME (CSS + 60FPS CANVAS VFX ENGINE — CLEAN HUNTER HUD)
+# SHADOW BLADE THEME (CSS + 60FPS CANVAS VFX ENGINE + LIVE PROGRESS HUD)
 # ==============================================================================
 
 SHADOW_BLADE_HEAD = """
@@ -76,7 +82,6 @@ html, body, .gradio-container {
     padding: 16px 20px 36px !important;
 }
 
-/* Screen Shake Effect Class triggered by Canvas VFX */
 body.sb-screen-shake .gradio-container {
     animation: sb-shake-anim 0.42s cubic-bezier(.36,.07,.19,.97) both;
 }
@@ -90,7 +95,6 @@ body.sb-screen-shake .gradio-container {
     75% { transform: translate3d(-2px, 1px, 0); }
 }
 
-/* Fullscreen VFX Canvas & System Notification HUD */
 #sb-global-vfx-canvas {
     position: fixed;
     inset: 0;
@@ -153,7 +157,6 @@ body.sb-screen-shake .gradio-container {
     color: var(--sb-text);
 }
 
-/* Custom Hunter HUD Header */
 .sb-hero-wrap {
     position: relative;
     background: linear-gradient(135deg, rgba(11, 19, 38, 0.96) 0%, rgba(7, 12, 26, 0.98) 100%);
@@ -306,7 +309,6 @@ body.sb-screen-shake .gradio-container {
     box-shadow: 0 0 22px rgba(56, 189, 248, 0.6);
 }
 
-/* Interactive Subtitle Combat Preview Strip (Above Video Player) */
 .sb-combat-stage-card {
     background: var(--sb-panel);
     border: 1px solid rgba(56, 189, 248, 0.24);
@@ -341,7 +343,6 @@ body.sb-screen-shake .gradio-container {
     background: #040710;
 }
 
-/* Panels, Accordions, Inputs, Labels */
 .gradio-container .block,
 .gradio-container .form,
 .gradio-container .gr-box,
@@ -401,7 +402,6 @@ body.sb-screen-shake .gradio-container {
     outline: none !important;
 }
 
-/* Terminal Log & Ready Links Styling */
 #sb-log-box textarea {
     background-color: #03060E !important;
     color: #7DD3FC !important;
@@ -420,10 +420,6 @@ body.sb-screen-shake .gradio-container {
     border: 1px solid rgba(167, 139, 250, 0.32) !important;
     unicode-bidi: plaintext !important;
 }
-
-/* ============================================================================
-   HERO ACTION BUTTONS WITH EMBEDDED 60FPS CANVAS VFX
-   ============================================================================ */
 
 #sb-step1-btn,
 #sb-step2-btn {
@@ -494,7 +490,6 @@ body.sb-screen-shake .gradio-container {
     font-weight: 700 !important;
 }
 
-/* Canvas injected inside Gradio buttons */
 .sb-btn-vfx-canvas {
     position: absolute !important;
     inset: 0 !important;
@@ -510,19 +505,134 @@ body.sb-screen-shake .gradio-container {
     z-index: 2;
 }
 
-/* Checkboxes & Sliders Accent */
 .gradio-container input[type="checkbox"],
 .gradio-container input[type="radio"],
 .gradio-container input[type="range"] {
     accent-color: var(--sb-cyan) !important;
 }
 
-/* Video Player Frame */
 #sb-video-player {
     border: 1px solid rgba(56, 189, 248, 0.3) !important;
     border-radius: 6px !important;
     background: #03060E !important;
     overflow: hidden !important;
+}
+
+/* Native Shadow Blade Live Progress HUD */
+.sb-prog-card {
+    background: linear-gradient(135deg, rgba(11, 19, 38, 0.98) 0%, rgba(5, 10, 22, 0.99) 100%);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    border-right: 4px solid var(--sb-cyan);
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin: 10px 0 12px;
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5), inset 0 0 20px rgba(56, 189, 248, 0.06);
+    direction: rtl;
+}
+.sb-prog-card.sb-mode-violet {
+    border-color: rgba(167, 139, 250, 0.42);
+    border-right-color: var(--sb-violet);
+}
+.sb-prog-card.sb-mode-done {
+    border-color: rgba(52, 211, 153, 0.45);
+    border-right-color: var(--sb-success);
+}
+.sb-prog-card.sb-mode-error {
+    border-color: rgba(251, 113, 133, 0.5);
+    border-right-color: var(--sb-danger);
+}
+.sb-prog-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+.sb-prog-badge {
+    font-family: 'JetBrains Mono', 'Cairo', monospace;
+    font-size: 11.5px;
+    font-weight: 800;
+    color: var(--sb-cyan-bright);
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.32);
+    padding: 2px 9px;
+    border-radius: 4px;
+    display: inline-block;
+    margin-bottom: 4px;
+}
+.sb-mode-violet .sb-prog-badge {
+    color: #DDD6FE;
+    background: rgba(167, 139, 250, 0.14);
+    border-color: rgba(167, 139, 250, 0.38);
+}
+.sb-mode-done .sb-prog-badge {
+    color: #6EE7B7;
+    background: rgba(52, 211, 153, 0.14);
+    border-color: rgba(52, 211, 153, 0.4);
+}
+.sb-mode-error .sb-prog-badge {
+    color: #FDA4AF;
+    background: rgba(251, 113, 133, 0.14);
+    border-color: rgba(251, 113, 133, 0.4);
+}
+.sb-prog-title {
+    font-size: 14.5px;
+    font-weight: 800;
+    color: #F8FAFC;
+}
+.sb-prog-pct {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 28px;
+    font-weight: 900;
+    color: var(--sb-cyan-bright);
+    text-shadow: 0 0 16px rgba(56, 189, 248, 0.55);
+    line-height: 1;
+    direction: ltr;
+}
+.sb-mode-violet .sb-prog-pct {
+    color: #DDD6FE;
+    text-shadow: 0 0 16px rgba(167, 139, 250, 0.55);
+}
+.sb-mode-done .sb-prog-pct {
+    color: var(--sb-success);
+    text-shadow: 0 0 16px rgba(52, 211, 153, 0.5);
+}
+.sb-mode-error .sb-prog-pct {
+    color: var(--sb-danger);
+}
+.sb-prog-track {
+    width: 100%;
+    height: 12px;
+    background: #03060E;
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    border-radius: 999px;
+    overflow: hidden;
+    position: relative;
+}
+.sb-prog-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #38BDF8 0%, #818CF8 60%, #A78BFA 100%);
+    box-shadow: 0 0 14px rgba(56, 189, 248, 0.7);
+    border-radius: 999px;
+    transition: width 0.3s ease;
+}
+.sb-mode-done .sb-prog-fill {
+    background: linear-gradient(90deg, #10B981 0%, #34D399 100%);
+    box-shadow: 0 0 14px rgba(52, 211, 153, 0.65);
+}
+.sb-mode-error .sb-prog-fill {
+    background: var(--sb-danger);
+}
+.sb-prog-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--sb-muted);
+    font-family: 'JetBrains Mono', 'Cairo', monospace;
+    flex-wrap: wrap;
 }
 """
 
@@ -553,7 +663,7 @@ SHADOW_BLADE_HERO_HTML = """
                     <span class="sb-rank-pill">HUNTER HUD · S-RANK</span>
                 </h1>
                 <p class="sb-subtitle-desc">
-                    <strong>المرحلة 1 [STRIKE]:</strong> تحميل التورنت والترجمة بالذكاء الاصطناعي والدمج بـ NVENC للمعاينة
+                    <strong>المرحلة 1 [STRIKE]:</strong> تحميل التورنت (حفظ دائم) والترجمة بالذكاء الاصطناعي والدمج بـ NVENC للمعاينة
                     &nbsp;←&nbsp;
                     <strong>المرحلة 2 [S-PORTAL]:</strong> اعتماد ورفع جميع الجودات واستخراج الروابط
                 </p>
@@ -590,7 +700,6 @@ SHADOW_BLADE_JS = r"""
         return (app && app.shadowRoot) ? app.shadowRoot : document;
     };
 
-    // Clean, high-energy anime action subtitle lines (zero controversial terms)
     const ACTION_SUB_LINES = [
         "حسمتُ أمري... سأتجاوز هذا الاختبار بنفسي الآن!",
         "سرعة مذهلة! بالكاد تمكنتُ من رصد حركة النصل!",
@@ -600,7 +709,6 @@ SHADOW_BLADE_JS = r"""
     let currentSubIdx = 0;
     let stageFlash = 0;
 
-    // 1. Setup Global Fullscreen VFX Canvas
     let globalCanvas = document.getElementById("sb-global-vfx-canvas");
     if (!globalCanvas) {
         globalCanvas = document.createElement("canvas");
@@ -656,7 +764,6 @@ SHADOW_BLADE_JS = r"""
         triggerScreenShake();
         stageFlash = 1.0;
 
-        // Twin crossing blade slashes
         slashes.push({
             x1: cx - 360, y1: cy + 170,
             x2: cx + 360, y2: cy - 170,
@@ -668,11 +775,9 @@ SHADOW_BLADE_JS = r"""
             life: 1.0, color: subColor, width: 5.5
         });
 
-        // Expanding energy shockwaves
         shockwaves.push({ x: cx, y: cy, r: 12, maxR: 340, life: 1.0, color: mainColor });
         shockwaves.push({ x: cx, y: cy, r: 4, maxR: 210, life: 0.9, color: "#F8FAFC" });
 
-        // High-velocity combat sparks
         for (let i = 0; i < 42; i++) {
             const angle = (Math.PI * 2 * i) / 42 + (Math.random() - 0.5) * 0.25;
             const speed = 4 + Math.random() * 11;
@@ -687,7 +792,6 @@ SHADOW_BLADE_JS = r"""
             });
         }
 
-        // Clean tech-combat callouts
         const words = isPortal ? ["S-PORTAL", "UPLOADING", "LINK SYNC"] : ["STRIKE!", "S-RANK", "NVENC ⚡"];
         words.forEach((w, idx) => {
             floatingTags.push({
@@ -701,7 +805,6 @@ SHADOW_BLADE_JS = r"""
         });
     };
 
-    // 2. Attach Live 60fps Canvas Inside Step 1 (STRIKE) & Step 2 (S-PORTAL) Buttons
     const attachButtonCanvas = (btn, type) => {
         if (!btn || btn.dataset.sbVfxBound === "1") return;
         btn.dataset.sbVfxBound = "1";
@@ -761,12 +864,10 @@ SHADOW_BLADE_JS = r"""
             const speedMul = hovered ? 2.4 : 1.0;
 
             if (type === "strike") {
-                // Hunter Glowing Eyes on Left Edge + Mana Lightning Arcs
                 const eyeBaseX = 46;
                 const eyeBaseY = h * 0.5;
                 const pulse = 0.75 + 0.25 * Math.sin(t * 0.005 * speedMul);
 
-                // Dark shadow aura plumes
                 for (let p of particles) {
                     p.y -= p.v * speedMul;
                     if (p.y < -0.1) { p.y = 1.1; p.x = Math.random(); }
@@ -776,7 +877,6 @@ SHADOW_BLADE_JS = r"""
                     ctx.fill();
                 }
 
-                // Glowing Hunter Eyes + Light Trail
                 const drawEye = (ex, ey, tilt) => {
                     ctx.save();
                     ctx.translate(ex, ey);
@@ -799,7 +899,6 @@ SHADOW_BLADE_JS = r"""
                 drawEye(eyeBaseX - 12, eyeBaseY, 0.14);
                 drawEye(eyeBaseX + 12, eyeBaseY, -0.14);
 
-                // Mana Lightning Bolt across button
                 if (Math.random() < (hovered ? 0.55 : 0.22)) {
                     ctx.save();
                     ctx.strokeStyle = hovered ? "#BAE6FD" : "rgba(56, 189, 248, 0.55)";
@@ -820,7 +919,6 @@ SHADOW_BLADE_JS = r"""
                     ctx.restore();
                 }
             } else {
-                // Clean Geometric S-Portal Vortex (No runes, pure tech rings + inward particles)
                 const px = 48;
                 const py = h * 0.5;
                 const rot = t * 0.0024 * speedMul;
@@ -830,7 +928,6 @@ SHADOW_BLADE_JS = r"""
                 ctx.shadowColor = "#A78BFA";
                 ctx.shadowBlur = hovered ? 16 : 9;
 
-                // Outer dashed geometric ring
                 ctx.rotate(rot);
                 ctx.strokeStyle = "rgba(167, 139, 250, 0.75)";
                 ctx.lineWidth = 1.8;
@@ -839,7 +936,6 @@ SHADOW_BLADE_JS = r"""
                 ctx.arc(0, 0, 21, 0, Math.PI * 2);
                 ctx.stroke();
 
-                // Inner counter-rotating cyan hexagon
                 ctx.rotate(-rot * 2.1);
                 ctx.setLineDash([]);
                 ctx.strokeStyle = "rgba(56, 189, 248, 0.85)";
@@ -855,14 +951,12 @@ SHADOW_BLADE_JS = r"""
                 ctx.closePath();
                 ctx.stroke();
 
-                // Core singularity
                 ctx.fillStyle = "#DDD6FE";
                 ctx.beginPath();
                 ctx.arc(0, 0, hovered ? 4.2 : 3, 0, Math.PI * 2);
                 ctx.fill();
                 ctx.restore();
 
-                // Streaming portal particles across button
                 for (let p of particles) {
                     p.a += 0.03 * speedMul;
                     p.x -= p.v * speedMul;
@@ -877,7 +971,6 @@ SHADOW_BLADE_JS = r"""
         };
     };
 
-    // 3. Interactive Anime Combat Subtitle Stage Canvas (Right above Video Preview)
     const renderStageCanvas = (stageCvs, t) => {
         if (!stageCvs) return;
         const rect = stageCvs.getBoundingClientRect();
@@ -894,11 +987,9 @@ SHADOW_BLADE_JS = r"""
         const w = rect.width;
         const h = rect.height;
 
-        // Deep void anime combat backdrop
         ctx.fillStyle = "#040710";
         ctx.fillRect(0, 0, w, h);
 
-        // Speed lines
         ctx.strokeStyle = "rgba(56, 189, 248, 0.09)";
         ctx.lineWidth = 1;
         for (let i = 0; i < 12; i++) {
@@ -909,7 +1000,6 @@ SHADOW_BLADE_JS = r"""
             ctx.stroke();
         }
 
-        // Hunter silhouette + flowing cloak + glowing cyan eye trail
         const hx = w * 0.18;
         const hy = h * 0.56;
         const cloakWave = Math.sin(t * 0.004) * 7;
@@ -927,7 +1017,6 @@ SHADOW_BLADE_JS = r"""
         ctx.fill();
         ctx.stroke();
 
-        // Glowing eye trail
         ctx.shadowColor = "#38BDF8";
         ctx.shadowBlur = 14;
         ctx.strokeStyle = "#38BDF8";
@@ -943,7 +1032,6 @@ SHADOW_BLADE_JS = r"""
         ctx.fill();
         ctx.restore();
 
-        // Diagonal twin blade gleam
         ctx.save();
         ctx.strokeStyle = "rgba(167, 139, 250, 0.35)";
         ctx.lineWidth = 2;
@@ -953,14 +1041,12 @@ SHADOW_BLADE_JS = r"""
         ctx.stroke();
         ctx.restore();
 
-        // Flash overlay when clicked
         if (stageFlash > 0.01) {
             ctx.fillStyle = `rgba(56, 189, 248, ${stageFlash * 0.28})`;
             ctx.fillRect(0, 0, w, h);
             stageFlash *= 0.88;
         }
 
-        // Burned-in Arabic Anime Subtitle Preview
         const subText = ACTION_SUB_LINES[currentSubIdx];
         ctx.save();
         ctx.font = "800 16px 'Cairo', sans-serif";
@@ -977,7 +1063,6 @@ SHADOW_BLADE_JS = r"""
         ctx.restore();
     };
 
-    // 4. Bind Interactive Elements safely via MutationObserver
     const bindDomElements = () => {
         const root = getRoot();
         const q = (sel) => (root.querySelector ? root.querySelector(sel) : null) || document.querySelector(sel);
@@ -1030,21 +1115,17 @@ SHADOW_BLADE_JS = r"""
     observer.observe(document.body, { childList: true, subtree: true });
     bindDomElements();
 
-    // 5. Master 60fps Animation Loop
     const tick = (t) => {
         const root = getRoot();
         const q = (sel) => (root.querySelector ? root.querySelector(sel) : null) || document.querySelector(sel);
 
-        // Render button canvases
         const b1 = q("#sb-step1-btn");
         const b2 = q("#sb-step2-btn");
         if (b1 && b1.__sbRender) b1.__sbRender(t);
         if (b2 && b2.__sbRender) b2.__sbRender(t);
 
-        // Render stage preview canvas
         renderStageCanvas(q("#sb-anime-preview-canvas"), t);
 
-        // Render global fullscreen slashes, shockwaves, sparks
         gCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
         for (let i = shockwaves.length - 1; i >= 0; i--) {
@@ -1130,8 +1211,65 @@ SHADOW_BLADE_JS = r"""
 
 
 # ==============================================================================
-# BACKEND SETTINGS & PROCESSING PIPELINE (100% PRESERVED)
+# BACKEND SETTINGS, PERSISTENT RAW EPISODE CACHE & LIVE PROGRESS PIPELINE
 # ==============================================================================
+
+def _rescue_legacy_tmp_downloads() -> None:
+    """Rescue any completed episodes sitting in /workspace/tmp_downloads so user never re-downloads them."""
+    RAW_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    if not LEGACY_TEMP_ROOT.is_dir():
+        return
+    for vid in LEGACY_TEMP_ROOT.rglob("*"):
+        if not vid.is_file() or vid.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        if vid.stat().st_size < 1024 * 1024 or any(vid.parent.glob("*.aria2")):
+            continue
+        dest_dir = RAW_CACHE_ROOT / f"rescued_{vid.parent.name}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / vid.name
+        if not dest_file.exists():
+            try:
+                shutil.move(str(vid), str(dest_file))
+            except Exception:
+                pass
+
+
+_rescue_legacy_tmp_downloads()
+
+
+def render_progress_hud(
+    pct: float = 0.0,
+    badge: str = "HUNTER HUD · STANDBY",
+    title: str = "جاهز للانطلاق — أدخل الرابط أو اختر حلقة محفوظة للبدء",
+    metric: str = "السرعة: — · المتبقي: —",
+    detail: str = "الحلقات المحمّلة تُحفظ تلقائياً في /workspace/raw_episodes",
+    mode: str = "cyan",
+) -> str:
+    clamped = max(0.0, min(100.0, float(pct)))
+    mode_cls = {
+        "violet": "sb-mode-violet",
+        "done": "sb-mode-done",
+        "error": "sb-mode-error",
+    }.get(mode, "")
+    return f"""
+    <div class="sb-prog-card {mode_cls}">
+        <div class="sb-prog-top">
+            <div>
+                <div class="sb-prog-badge">{html.escape(badge)}</div>
+                <div class="sb-prog-title">{html.escape(title)}</div>
+            </div>
+            <div class="sb-prog-pct">{clamped:.1f}%</div>
+        </div>
+        <div class="sb-prog-track">
+            <div class="sb-prog-fill" style="width: {clamped:.1f}%;"></div>
+        </div>
+        <div class="sb-prog-meta">
+            <span>⚡ {html.escape(metric)}</span>
+            <span>📦 {html.escape(detail)}</span>
+        </div>
+    </div>
+    """
+
 
 def load_settings() -> Dict:
     defaults = {
@@ -1202,8 +1340,43 @@ def list_local_outputs() -> List[str]:
     return [str(p) for p in mp4s[:50]]
 
 
+def list_cached_raw_videos() -> List[str]:
+    _rescue_legacy_tmp_downloads()
+    if not RAW_CACHE_ROOT.exists():
+        return []
+    vids = [
+        p for p in RAW_CACHE_ROOT.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in VIDEO_EXTENSIONS
+        and "_work" not in p.parts
+        and p.stat().st_size > 1024 * 1024
+        and not any(p.parent.glob("*.aria2"))
+    ]
+    vids.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [str(p) for p in vids[:60]]
+
+
+def _raw_cache_dir_for_source(q_label: str, source_link: Optional[str], torrent_file: Optional[str], ep_name: str) -> Path:
+    """Deterministic persistent folder per magnet/URL/torrent so identical episodes NEVER re-download."""
+    RAW_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    if source_link and source_link.strip():
+        s = source_link.strip()
+        m_hash = re.search(r"btih:([a-zA-Z0-9]+)", s, re.IGNORECASE)
+        if m_hash:
+            key = f"magnet_{m_hash.group(1).lower()[:16]}"
+        else:
+            key = f"url_{hashlib.sha1(s.encode('utf-8')).hexdigest()[:14]}"
+    elif torrent_file and os.path.isfile(torrent_file):
+        h = hashlib.sha1(Path(torrent_file).read_bytes()).hexdigest()[:14]
+        key = f"tor_{h}"
+    else:
+        key = _safe_name(ep_name)
+    return RAW_CACHE_ROOT / f"{key}_{q_label}"
+
+
 def step1_process_for_preview(
     episode_name: str,
+    saved_raw_1080: str,
     link_1080: str, file_1080: Optional[str],
     link_720: str, file_720: Optional[str],
     link_480: str, file_480: Optional[str],
@@ -1230,9 +1403,107 @@ def step1_process_for_preview(
         logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
         return "\n".join(logs[-150:])
 
+    def pack(
+        hud_html: str,
+        preview_val=gr.update(),
+        local_dd=gr.update(),
+        raw_dd=gr.update(),
+        vids_val=gr.update(),
+        ass_val=gr.update(),
+        state_val=gr.update(),
+    ):
+        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val)
+
+    def run_live(
+        fn: Callable,
+        *args,
+        badge: str,
+        title: str,
+        mode: str = "cyan",
+        accepts_progress_cb: bool = True,
+        **kwargs,
+    ):
+        ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+        res_box: Dict[str, object] = {}
+
+        def _log_cb(m: str) -> None:
+            ev_q.put(("log", m))
+
+        def _prog_cb(p: float, met: str, det: str) -> None:
+            ev_q.put(("prog", (p, met, det)))
+
+        kwargs["log_cb"] = _log_cb
+        if accepts_progress_cb:
+            kwargs["progress_cb"] = _prog_cb
+
+        def _worker() -> None:
+            try:
+                res_box["val"] = fn(*args, **kwargs)
+            except Exception as e:
+                res_box["err"] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        cur_pct = 0.0
+        cur_met = "جاري البدء..."
+        cur_det = ""
+        dirty = True
+        last_yield = 0.0
+
+        while t.is_alive() or not ev_q.empty():
+            try:
+                kind, payload = ev_q.get(timeout=0.25)
+                items = [(kind, payload)]
+            except queue.Empty:
+                items = []
+
+            while not ev_q.empty():
+                try:
+                    items.append(ev_q.get_nowait())
+                except queue.Empty:
+                    break
+
+            for k, p in items:
+                dirty = True
+                if k == "prog":
+                    cur_pct, cur_met, cur_det = p  # type: ignore[misc]
+                elif k == "log":
+                    msg_s = str(p)
+                    if msg_s.startswith("[whisper_prog]"):
+                        parts = msg_s.replace("[whisper_prog]", "").strip().split("|")
+                        try:
+                            cur_pct = float(parts[0].replace("%", "").strip())
+                        except Exception:
+                            pass
+                        cur_met = "تفريغ صوتي بـ Faster-Whisper ⚡"
+                        cur_det = parts[1].strip() if len(parts) > 1 else ""
+                    else:
+                        push(msg_s)
+                        bm = re.search(r"Translated batch\s+(\d+)/(\d+)", msg_s)
+                        if bm:
+                            bx, by = int(bm.group(1)), int(bm.group(2))
+                            cur_pct = (bx / max(1, by)) * 100.0
+                            cur_met = f"تمت ترجمة الدفعة {bx} من {by}"
+                            cur_det = llm_model
+
+            now_m = time.monotonic()
+            if dirty and (now_m - last_yield >= 0.35 or not t.is_alive()):
+                last_yield = now_m
+                dirty = False
+                yield pack(render_progress_hud(cur_pct, badge, title, cur_met, cur_det, mode=mode))
+
+        if "err" in res_box:
+            raise res_box["err"]  # type: ignore[misc]
+        return res_box.get("val")
+
+    effective_file_1080 = file_1080
+    if saved_raw_1080 and os.path.isfile(saved_raw_1080):
+        effective_file_1080 = saved_raw_1080
+
     quality_inputs: List[Tuple[str, str, Optional[str]]] = []
     for label, lnk, fl in [
-        ("1080p", link_1080, file_1080),
+        ("1080p", link_1080, effective_file_1080),
         ("720p", link_720, file_720),
         ("480p", link_480, file_480),
     ]:
@@ -1240,27 +1511,46 @@ def step1_process_for_preview(
             quality_inputs.append((label, lnk, fl))
 
     if not quality_inputs:
-        yield push("⚠️ أدخل رابط أو ملف تورنت لجودة واحدة على الأقل قبل الانطلاق."), None, gr.update(), None, None, {}
+        push("⚠️ أدخل رابط تورنت أو اختر حلقة خام محفوظة من القائمة قبل الانطلاق.")
+        yield pack(
+            render_progress_hud(0.0, "تنبيه · لا يوجد مصدر", "أدخل رابط أو اختر حلقة محفوظة من القائمة", "—", "—", mode="error"),
+            state_val={},
+        )
         return
 
-    ep_folder_name = _safe_name(episode_name)
-    ep_out_dir = STORAGE_ROOT / ep_folder_name
-    ep_tmp_dir = TEMP_ROOT / f"{ep_folder_name}_{time.strftime('%H%M%S')}"
-    ep_out_dir.mkdir(parents=True, exist_ok=True)
-    ep_tmp_dir.mkdir(parents=True, exist_ok=True)
+    auto_base_name = episode_name.strip()
+    if not auto_base_name and effective_file_1080 and os.path.isfile(effective_file_1080):
+        auto_base_name = Path(effective_file_1080).stem
+    ep_folder_name = _safe_name(auto_base_name)
 
-    yield push(f"⚔️ [STRIKE] بدء التجهيز للمعاينة (بدون رفع): {ep_folder_name}"), None, gr.update(), None, None, {}
+    ep_out_dir = STORAGE_ROOT / ep_folder_name
+    work_dir = RAW_CACHE_ROOT / "_work" / ep_folder_name
+    ep_out_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    push(f"⚔️ [STRIKE] بدء تجهيز الحلقة: {ep_folder_name}")
+    yield pack(render_progress_hud(1.0, "STAGE 1/3 · INITIALIZING", f"بدء تجهيز الحلقة: {ep_folder_name}", "تجهيز المجلدات...", str(ep_out_dir)))
 
     try:
-        # 1. Download all provided qualities
         downloaded: Dict[str, Path] = {}
+        used_cache_dirs: List[Path] = []
         for q_label, lnk, fl in quality_inputs:
-            yield push(f"1/3 — جاري تحميل جودة {q_label}..."), None, gr.update(), None, None, {}
-            vid_path = download_torrent_or_url(lnk, fl, str(ep_tmp_dir / q_label), log_cb=lambda m: push(m))
+            cdir = _raw_cache_dir_for_source(q_label, lnk, fl, ep_folder_name)
+            used_cache_dirs.append(cdir)
+            vid_path = yield from run_live(
+                download_torrent_or_url,
+                lnk,
+                fl,
+                str(cdir),
+                badge=f"STAGE 1/3 · DOWNLOAD [{q_label}]",
+                title=f"تحميل / فحص الحلقة الخام بجودة {q_label}",
+                accepts_progress_cb=True,
+            )
             downloaded[q_label] = vid_path
-            yield push(f"✓ اكتمل تحميل {q_label}: {vid_path.name}"), None, gr.update(), None, None, {}
+            push(f"✓ جاهز ({q_label}): {vid_path.name}")
 
-        # 2. Extract & Translate ONCE
+        updated_raw_list = [""] + list_cached_raw_videos()
+
         primary_q = quality_inputs[0][0]
         primary_vid = downloaded[primary_q]
         source_sub = None
@@ -1268,24 +1558,37 @@ def step1_process_for_preview(
         if sub_mode.startswith("Auto"):
             probe = probe_embedded_subtitles(str(primary_vid))
             if probe is not None:
-                yield push(f"2/3 — سحب الترجمة المرفقة ({probe[1]}) من نسخة {primary_q}..."), None, gr.update(), None, None, {}
-                source_sub = extract_embedded_subtitle(str(primary_vid), probe[0], probe[1], str(ep_tmp_dir))
+                push(f"2/3 — سحب الترجمة المرفقة ({probe[1]}) من نسخة {primary_q}...")
+                yield pack(
+                    render_progress_hud(20.0, "STAGE 2/3 · SUBTITLE EXTRACT", f"سحب الترجمة المرفقة ({probe[1]}) من الفيديو...", "FFmpeg Demux", primary_vid.name),
+                    raw_dd=gr.update(choices=updated_raw_list),
+                )
+                source_sub = extract_embedded_subtitle(str(primary_vid), probe[0], probe[1], str(work_dir))
 
         if source_sub is None:
-            yield push(f"2/3 — تفريغ الصوت بـ Faster-Whisper ({whisper_model})..."), None, gr.update(), None, None, {}
-            source_sub = transcribe_with_whisper(
-                str(primary_vid), str(ep_tmp_dir / "whisper.srt"), model_size=whisper_model, log_cb=lambda m: push(m)
+            push(f"2/3 — تفريغ الصوت بـ Faster-Whisper ({whisper_model})...")
+            source_sub = yield from run_live(
+                transcribe_with_whisper,
+                str(primary_vid),
+                str(work_dir / "whisper.srt"),
+                model_size=whisper_model,
+                badge=f"STAGE 2/3 · FASTER-WHISPER [{whisper_model}]",
+                title="تفريغ الصوت بالذكاء الاصطناعي إلى جمل زمنية...",
+                accepts_progress_cb=False,
             )
 
         entries = parse_source_subtitles(source_sub)
-        yield push(f"⚡ ترجمة {len(entries)} سطر للعربية عبر {provider} ({llm_model})..."), None, gr.update(), None, None, {}
-        translations = translate_entries(
+        push(f"⚡ ترجمة {len(entries)} سطر للعربية عبر {provider} ({llm_model})...")
+        translations = yield from run_live(
+            translate_entries,
             entries=entries,
             provider="gemini" if provider.startswith("Gemini") else "openai",
             api_key=api_key,
             model_name=llm_model,
             base_url=base_url,
-            log_cb=lambda m: push(m),
+            badge="STAGE 2/3 · AI TRANSLATION",
+            title=f"ترجمة {len(entries)} جملة للعربية عبر {llm_model}...",
+            accepts_progress_cb=False,
         )
 
         credits_dict = {
@@ -1300,20 +1603,17 @@ def step1_process_for_preview(
             out_ass_path=ass_out,
             credits=credits_dict if any(v.strip() for v in credits_dict.values()) else None,
         )
-        yield push(f"✓ تم إنشاء ملف الترجمة المنسّق: {Path(ass_out).name}"), None, gr.update(), None, ass_out, {}
+        push(f"✓ تم إنشاء ملف الترجمة المنسّق: {Path(ass_out).name}")
+        yield pack(
+            render_progress_hud(100.0, "STAGE 2/3 · ASS READY", "اكتملت الترجمة وتنسيق الخطوط بنجاح!", "7 خطوط مفعّلة", Path(ass_out).name),
+            raw_dd=gr.update(choices=updated_raw_list),
+            ass_val=ass_out,
+        )
 
-        # 3. Burn & compress each quality (NO UPLOAD YET)
         for q_label, vid_path in downloaded.items():
             out_mp4 = str(ep_out_dir / f"{ep_folder_name}_{q_label}_AR.mp4")
-            yield (
-                push(f"3/3 — حرق الترجمة وضغط {q_label} ({codec}, CQ={cq})..."),
-                None,
-                gr.update(),
-                list(rendered_map.values()) or None,
-                ass_out,
-                rendered_map,
-            )
-            burn_and_compress_native(
+            yield from run_live(
+                burn_and_compress_native,
                 video_path=str(vid_path),
                 ass_path=ass_out,
                 output_path=out_mp4,
@@ -1322,35 +1622,57 @@ def step1_process_for_preview(
                 cq=int(cq),
                 preset=preset,
                 audio_bitrate=audio_bitrate,
-                log_cb=lambda m: push(m),
+                badge=f"STAGE 3/3 · NVENC ENCODE [{q_label}]",
+                title=f"حرق الترجمة وضغط جودة {q_label} بكرت الشاشة ({codec})...",
+                accepts_progress_cb=True,
             )
             rendered_map[q_label] = out_mp4
 
-        if cleanup_temp and ep_tmp_dir.exists():
-            shutil.rmtree(ep_tmp_dir, ignore_errors=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if cleanup_temp:
+            for cdir in used_cache_dirs:
+                if cdir.exists():
+                    shutil.rmtree(cdir, ignore_errors=True)
+            updated_raw_list = [""] + list_cached_raw_videos()
 
         first_video = next(iter(rendered_map.values()))
         all_local = list_local_outputs()
 
-        yield (
-            push(
-                f"✅ اكتمل التجهيز بنجاح! عاين الفيديو في المشغّل الآن، ثم اضغط زر (عبور البوابة S-PORTAL) للرفع.\n"
-                f"📁 محفوظ محلياً في: {ep_out_dir}"
+        push(
+            f"✅ اكتمل التجهيز بنجاح! عاين الفيديو الآن، ثم اضغط زر (عبور البوابة S-PORTAL) للرفع.\n"
+            f"📁 المخرجات: {ep_out_dir} | الحلقات الخام محفوظة في: {RAW_CACHE_ROOT}"
+        )
+        yield pack(
+            render_progress_hud(
+                100.0,
+                "MISSION COMPLETE · 100%",
+                "اكتمل التحميل والترجمة والحرق بنجاح! الفيديو جاهز للمعاينة أو الرفع",
+                f"تم إنتاج {len(rendered_map)} جودة",
+                str(ep_out_dir),
+                mode="done",
             ),
-            first_video,
-            gr.update(choices=all_local, value=first_video),
-            list(rendered_map.values()),
-            ass_out,
-            {"folder": str(ep_out_dir), "files": rendered_map},
+            preview_val=first_video,
+            local_dd=gr.update(choices=all_local, value=first_video),
+            raw_dd=gr.update(choices=updated_raw_list),
+            vids_val=list(rendered_map.values()),
+            ass_val=ass_out,
+            state_val={"folder": str(ep_out_dir), "files": rendered_map},
         )
     except Exception as exc:
-        yield (
-            push(f"❌ حدث خطأ أثناء التجهيز: {exc}\n{traceback.format_exc()[-500:]}"),
-            None,
-            gr.update(),
-            list(rendered_map.values()) or None,
-            ass_out,
-            {},
+        push(f"❌ حدث خطأ أثناء التجهيز: {exc}\n{traceback.format_exc()[-500:]}")
+        yield pack(
+            render_progress_hud(
+                0.0,
+                "ERROR · SYSTEM HALTED",
+                f"توقف بسبب خطأ: {str(exc)[:110]}",
+                "راجع سجل العمليات للتفاصيل",
+                "الحلقة الخام ما زالت محفوظة ولن يُعاد تحميلها!",
+                mode="error",
+            ),
+            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+            vids_val=list(rendered_map.values()) or None,
+            ass_val=ass_out,
+            state_val={},
         )
 
 
@@ -1361,7 +1683,11 @@ def step2_approve_and_upload(
     enable_gdrive: bool, gdrive_remote: str, gdrive_folder: str,
 ):
     if not job_state or not job_state.get("files"):
-        yield "⚠️ لا توجد فيديوهات جاهزة للرفع حالياً. شغّل المرحلة 1 [STRIKE] للمعاينة أولاً.", ""
+        yield (
+            render_progress_hud(0.0, "S-PORTAL · NO FILES", "شغّل المرحلة 1 [STRIKE] للمعاينة أولاً قبل الرفع.", "—", "—", mode="error"),
+            "⚠️ لا توجد فيديوهات جاهزة للرفع حالياً. شغّل المرحلة 1 [STRIKE] للمعاينة أولاً.",
+            "",
+        )
         return
 
     logs: List[str] = []
@@ -1371,6 +1697,53 @@ def step2_approve_and_upload(
         logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
         return "\n".join(logs[-150:])
 
+    def run_upload_live(fn: Callable, *args, badge: str, title: str, **kwargs):
+        ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+        res_box: Dict[str, object] = {}
+        kwargs["log_cb"] = lambda m: ev_q.put(("log", m))
+        kwargs["progress_cb"] = lambda p, met, det: ev_q.put(("prog", (p, met, det)))
+
+        def _worker() -> None:
+            try:
+                res_box["val"] = fn(*args, **kwargs)
+            except Exception as e:
+                res_box["err"] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        cur_pct, cur_met, cur_det = 1.0, "جاري الاتصال بالسحابة...", ""
+        dirty = True
+        last_y = 0.0
+
+        while t.is_alive() or not ev_q.empty():
+            try:
+                items = [ev_q.get(timeout=0.25)]
+            except queue.Empty:
+                items = []
+            while not ev_q.empty():
+                try:
+                    items.append(ev_q.get_nowait())
+                except queue.Empty:
+                    break
+            for k, p in items:
+                dirty = True
+                if k == "prog":
+                    cur_pct, cur_met, cur_det = p  # type: ignore[misc]
+                else:
+                    push(str(p))
+            now_m = time.monotonic()
+            if dirty and (now_m - last_y >= 0.35 or not t.is_alive()):
+                last_y = now_m
+                dirty = False
+                yield (
+                    render_progress_hud(cur_pct, badge, title, cur_met, cur_det, mode="violet"),
+                    "\n".join(logs[-150:]),
+                    "\n".join(links_report),
+                )
+        if "err" in res_box:
+            raise res_box["err"]  # type: ignore[misc]
+        return res_box.get("val")
+
     files_map: Dict[str, str] = job_state["files"]
 
     try:
@@ -1379,36 +1752,56 @@ def step2_approve_and_upload(
             links_report.append(f"  Local Path: {mp4_path}")
 
             if enable_mega:
-                yield push(f"🌀 جاري رفع {q_label} على MEGA..."), "\n".join(links_report)
-                mega_link = upload_to_rclone(
-                    mp4_path, mega_remote, mega_folder, generate_link=True, log_cb=lambda m: push(m)
+                push(f"🌀 جاري رفع {q_label} على MEGA...")
+                mega_link = yield from run_upload_live(
+                    upload_to_rclone,
+                    mp4_path, mega_remote, mega_folder, generate_link=True,
+                    badge=f"S-PORTAL · MEGA [{q_label}]",
+                    title=f"جاري رفع نسخة {q_label} على سحابة MEGA...",
                 )
                 links_report.append(f"  MEGA: {mega_link}")
 
             if enable_dood:
-                yield push(f"🌀 جاري رفع {q_label} على DoodStream..."), "\n".join(links_report)
-                dood_res = upload_to_doodstream(mp4_path, dood_api_key, log_cb=lambda m: push(m))
+                push(f"🌀 جاري رفع {q_label} على DoodStream...")
+                dood_res = yield from run_upload_live(
+                    upload_to_doodstream,
+                    mp4_path, dood_api_key,
+                    badge=f"S-PORTAL · DOODSTREAM [{q_label}]",
+                    title=f"جاري رفع نسخة {q_label} على DoodStream...",
+                )
                 links_report.append(f"  DoodStream Watch: {dood_res['watch_url']}")
                 links_report.append(f"  DoodStream Embed: {dood_res['embed_url']}")
 
             if enable_gdrive:
-                yield push(f"🌀 جاري رفع {q_label} على Google Drive..."), "\n".join(links_report)
-                gd_res = upload_to_rclone(
-                    mp4_path, gdrive_remote, gdrive_folder, generate_link=False, log_cb=lambda m: push(m)
+                push(f"🌀 جاري رفع {q_label} على Google Drive...")
+                gd_res = yield from run_upload_live(
+                    upload_to_rclone,
+                    mp4_path, gdrive_remote, gdrive_folder, generate_link=False,
+                    badge=f"S-PORTAL · GOOGLE DRIVE [{q_label}]",
+                    title=f"جاري رفع نسخة {q_label} على Google Drive...",
                 )
                 links_report.append(f"  Google Drive: {gd_res}")
 
             links_report.append("")
-            yield "\n".join(logs[-150:]), "\n".join(links_report)
 
         (Path(job_state["folder"]) / "links.txt").write_text("\n".join(links_report), encoding="utf-8")
-        yield push("✅ اكتمل الرفع السحابي وحُفظت جميع الروابط داخل links.txt!"), "\n".join(links_report)
+        push("✅ اكتمل الرفع السحابي وحُفظت جميع الروابط داخل links.txt!")
+        yield (
+            render_progress_hud(100.0, "S-PORTAL · UPLOAD COMPLETE", "اكتمل رفع جميع الجودات واستخراج الروابط بنجاح!", "100% Cloud Sync", job_state["folder"], mode="done"),
+            "\n".join(logs[-150:]),
+            "\n".join(links_report),
+        )
     except Exception as exc:
-        yield push(f"❌ خطأ أثناء الرفع: {exc}\n{traceback.format_exc()[-400:]}"), "\n".join(links_report)
+        push(f"❌ خطأ أثناء الرفع: {exc}\n{traceback.format_exc()[-400:]}")
+        yield (
+            render_progress_hud(0.0, "S-PORTAL · UPLOAD ERROR", f"خطأ أثناء الرفع: {str(exc)[:100]}", "راجع سجل العمليات", "", mode="error"),
+            "\n".join(logs[-150:]),
+            "\n".join(links_report),
+        )
 
 
 # ==============================================================================
-# SHADOW BLADE GRADIO UI BUILDER (COMPATIBLE WITH GRADIO 4.x / 5.x / 6.x)
+# SHADOW BLADE GRADIO UI BUILDER
 # ==============================================================================
 
 def _build_blocks_kwargs() -> Dict:
@@ -1434,27 +1827,33 @@ def build_ui() -> gr.Blocks:
     cfg = load_settings()
 
     with gr.Blocks(**_build_blocks_kwargs()) as demo:
-        # Fallback inline CSS injection if Gradio version ignores css= in Blocks
         gr.HTML(f"<style>{SHADOW_BLADE_CSS}</style>{SHADOW_BLADE_HEAD}", visible=True)
-
-        # Custom Hunter HUD Top Header + Toast Container
         gr.HTML(SHADOW_BLADE_HERO_HTML)
 
         job_state = gr.State({})
 
         with gr.Row():
-            # Right Column (in RTL): Controls, Qualities, Keys, Encoding, Action Buttons
             with gr.Column(scale=2):
                 episode_name = gr.Textbox(
                     label="📌 اسم الحلقة / مجلد الإخراج",
-                    placeholder="مثال: Solo_Action_S2_EP01",
+                    placeholder="مثال: Solo_Action_S2_EP01 (أو اتركه فارغاً ليأخذ اسم الحلقة تلقائياً)",
                 )
 
                 with gr.Accordion(
-                    "🔗 روابط أو ملفات التورنت لكل جودة (اترك الجودة غير المطلوبة فارغة)",
+                    "🔗 الحلقات المحفوظة على السيرفر أو روابط التورنت (حفظ دائم بدون إعادة تحميل)",
                     open=True,
                     elem_classes=["sb-accordion"],
                 ):
+                    with gr.Row():
+                        saved_raw_1080 = gr.Dropdown(
+                            choices=[""] + list_cached_raw_videos(),
+                            value="",
+                            label="📦 اختر حلقة خام محمّلة مسبقاً على السيرفر (/workspace/raw_episodes) — تتخطى التحميل فوراً!",
+                            interactive=True,
+                            scale=4,
+                        )
+                        refresh_raw_btn = gr.Button("🔄 تحديث المحفوظ", size="sm", elem_id="sb-refresh-btn", scale=1)
+
                     with gr.Row():
                         link_1080 = gr.Textbox(label="رابط 1080p (Magnet / URL)", placeholder="magnet:?xt=...")
                         file_1080 = gr.File(label="أو ملف .torrent / فيديو 1080p", type="filepath")
@@ -1553,7 +1952,12 @@ def build_ui() -> gr.Blocks:
                         credit_typesetter = gr.Textbox(value=cfg["credit_typesetter"], label="المحاكاة")
                         credit_encoder = gr.Textbox(value=cfg["credit_encoder"], label="الدمج والرفع")
 
-                    cleanup_temp = gr.Checkbox(value=True, label="مسح ملفات التورنت الخام بعد انتهاء الدمج")
+                    cleanup_temp = gr.Checkbox(
+                        value=False,
+                        label="مسح الحلقة الخام بعد انتهاء الدمج (اتركه مغلقاً للاحتفاظ بالحلقات المحمّلة دائماً وعدم إعادة تحميلها)",
+                    )
+
+                progress_hud = gr.HTML(value=render_progress_hud(), elem_id="sb-progress-hud")
 
                 step1_btn = gr.Button(
                     "⚔️ انطلق — بدء التحميل والترجمة والدمج للمعاينة! [STRIKE]",
@@ -1574,7 +1978,6 @@ def build_ui() -> gr.Blocks:
                     elem_id="sb-step2-btn",
                 )
 
-            # Left Column (in RTL): Live VFX Stage, Video Player, Local Browser, Links & Logs
             with gr.Column(scale=1):
                 gr.HTML(SHADOW_BLADE_STAGE_HTML)
 
@@ -1586,7 +1989,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     local_dropdown = gr.Dropdown(
                         choices=list_local_outputs(),
-                        label="📂 تصفّح الحلقات المحفوظة على Runpod (/workspace/outputs)",
+                        label="📂 تصفّح الحلقات المحروقة الجاهزة (/workspace/outputs)",
                         interactive=True,
                     )
                     refresh_local_btn = gr.Button("🔄 تحديث", size="sm", elem_id="sb-refresh-btn")
@@ -1607,12 +2010,10 @@ def build_ui() -> gr.Blocks:
                 out_video_files = gr.Files(label="🎥 تحميل الفيديوهات النهائية لجهازك")
                 out_ass_file = gr.File(label="📝 تحميل ملف الترجمة المنسّق (.ass)")
 
-        # Ensure 60fps Canvas VFX Engine boots even on Gradio versions without Blocks(js=...)
         load_sig = inspect.signature(demo.load).parameters
         if "js" in load_sig:
             demo.load(fn=None, inputs=None, outputs=None, js=SHADOW_BLADE_JS)
 
-        # Wire Backend Events
         save_btn.click(
             fn=save_settings,
             inputs=[
@@ -1622,6 +2023,11 @@ def build_ui() -> gr.Blocks:
                 credit_translator, credit_typesetter, credit_encoder,
             ],
             outputs=[save_status],
+        )
+
+        refresh_raw_btn.click(
+            fn=lambda: gr.update(choices=[""] + list_cached_raw_videos()),
+            outputs=[saved_raw_1080],
         )
 
         refresh_local_btn.click(
@@ -1634,6 +2040,7 @@ def build_ui() -> gr.Blocks:
             fn=step1_process_for_preview,
             inputs=[
                 episode_name,
+                saved_raw_1080,
                 link_1080, file_1080,
                 link_720, file_720,
                 link_480, file_480,
@@ -1642,7 +2049,7 @@ def build_ui() -> gr.Blocks:
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
             ],
-            outputs=[log_box, preview_player, local_dropdown, out_video_files, out_ass_file, job_state],
+            outputs=[progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080, out_video_files, out_ass_file, job_state],
         )
 
         step2_btn.click(
@@ -1653,7 +2060,7 @@ def build_ui() -> gr.Blocks:
                 enable_dood, dood_api_key,
                 enable_gdrive, gdrive_remote, gdrive_folder,
             ],
-            outputs=[log_box, links_box],
+            outputs=[progress_hud, log_box, links_box],
         )
 
     return demo
