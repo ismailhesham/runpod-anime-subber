@@ -29,6 +29,7 @@ from media_ops import (
 from subtitles_ai import (
     ensure_style_profile,
     extract_embedded_subtitle,
+    learn_glossary_from_translation,
     load_or_extract_series_glossary,
     parse_source_subtitles,
     probe_embedded_subtitles,
@@ -673,6 +674,21 @@ def step1_process_for_preview(
             accepts_progress_cb=False,
         )
 
+        glossary = yield from run_live(
+            learn_glossary_from_translation,
+            series_name=series_name,
+            entries=entries,
+            translations=translations,
+            glossary=glossary,
+            provider=_provider_key(provider),
+            api_key=api_key,
+            model_name=llm_model,
+            base_url=base_url,
+            badge="STAGE 3/4 · GLOSSARY LEARN",
+            title="حفظ أسماء ومصطلحات الحلقة في قاموس الأنمي...",
+            accepts_progress_cb=False,
+        )
+
         credits_dict = {
             "translator": credit_translator,
             "typesetter": credit_typesetter,
@@ -987,6 +1003,21 @@ def step_batch_process(
                     checkpoint_path=str(work_dir / "translation_checkpoint.json"),
                     badge=f"TRANSLATION [{ep_label} {gi}/{total}]",
                     title=f"ترجمة حلقة {gi} من {total} بأسلوب Celestial-Dragons ({len(entries)} سطر)...",
+                    accepts_progress_cb=False,
+                )
+
+                glossary = yield from run_live(
+                    learn_glossary_from_translation,
+                    series_name=series_name,
+                    entries=entries,
+                    translations=translations,
+                    glossary=glossary,
+                    provider=_provider_key(provider),
+                    api_key=api_key,
+                    model_name=llm_model,
+                    base_url=base_url,
+                    badge=f"GLOSSARY LEARN [{ep_label}]",
+                    title="حفظ أسماء ومصطلحات الحلقة في قاموس الأنمي...",
                     accepts_progress_cb=False,
                 )
 
