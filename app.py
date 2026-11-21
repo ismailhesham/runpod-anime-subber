@@ -1827,14 +1827,7 @@ def build_ui() -> gr.Blocks:
                                 placeholder="مثال: Bleach أو Black Clover أو Jujutsu Kaisen",
                                 visible=(_default_series_pick() == SERIES_NEW_OPT),
                             )
-                        style_preset = gr.Dropdown(
-                            choices=[
-                                ("Bleach Style (ScaleX 95% · MarginV 2.78%H · Inline \\an8)", "bleach_style"),
-                            ],
-                            value=cfg.get("style_preset") if cfg.get("style_preset") in ("bleach_style",) else "bleach_style",
-                            label="📐 بروفايل الأبعاد النسبية (%W/%H)",
-                            scale=2,
-                        )
+                        style_preset = gr.State("bleach_style")  # fixed: Bleach geometry, no UI control
 
                     with gr.Accordion("🔗 الحلقات المحفوظة على السيرفر أو روابط التورنت (حفظ دائم بدون إعادة تحميل)", open=True, elem_classes=["sb-accordion"]):
                         with gr.Row():
