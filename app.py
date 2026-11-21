@@ -61,12 +61,144 @@ ensure_style_profile()
 SHADOW_BLADE_HEAD = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@500;600;700;800;900&family=Changa:wght@600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+
+<script>
+(function () {
+  function boot() {
+    if (!document.body) { setTimeout(boot, 80); return; }
+    if (document.getElementById('sb-global-vfx-canvas')) return;
+    var cv = document.createElement('canvas'); cv.id = 'sb-global-vfx-canvas'; document.body.appendChild(cv);
+    var vig = document.createElement('div'); vig.className = 'sb-vig'; document.body.appendChild(vig);
+    var flash = document.createElement('div'); flash.id = 'sb-flash'; document.body.appendChild(flash);
+    var arise = document.createElement('div'); arise.id = 'sb-arise'; arise.textContent = 'ARISE'; document.body.appendChild(arise);
+    var alertW = document.createElement('div'); alertW.id = 'sb-sysalert';
+    alertW.innerHTML = '<div class="win"><div class="cap">\u26A0 SYSTEM ALERT</div><div class="big">RANK UP!</div><div class="sub" id="sb-sysalert-sub"></div></div>';
+    document.body.appendChild(alertW);
+
+    var cx = cv.getContext('2d'), W = 0, H = 0;
+    function resize() {
+      var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      W = window.innerWidth; H = window.innerHeight;
+      cv.width = W * dpr; cv.height = H * dpr;
+      cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener('resize', resize); resize();
+
+    function newWisp() {
+      return { x: Math.random() * W, y: H + 30 + Math.random() * 90, r: 10 + Math.random() * 26,
+        vy: 12 + Math.random() * 24, ph: Math.random() * 6.28, sw: 12 + Math.random() * 26,
+        hue: 258 + Math.random() * 28, a: .10 + Math.random() * .15 };
+    }
+    var wisps = [], motes = [], sparks = [], rings = [], i;
+    for (i = 0; i < 26; i++) { var w = newWisp(); w.y = Math.random() * H; wisps.push(w); }
+    for (i = 0; i < 70; i++) motes.push({ x: Math.random() * W, y: Math.random() * H, r: .6 + Math.random() * 1.7, vy: 5 + Math.random() * 15, ph: Math.random() * 6.28, tw: .5 + Math.random() * 1.6 });
+    var combat = 0, combatTarget = 0, last = performance.now(), ema = 60, fpsAt = 0, sweepX = -320;
+
+    function shadowBurst(x, y) {
+      for (var j = 0; j < 90; j++) {
+        var ang = Math.random() * 6.283, sp = 140 + Math.random() * 520;
+        sparks.push({ x: x, y: y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp - 60,
+          r: 1 + Math.random() * 2.6, life: .6 + Math.random() * .9, hue: 258 + Math.random() * 40 });
+      }
+      rings.push({ x: x, y: y, r: 24, vr: 780, a: .9, decay: 1.1, w: 4, hue: 275 });
+      rings.push({ x: x, y: y, r: 12, vr: 560, a: .8, decay: 1.0, w: 2.5, hue: 200 });
+    }
+
+    function frame(now) {
+      var dt = Math.min(.05, (now - last) / 1000); last = now;
+      if (dt > 0) ema = ema * .95 + (1 / dt) * .05;
+      if (now - fpsAt > 250) {
+        fpsAt = now;
+        var f = document.getElementById('sb-fps-meter');
+        if (f) f.textContent = Math.round(ema) + ' FPS \u00B7 CANVAS';
+      }
+      combat += (combatTarget - combat) * Math.min(1, dt * 2.2);
+      cx.clearRect(0, 0, W, H);
+      cx.globalCompositeOperation = 'lighter';
+      sweepX += dt * 340; if (sweepX > W + 320) sweepX = -320;
+      var sg = cx.createLinearGradient(sweepX - 90, 0, sweepX + 90, 0);
+      sg.addColorStop(0, 'rgba(125,211,252,0)'); sg.addColorStop(.5, 'rgba(125,211,252,.05)'); sg.addColorStop(1, 'rgba(125,211,252,0)');
+      cx.fillStyle = sg; cx.fillRect(sweepX - 90, 0, 180, H);
+      var k, w, m, g2;
+      for (k = 0; k < wisps.length; k++) {
+        w = wisps[k];
+        w.y -= w.vy * (1 + combat * 2.0) * dt; w.ph += dt * 2;
+        var x = w.x + Math.sin(w.ph) * w.sw;
+        var fl = .7 + .3 * Math.sin(w.ph * 3.7);
+        var rr = w.r * (1 + combat * .5);
+        g2 = cx.createRadialGradient(x, w.y, 0, x, w.y, rr);
+        g2.addColorStop(0, 'hsla(' + (w.hue - combat * 30) + ',85%,62%,' + (w.a * fl * (1 + combat)) + ')');
+        g2.addColorStop(1, 'hsla(270,80%,50%,0)');
+        cx.fillStyle = g2; cx.beginPath(); cx.arc(x, w.y, rr, 0, 6.29); cx.fill();
+        if (w.y < -70) wisps[k] = newWisp();
+      }
+      for (k = 0; k < motes.length; k++) {
+        m = motes[k];
+        m.y -= m.vy * (1 + combat * 2.4) * dt; m.ph += dt * m.tw * 3;
+        var a2 = .22 + .55 * Math.abs(Math.sin(m.ph));
+        cx.fillStyle = 'hsla(' + (196 + combat * 90) + ',95%,70%,' + a2 + ')';
+        cx.beginPath(); cx.arc(m.x + Math.sin(m.ph) * 6, m.y, m.r, 0, 6.29); cx.fill();
+        if (m.y < -8) { m.y = H + 8; m.x = Math.random() * W; }
+      }
+      for (k = rings.length - 1; k >= 0; k--) {
+        var r = rings[k]; r.r += r.vr * dt; r.a -= dt * r.decay;
+        if (r.a <= 0) { rings.splice(k, 1); continue; }
+        cx.strokeStyle = 'hsla(' + r.hue + ',92%,66%,' + r.a + ')'; cx.lineWidth = r.w;
+        cx.beginPath(); cx.arc(r.x, r.y, r.r, 0, 6.29); cx.stroke();
+      }
+      for (k = sparks.length - 1; k >= 0; k--) {
+        var s = sparks[k]; s.life -= dt;
+        if (s.life <= 0) { sparks.splice(k, 1); continue; }
+        s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 26 * dt; s.vx *= (1 - dt * 1.4);
+        cx.fillStyle = 'hsla(' + s.hue + ',92%,68%,' + Math.min(1, s.life * 1.4) + ')';
+        cx.beginPath(); cx.arc(s.x, s.y, s.r, 0, 6.29); cx.fill();
+      }
+      cx.globalCompositeOperation = 'source-over';
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    function retrigger(el, cls) { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+    function strike() {
+      combatTarget = 1;
+      retrigger(flash, 'go'); retrigger(arise, 'go');
+      shadowBurst(W / 2, H * .45);
+      setTimeout(function () { shadowBurst(W / 2, H * .45); }, 260);
+      var gc = document.querySelector('.gradio-container');
+      if (gc) { gc.classList.remove('sb-shake'); void gc.offsetWidth; gc.classList.add('sb-shake');
+        setTimeout(function () { gc.classList.remove('sb-shake'); }, 700); }
+    }
+    document.addEventListener('click', function (e) {
+      var b = e.target && e.target.closest ? e.target.closest('#sb-step1-btn, #sb-batch-btn') : null;
+      if (b) strike();
+    }, true);
+
+    var RANKS = ['D', 'C', 'B', 'A', 'S', 'S+'];
+    var lastRank = null;
+    setInterval(function () {
+      var hud = document.querySelector('.sb-prog-card');
+      if (hud && (hud.classList.contains('sb-mode-done') || hud.classList.contains('sb-mode-error'))) combatTarget = 0;
+      var r = document.getElementById('sb-rank-live');
+      if (r) {
+        var rk = r.textContent.replace('RANK', '').trim();
+        if (lastRank && rk !== lastRank && RANKS.indexOf(rk) > RANKS.indexOf(lastRank)) {
+          document.getElementById('sb-sysalert-sub').textContent = lastRank + ' \u2190 ' + rk;
+          retrigger(alertW, 'go');
+          shadowBurst(W / 2, H * .4);
+        }
+        lastRank = rk;
+      }
+    }, 400);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
+})();
+</script>
 """
 
 SHADOW_BLADE_CSS = """
 :root {
-    --sb-void: #040710;
+    --sb-void: #030309;
     --sb-deep: #080E1E;
     --sb-panel: #0B1326;
     --sb-panel-alt: #0F1A33;
@@ -274,6 +406,52 @@ html, body, .gradio-container {
 .sb-prog-track { width: 100%; height: 11px; background: #03060E; border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 999px; overflow: hidden; }
 .sb-prog-fill { height: 100%; background: linear-gradient(90deg, #38BDF8 0%, #818CF8 60%, #A78BFA 100%); border-radius: 999px; transition: width 0.3s ease; }
 .sb-prog-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; font-size: 12px; color: var(--sb-muted); font-family: 'JetBrains Mono', 'Cairo', monospace; flex-wrap: wrap; }
+
+/* === SOLO SYSTEM VFX === */
+.sb-vig { position: fixed; inset: 0; z-index: 9997; pointer-events: none;
+    background: radial-gradient(ellipse at 50% 42%, transparent 44%, rgba(3,3,9,.55) 100%); }
+.sb-hero-wrap, .sb-prog-card { border-radius: 2px !important; position: relative; }
+.sb-hero-wrap::before, .sb-prog-card::before { content: ''; position: absolute; top: -2px; right: -2px; width: 14px; height: 14px;
+    border-top: 2px solid var(--sb-cyan); border-right: 2px solid var(--sb-cyan); pointer-events: none; }
+.sb-hero-wrap::after, .sb-prog-card::after { content: ''; position: absolute; bottom: -2px; left: -2px; width: 14px; height: 14px;
+    border-bottom: 2px solid var(--sb-cyan); border-left: 2px solid var(--sb-cyan); pointer-events: none; }
+.sb-main-title { font-family: 'Changa', 'Cairo', sans-serif !important; letter-spacing: .02em; }
+.sb-prog-fill { background-size: 200% 100%; animation: sbShine 1.5s linear infinite; box-shadow: 0 0 14px rgba(56,189,248,.5); }
+@keyframes sbShine { 0% { background-position: 0% 0; } 100% { background-position: -200% 0; } }
+.sb-fill-violet { background: linear-gradient(90deg,#7C3AED,#A855F7 55%,#E9D5FF); background-size: 200% 100%; box-shadow: 0 0 14px rgba(139,92,246,.55); }
+.sb-grind { margin-top: 11px; padding-top: 10px; border-top: 1px dashed rgba(148,163,184,.3); }
+.sb-grind-head { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; flex-wrap: wrap; }
+.sb-rank-live { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 900; color: #030309;
+    background: linear-gradient(90deg,#0EA5E9,#7DD3FC); padding: 2px 12px; letter-spacing: .06em; }
+.sb-grind-label { font-size: 12.5px; font-weight: 800; color: #F8FAFC; }
+.sb-grind-sub { font-size: 10.5px; color: var(--sb-muted); font-family: 'JetBrains Mono', 'Cairo', monospace; }
+#sb-step1-btn, #sb-batch-btn { border-radius: 0 !important;
+    clip-path: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px); }
+#sb-flash { position: fixed; inset: 0; background: radial-gradient(circle at 50% 45%, rgba(168,85,247,.55), rgba(3,3,9,0) 58%);
+    opacity: 0; pointer-events: none; z-index: 10001; }
+#sb-flash.go { animation: sbFlashGo 1.1s ease-out; }
+@keyframes sbFlashGo { 0% { opacity: 0; } 10% { opacity: 1; } 100% { opacity: 0; } }
+#sb-arise { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 10002; pointer-events: none;
+    font-family: 'Changa', 'Cairo', sans-serif; font-weight: 800; font-size: 110px; letter-spacing: .12em; direction: ltr;
+    color: #E9D5FF; text-shadow: 0 0 40px rgba(168,85,247,1), 0 0 110px rgba(139,92,246,.8); opacity: 0; }
+#sb-arise.go { animation: sbAriseIn 1.25s cubic-bezier(.16,1,.3,1); }
+@keyframes sbAriseIn { 0% { opacity: 0; transform: scale(.5) translateY(26px); filter: blur(6px); }
+    22% { opacity: 1; transform: scale(1.08); filter: blur(0); } 55% { opacity: 1; transform: scale(1); }
+    100% { opacity: 0; transform: scale(1.04) translateY(-14px); } }
+.gradio-container.sb-shake { animation: sbPageShake .5s linear; }
+@keyframes sbPageShake { 0%,100% { transform: translate(0,0); } 15% { transform: translate(-7px,3px); }
+    30% { transform: translate(6px,-4px); } 45% { transform: translate(-5px,-2px); } 60% { transform: translate(5px,3px); } 80% { transform: translate(-3px,1px); } }
+#sb-sysalert { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 10003; pointer-events: none; }
+#sb-sysalert .win { min-width: 360px; text-align: center; padding: 18px 32px; background: rgba(8,12,28,.94);
+    border: 1px solid var(--sb-cyan); box-shadow: 0 0 44px rgba(56,189,248,.45), inset 0 0 30px rgba(56,189,248,.12);
+    opacity: 0; transform: scale(.7); }
+#sb-sysalert .cap { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: .24em; color: var(--sb-cyan-bright); margin-bottom: 6px; }
+#sb-sysalert .big { font-family: 'Changa', 'Cairo', sans-serif; font-size: 40px; font-weight: 800; color: #FDE68A; text-shadow: 0 0 30px rgba(253,230,138,.85); }
+#sb-sysalert .sub { font-family: 'JetBrains Mono', monospace; font-size: 15px; color: #FDE68A; margin-top: 4px; direction: ltr; }
+#sb-sysalert.go .win { animation: sbAlertIn 1.6s cubic-bezier(.16,1,.3,1); }
+@keyframes sbAlertIn { 0% { opacity: 0; transform: scale(.65); } 14% { opacity: 1; transform: scale(1.05); } 22% { opacity: .3; }
+    30% { opacity: 1; transform: scale(1); } 80% { opacity: 1; } 100% { opacity: 0; transform: scale(1.02) translateY(-10px); } }
+.sb-fps { color: #FDE68A; font-weight: 800; }
 """
 
 SHADOW_BLADE_HERO_HTML = """
@@ -282,16 +460,15 @@ SHADOW_BLADE_HERO_HTML = """
         <div class="sb-brand-side">
             <div class="sb-emblem-box">
                 <svg viewBox="0 0 64 64" width="42" height="42" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <polygon points="32,4 58,18 58,46 32,60 6,46 6,18" stroke="#38BDF8" stroke-width="1.6" fill="#070D1D"/>
-                    <path d="M16 48 L47 15 L51 19 L22 50 Z" fill="#38BDF8"/>
-                    <path d="M48 48 L17 15 L13 19 L42 50 Z" fill="#A78BFA" fill-opacity="0.9"/>
-                    <circle cx="32" cy="32" r="4.5" fill="#F8FAFC"/>
+                    <polygon points="32,4 58,18 58,46 32,60 6,46 6,18" stroke="#A855F7" stroke-width="1.8" fill="#070D1D"/>
+                    <path d="M32 12 C24 24 19 30 19 41 a13 13 0 0 0 26 0 C45 30 40 24 32 12 Z" fill="none" stroke="#A855F7" stroke-width="2.2"/>
+                    <path d="M32 25 c-4.5 7 -7 10.5 -7 16 a7 7 0 0 0 14 0 c0 -5.5 -2.5 -9 -7 -16 Z" fill="#8B5CF6"/>
                 </svg>
             </div>
             <div>
-                <div class="sb-title-eyebrow">CELESTIAL ENGINE · DEEPSEEK V4.1 · WHISPER</div>
+                <div class="sb-title-eyebrow">ANIME SUBBER · DEEPSEEK V4.1</div>
                 <h1 class="sb-main-title">
-                    نصل الظل · سَبّر الأنمي الاحترافي
+                    سَبّر الأنمي
                     <span class="sb-rank-pill">AUTO-WHISPER · %W/%H RESPONSIVE</span>
                 </h1>
                 <p class="sb-subtitle-desc">
@@ -302,7 +479,8 @@ SHADOW_BLADE_HERO_HTML = """
         </div>
         <div class="sb-hud-chip">
             <span class="sb-dot-online"></span>
-            <span>DEEPSEEK · WHISPER · NVENC</span>
+            <span>SYSTEM ONLINE</span>
+            <span class="sb-fps" id="sb-fps-meter">-- FPS</span>
         </div>
     </div>
 </div>
@@ -331,6 +509,20 @@ def _rescue_legacy_tmp_downloads() -> None:
 _rescue_legacy_tmp_downloads()
 
 
+def _grind_rank(overall: float) -> str:
+    if overall >= 99.5:
+        return "S+"
+    if overall >= 80:
+        return "S"
+    if overall >= 60:
+        return "A"
+    if overall >= 40:
+        return "B"
+    if overall >= 20:
+        return "C"
+    return "D"
+
+
 def render_progress_hud(
     pct: float = 0.0,
     badge: str = "HUNTER HUD · STANDBY",
@@ -338,9 +530,27 @@ def render_progress_hud(
     metric: str = "السرعة: — · المتبقي: —",
     detail: str = "الحلقات الخام والقواميس والموديلات محفوظة دائماً في /workspace",
     mode: str = "cyan",
+    overall_pct: Optional[float] = None,
+    grind_label: str = "",
 ) -> str:
     clamped = max(0.0, min(100.0, float(pct)))
     mode_cls = {"violet": "sb-mode-violet", "done": "sb-mode-done", "error": "sb-mode-error"}.get(mode, "")
+    grind_html = ""
+    if overall_pct is not None:
+        ov = max(0.0, min(100.0, float(overall_pct)))
+        rank = _grind_rank(ov)
+        grind_html = f"""
+        <div class="sb-grind">
+            <div class="sb-grind-head">
+                <span class="sb-rank-live" id="sb-rank-live">RANK {rank}</span>
+                <span class="sb-grind-label">{html.escape(grind_label)}</span>
+                <span class="sb-grind-sub">إجمالي الموسم {ov:.1f}%</span>
+            </div>
+            <div class="sb-prog-track">
+                <div class="sb-prog-fill sb-fill-violet" style="width: {ov:.1f}%;"></div>
+            </div>
+        </div>
+        """
     return f"""
     <div class="sb-prog-card {mode_cls}">
         <div class="sb-prog-top">
@@ -357,6 +567,7 @@ def render_progress_hud(
             <span>⚡ {html.escape(metric)}</span>
             <span>📦 {html.escape(detail)}</span>
         </div>
+        {grind_html}
     </div>
     """
 
@@ -522,6 +733,8 @@ def step1_process_for_preview(
     ):
         return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val)
 
+    grind_ctx = {"gi": 0, "total": 0}
+
     def run_live(fn: Callable, *args, badge: str, title: str, mode: str = "cyan", accepts_progress_cb: bool = True, **kwargs):
         ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         res_box: Dict[str, object] = {}
@@ -578,7 +791,12 @@ def step1_process_for_preview(
             if dirty and (now_m - last_yield >= 0.35 or not t.is_alive()):
                 last_yield = now_m
                 dirty = False
-                yield pack(render_progress_hud(cur_pct, badge, title, cur_met, cur_det, mode=mode))
+                ov_pct, ov_label = None, ""
+                if grind_ctx["total"]:
+                    _gi, _tot = grind_ctx["gi"], grind_ctx["total"]
+                    ov_pct = ((_gi - 1) + max(0.0, min(100.0, cur_pct)) / 100.0) / _tot * 100.0
+                    ov_label = f"طحن الموسم: الحلقة {_gi} من {_tot}"
+                yield pack(render_progress_hud(cur_pct, badge, title, cur_met, cur_det, mode=mode, overall_pct=ov_pct, grind_label=ov_label))
 
         if "err" in res_box:
             raise res_box["err"]  # type: ignore[misc]
@@ -906,6 +1124,7 @@ def step_batch_process(
         if total == 0:
             raise FileNotFoundError("لم يتم العثور على أي حلقة في الروابط المدخلة.")
 
+        grind_ctx["total"] = total
         push(f"📚 إجمالي الحلقات المكتشفة: {total} حلقة.")
         for pos, vp in enumerate(all_eps, 1):
             epn = extract_episode_number(vp.name)
@@ -943,6 +1162,7 @@ def step_batch_process(
         # ═══ المرحلة 2: معالجة كل حلقة (ترجمة ← حرق ← ضغط) ═══
         for gi, vid in enumerate(all_eps, 1):
             ep_label = f"EP{gi:03d}"
+            grind_ctx["gi"] = gi
             out_mp4 = part_dir_for(gi) / f"{series_safe}_{ep_label}_AR.mp4"
 
             if out_mp4.exists() and out_mp4.stat().st_size > 1024 * 1024:
@@ -1078,6 +1298,8 @@ def step_batch_process(
                 f"الفولدر: {series_root}" + (" · مقسم ×35" if split_parts else ""),
                 f"{done_n} MP4",
                 mode="done" if not fail_n else "error",
+                overall_pct=(done_n / total) * 100.0,
+                grind_label=f"طحن الموسم: {done_n} من {total}",
             ),
             preview_val=first_video,
             local_dd=gr.update(choices=all_local, value=first_video),
@@ -1205,7 +1427,7 @@ def step2_approve_and_upload(
 
 def _build_blocks_kwargs() -> Dict:
     sig = inspect.signature(gr.Blocks.__init__).parameters
-    kwargs: Dict = {"title": "نصل الظل · سَبّر الأنمي | Celestial DeepSeek Edition"}
+    kwargs: Dict = {"title": "سَبّر الأنمي | Anime Subber"}
     if "theme" in sig:
         kwargs["theme"] = gr.themes.Base(primary_hue="sky", secondary_hue="violet", neutral_hue="slate")
     if "css" in sig:
@@ -1326,7 +1548,7 @@ def build_ui() -> gr.Blocks:
                 progress_hud = gr.HTML(value=render_progress_hud())
 
                 step1_btn = gr.Button(
-                    "⚔️ الخطوة 1: انطلق — ترجمة الذكاء الاصطناعي والحرق وضغط MP4 للمعاينة! [STRIKE]",
+                    "⚔️ ARISE · ابدأ الطحن — ترجمة وحرق وضغط MP4 [STRIKE]",
                     variant="primary",
                     size="lg",
                     elem_id="sb-step1-btn",
