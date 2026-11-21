@@ -17,6 +17,7 @@ import gradio as gr
 from media_ops import (
     VIDEO_EXTENSIONS,
     burn_and_compress_native,
+    qc_burned_episode,
     collect_episode_videos,
     download_season_batch,
     download_torrent_or_url,
@@ -945,6 +946,16 @@ def step1_process_for_preview(
                 title=f"حرق الترجمة وضغط جودة {q_label} بأعلى جودة وأقل حجم ({codec})...",
                 accepts_progress_cb=True,
             )
+            yield from run_live(
+                qc_burned_episode,
+                str(vid_path), out_mp4,
+                ass_path=q_ass,
+                expected_lines=len(translations),
+                qc_dir=str(ep_out_dir / "_qc" / q_label),
+                badge=f"QC [{q_label}]",
+                title=f"فحص جودة نسخة {q_label} بعد الحرق...",
+                accepts_progress_cb=False,
+            )
             rendered_map[q_label] = out_mp4
 
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1159,6 +1170,20 @@ def step_batch_process(
         glossary: Dict = {}
         last_ass: Optional[str] = None
 
+        # ذاكرة ترجمة الموسم: الأسطر المكررة (الأوبنينج/الإندينج) تترجم مرة واحدة فقط
+        tmem_path = series_root / "_translation_memory.json"
+        tmem: Dict[str, str] = {}
+        if tmem_path.is_file():
+            try:
+                tmem = {str(k): str(v) for k, v in json.loads(tmem_path.read_text(encoding="utf-8")).items()}
+            except Exception:
+                tmem = {}
+        if tmem:
+            push(f"♻️ ذاكرة ترجمة الموسم محملة: {len(tmem)} سطر جاهز لإعادة الاستخدام.")
+
+        def _tkey(txt: str) -> str:
+            return " ".join((txt or "").split())
+
         # ═══ المرحلة 2: معالجة كل حلقة (ترجمة ← حرق ← ضغط) ═══
         for gi, vid in enumerate(all_eps, 1):
             ep_label = f"EP{gi:03d}"
@@ -1211,9 +1236,20 @@ def step_batch_process(
                         accepts_progress_cb=False,
                     )
 
+                reused: Dict[int, str] = {}
+                if tmem:
+                    for e in entries:
+                        if getattr(e, "keep_untranslated", False):
+                            continue
+                        k = _tkey(getattr(e, "plain_text", ""))
+                        if k and k in tmem:
+                            reused[e.index] = tmem[k]
+                if reused:
+                    push(f"♻️ {ep_label}: {len(reused)} سطر مكرر (أوبنينج/إندينج) أُعيد استخدام ترجمته — المتبقي {len(entries) - len(reused)} سطر.")
+
                 translations = yield from run_live(
                     translate_entries,
-                    entries=entries,
+                    entries=[e for e in entries if e.index not in reused],
                     provider=_provider_key(provider),
                     api_key=api_key,
                     model_name=llm_model,
@@ -1222,9 +1258,24 @@ def step_batch_process(
                     glossary=glossary,
                     checkpoint_path=str(work_dir / "translation_checkpoint.json"),
                     badge=f"TRANSLATION [{ep_label} {gi}/{total}]",
-                    title=f"ترجمة حلقة {gi} من {total} بأسلوب Celestial-Dragons ({len(entries)} سطر)...",
+                    title=f"ترجمة حلقة {gi} من {total} بأسلوب Celestial-Dragons ({len(entries) - len(reused)} سطر)...",
                     accepts_progress_cb=False,
                 )
+                translations.update(reused)
+
+                idx2key = {
+                    e.index: _tkey(getattr(e, "plain_text", ""))
+                    for e in entries
+                    if not getattr(e, "keep_untranslated", False)
+                }
+                for _idx, _ar in translations.items():
+                    _k = idx2key.get(_idx)
+                    if _k:
+                        tmem[_k] = _ar
+                try:
+                    tmem_path.write_text(json.dumps(tmem, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
 
                 glossary = yield from run_live(
                     learn_glossary_from_translation,
@@ -1267,6 +1318,16 @@ def step_batch_process(
                     badge=f"ENCODE [{ep_label} {gi}/{total}]",
                     title=f"حرق وضغط حلقة {gi} من {total} ({codec})...",
                     accepts_progress_cb=True,
+                )
+                yield from run_live(
+                    qc_burned_episode,
+                    str(vid), str(out_mp4),
+                    ass_path=str(ep_ass),
+                    expected_lines=len(entries),
+                    qc_dir=str(series_root / "_qc" / ep_label),
+                    badge=f"QC [{ep_label} {gi}/{total}]",
+                    title=f"فحص جودة حلقة {gi} من {total} بعد الحرق...",
+                    accepts_progress_cb=False,
                 )
                 rendered[ep_label] = str(out_mp4)
                 shutil.rmtree(work_dir, ignore_errors=True)
