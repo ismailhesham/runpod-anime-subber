@@ -1051,13 +1051,13 @@ def write_responsive_ass(
     out_ass_path: str,
     target_w: int = 1920,
     target_h: int = 1080,
-    style_preset: str = "black_clover_style",
+    style_preset: str = "bleach_style",
     approved_visual_signs: Optional[List[Dict]] = None,
     credits: Optional[Dict[str, str]] = None,
 ) -> str:
     prof = ensure_style_profile()
     geom = prof["responsive_geometry"]
-    preset_key = style_preset if style_preset in geom["presets"] else "black_clover_style"
+    preset_key = style_preset if style_preset in geom["presets"] else "bleach_style"
     preset_cfg = geom["presets"][preset_key]
     be_val = max(1, round(target_h * float(preset_cfg.get("blur_edge_h_ratio", 0.001852))))
     bottom_zone_pct = float(geom.get("bottom_collision_y_pct", 60.0))
