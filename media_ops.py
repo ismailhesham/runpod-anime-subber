@@ -684,12 +684,20 @@ def qc_burned_episode(
     expected_lines: int = 0,
     qc_dir: str = "",
     log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
 ) -> Dict[str, object]:
     """Post-burn QC: output exists and is sizable, duration matches source,
     3 sample frames extracted for review, ASS dialogue count vs translation count."""
     def log(m: str) -> None:
         if log_cb:
             log_cb(m)
+
+    def prog(pct: float, stage: str, detail: str = "") -> None:
+        if progress_cb:
+            try:
+                progress_cb(pct, stage, detail)
+            except Exception:
+                pass
 
     report: Dict[str, object] = {"ok": True, "issues": []}
 
@@ -700,10 +708,12 @@ def qc_burned_episode(
 
     out = Path(output_path)
     name = out.name
+    prog(8.0, "فحص الملف الناتج...", name)
     if not out.is_file() or out.stat().st_size < 256 * 1024:
         issue(f"الملف الناتج مفقود أو صغير بشكل غير طبيعي: {name}")
 
     size_mb = out.stat().st_size / (1024 * 1024) if out.is_file() else 0.0
+    prog(30.0, "مطابقة المدة مع الأصل...", name)
     src_dur = out_dur = 0.0
     try:
         _, _, _, src_dur = probe_video_info(source_path)
@@ -715,6 +725,7 @@ def qc_burned_episode(
     except Exception as exc:
         log(f"⚠️ QC: تعذر فحص المدة ({exc})")
 
+    prog(55.0, "استخراج لقطات المعاينة...", name)
     frames_ok = 0
     if qc_dir and out_dur > 0:
         try:
@@ -728,11 +739,13 @@ def qc_burned_episode(
                 )
                 if jpg.is_file() and jpg.stat().st_size > 4096:
                     frames_ok += 1
+                prog(55.0 + i * 10.0, f"لقطة معاينة {i}/3...", name)
             if frames_ok < 3:
                 issue(f"تم استخراج {frames_ok}/3 لقطات معاينة فقط")
         except Exception as exc:
             log(f"⚠️ QC: تعذر استخراج لقطات المعاينة ({exc})")
 
+    prog(88.0, "عد أسطر الحوار...", name)
     n_dlg = 0
     if ass_path and os.path.isfile(ass_path) and expected_lines:
         try:
@@ -757,4 +770,10 @@ def qc_burned_episode(
         )
     else:
         log(f"⚠️ QC لـ {name}: {len(report['issues'])} ملاحظة — راجع السجل")
+    prog(
+        100.0,
+        "اكتمل الفحص ✓" if report["ok"] else "اكتمل الفحص مع ملاحظات ⚠️",
+        f"{size_mb:.0f}MB · {name}",
+    )
     return report
+
