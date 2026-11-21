@@ -721,7 +721,7 @@ def load_settings() -> Dict:
         "llm_model": "deepseek-v4-pro",
         "api_key": os.environ.get("DEEPSEEK_API_KEY", os.environ.get("GEMINI_API_KEY", "")),
         "base_url": "https://api.deepseek.com",
-        "style_preset": "black_clover_style",
+        "style_preset": "bleach_style",
         "dood_api_key": os.environ.get("DOODSTREAM_API_KEY", ""),
         "gdrive_remote": "gdrive",
         "gdrive_folder": "Runpod_Anime",
@@ -1829,10 +1829,9 @@ def build_ui() -> gr.Blocks:
                             )
                         style_preset = gr.Dropdown(
                             choices=[
-                                ("Black Clover Style (ScaleX 90% · MarginV 4.35%H · Top Style)", "black_clover_style"),
                                 ("Bleach Style (ScaleX 95% · MarginV 2.78%H · Inline \\an8)", "bleach_style"),
                             ],
-                            value=cfg.get("style_preset", "black_clover_style"),
+                            value=cfg.get("style_preset") if cfg.get("style_preset") in ("bleach_style",) else "bleach_style",
                             label="📐 بروفايل الأبعاد النسبية (%W/%H)",
                             scale=2,
                         )
