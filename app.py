@@ -1180,23 +1180,31 @@ def step1_process_for_preview(
         all_local = list_local_outputs()
 
         push(f"✅ اكتمل الإنتاج بالكامل! عاين الفيديو الآن، ثم اضغط [S-PORTAL] للرفع السحابي.")
+        done_hud = render_progress_hud(
+            100.0,
+            "MISSION COMPLETE · 100%",
+            "اكتملت الترجمة والحرق والضغط بنجاح! الفيديو جاهز للمعاينة",
+            f"تم إنتاج {len(rendered_map)} جودة MP4",
+            str(ep_out_dir),
+            mode="done",
+        )
+        # التحديث الأول بدون فيديو المعاينة: ظهور لوحة الإتمام وزرار [S-PORTAL] فوراً،
+        # لأن تحويل Gradio لملف HEVC إلى mp4 للمتصفح كان يحبس التحديث كله دقائق طويلة
         yield pack(
-            render_progress_hud(
-                100.0,
-                "MISSION COMPLETE · 100%",
-                "اكتملت الترجمة والحرق والضغط بنجاح! الفيديو جاهز للمعاينة",
-                f"تم إنتاج {len(rendered_map)} جودة MP4",
-                str(ep_out_dir),
-                mode="done",
-            ),
-            preview_val=first_video,
-            local_dd=gr.update(choices=all_local, value=first_video),
+            done_hud,
+            local_dd=gr.update(choices=all_local),
             raw_dd=gr.update(choices=updated_raw_list),
             vids_val=list(rendered_map.values()),
             ass_val=ass_out,
             state_val={"folder": str(ep_out_dir), "files": rendered_map},
             g2=gr.update(visible=True),
             dls=gr.update(visible=True),
+        )
+        # المعاينة تصل في تحديث منفصل بعد اكتمال التحويل (ممكن ياخد دقائق مع ملف كبير)
+        yield pack(
+            done_hud,
+            preview_val=first_video,
+            local_dd=gr.update(value=first_video),
         )
     except Exception as exc:
         push(f"❌ حدث خطأ أثناء التجهيز: {exc}\n{traceback.format_exc()[-1500:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
@@ -1653,25 +1661,31 @@ def step_batch_process(
                 push(f"   • {f_}")
 
         push(f"✅ اكتمل الموسم! {done_n}/{total} حلقة جاهزة في: {series_root}")
+        done_hud = render_progress_hud(
+            100.0 if not fail_n else 97.0,
+            "SEASON COMPLETE" if not fail_n else "SEASON DONE WITH ERRORS",
+            f"تم إنتاج {done_n} من {total} حلقة" + (f" · {fail_n} فشلت" if fail_n else " بنجاح كامل!"),
+            f"الفولدر: {series_root}" + (" · مقسم ×35" if split_parts else ""),
+            f"{done_n} MP4",
+            mode="done" if not fail_n else "error",
+            overall_pct=(done_n / total) * 100.0,
+            grind_label=f"طحن الموسم: {done_n} من {total}",
+        )
+        # نفس فصل التحديثات: لوحة الإتمام وزرار [S-PORTAL] فوراً بدون انتظار تحويل المعاينة
         yield pack(
-            render_progress_hud(
-                100.0 if not fail_n else 97.0,
-                "SEASON COMPLETE" if not fail_n else "SEASON DONE WITH ERRORS",
-                f"تم إنتاج {done_n} من {total} حلقة" + (f" · {fail_n} فشلت" if fail_n else " بنجاح كامل!"),
-                f"الفولدر: {series_root}" + (" · مقسم ×35" if split_parts else ""),
-                f"{done_n} MP4",
-                mode="done" if not fail_n else "error",
-                overall_pct=(done_n / total) * 100.0,
-                grind_label=f"طحن الموسم: {done_n} من {total}",
-            ),
-            preview_val=first_video,
-            local_dd=gr.update(choices=all_local, value=first_video),
+            done_hud,
+            local_dd=gr.update(choices=all_local),
             raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
             vids_val=list(rendered.values())[:40],
             ass_val=last_ass,
             state_val={"folder": str(series_root), "files": rendered},
             g2=gr.update(visible=True),
             dls=gr.update(visible=True),
+        )
+        yield pack(
+            done_hud,
+            preview_val=first_video,
+            local_dd=gr.update(value=first_video),
         )
     except Exception as exc:
         push(f"❌ خطأ عام في وضع الموسم: {exc}\n{traceback.format_exc()[-1500:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
