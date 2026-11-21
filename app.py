@@ -729,7 +729,7 @@ def load_settings() -> Dict:
         "gdrive_folder": "Runpod_Anime",
         "codec": "hevc_nvenc",
         "preset": "p7",
-        "cq": 24,
+        "cq": 26,
         "audio_bitrate": "160k",
         "credit_translator": "",
         "credit_typesetter": "",
@@ -1979,7 +1979,16 @@ def build_ui() -> gr.Blocks:
                             )
                             whisper_model = gr.Dropdown(choices=["large-v3", "medium", "small"], value="large-v3", label="موديل Whisper")
                         with gr.Row():
-                            codec = gr.Dropdown(choices=["h264_nvenc", "hevc_nvenc", "av1_nvenc"], value=cfg["codec"], label="الكوديك (GPU NVENC)")
+                            codec = gr.Dropdown(
+                                choices=[
+                                    ("HEVC كرت الشاشة (hevc_nvenc · الأفضل توازناً)", "hevc_nvenc"),
+                                    ("H.264 كرت الشاشة (h264_nvenc · توافق أوسع)", "h264_nvenc"),
+                                    ("AV1 كرت الشاشة (av1_nvenc)", "av1_nvenc"),
+                                    ("HEVC معالج x265 · أصغر حجم ممكن (أبطأ بكثير)", "libx265"),
+                                ],
+                                value=cfg["codec"],
+                                label="الكوديك",
+                            )
                             preset = gr.Dropdown(choices=["p7", "p6", "p5", "p4"], value=cfg["preset"], label="دقة الضغط")
                             cq = gr.Slider(minimum=18, maximum=30, step=1, value=cfg["cq"], label="الجودة CQ")
                             audio_bitrate = gr.Dropdown(choices=["128k", "160k", "192k"], value=cfg["audio_bitrate"], label="صوت AAC")
