@@ -3,10 +3,12 @@ import os
 import re
 import subprocess
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import pysubs2
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -93,6 +95,36 @@ def extract_embedded_subtitle(video_path: str, sub_pos: int, codec: str, out_dir
     return out_path
 
 
+def _extract_16k_mono_pcm(video_path: str, wav_path: str) -> np.ndarray:
+    """
+    Decode audio via system FFmpeg directly into a float32 16kHz mono NumPy array.
+    Completely bypasses PyAV (`av.open`), permanently eliminating PyAV version conflicts!
+    """
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", video_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-acodec", "pcm_s16le",
+        wav_path,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.isfile(wav_path):
+        raise RuntimeError(f"FFmpeg audio extraction failed: {res.stderr[-300:]}")
+
+    with wave.open(wav_path, "rb") as wf:
+        raw_bytes = wf.readframes(wf.getnframes())
+
+    try:
+        os.remove(wav_path)
+    except OSError:
+        pass
+
+    audio_i16 = np.frombuffer(raw_bytes, dtype=np.int16)
+    return audio_i16.astype(np.float32) / 32768.0
+
+
 def transcribe_with_whisper(
     video_path: str,
     out_srt_path: str,
@@ -109,18 +141,39 @@ def transcribe_with_whisper(
     except Exception:
         pass
 
+    os.makedirs(os.path.dirname(os.path.abspath(out_srt_path)), exist_ok=True)
+    tmp_wav = os.path.join(os.path.dirname(os.path.abspath(out_srt_path)), "_whisper_16k.wav")
+
+    if log_cb:
+        log_cb("[whisper_prog] 2.0% | استخراج الصوت النقي عبر FFmpeg (16kHz)...")
+    audio_array = _extract_16k_mono_pcm(video_path, tmp_wav)
+    total_dur = max(0.1, float(len(audio_array)) / 16000.0)
+
     if log_cb:
         log_cb(f"Loading faster-whisper ({model_size}) on {device}...")
+        log_cb(f"[whisper_prog] 5.0% | تحميل موديل Whisper ({model_size}) على {device}...")
+
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    segments, info = model.transcribe(video_path, beam_size=5, vad_filter=True)
+    segments, info = model.transcribe(audio_array, beam_size=5, vad_filter=True)
     if log_cb:
         log_cb(f"Detected language: {info.language} ({info.language_probability:.2f})")
 
     subs = pysubs2.SSAFile()
+    last_emit = 0.0
     for seg in segments:
         txt = seg.text.strip()
         if txt:
             subs.append(pysubs2.SSAEvent(start=int(seg.start * 1000), end=int(seg.end * 1000), text=txt, style="Main"))
+        now_t = time.monotonic()
+        if log_cb and (now_t - last_emit >= 0.5):
+            last_emit = now_t
+            pct = min(99.5, (float(seg.end) / total_dur) * 100.0)
+            cm, cs = divmod(int(seg.end), 60)
+            tm, ts = divmod(int(total_dur), 60)
+            log_cb(f"[whisper_prog] {pct:.1f}% | {cm:02d}:{cs:02d} / {tm:02d}:{ts:02d}")
+
+    if log_cb:
+        log_cb("[whisper_prog] 100.0% | اكتمل التفريغ الصوتي 100%")
     subs.save(out_srt_path)
     return out_srt_path
 
