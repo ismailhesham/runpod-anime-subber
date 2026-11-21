@@ -23,6 +23,7 @@ from media_ops import (
     download_torrent_or_url,
     episode_sort_key,
     extract_episode_number,
+    make_browser_preview,
     probe_video_info,
     rclone_remote_configured,
     drive_download_file,
@@ -826,9 +827,22 @@ def list_local_outputs() -> List[str]:
         if not STORAGE_ROOT.exists():
             return []
         mp4s = sorted(STORAGE_ROOT.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return [str(p) for p in mp4s[:50]]
+        return [str(p) for p in mp4s if not p.name.endswith("_preview.mp4")][:50]
     except OSError:
         return []
+
+
+def _browser_preview_path(video_path: str) -> str:
+    """Prefer the fast H.264 browser copy (..._preview.mp4) for the preview player,
+    so picking a burned episode never triggers Gradio's slow CPU re-encode."""
+    try:
+        if video_path:
+            cand = Path(video_path).with_name(Path(video_path).stem + "_preview.mp4")
+            if cand.is_file():
+                return str(cand)
+    except Exception:
+        pass
+    return video_path
 
 
 def list_cached_raw_videos() -> List[str]:
@@ -1177,6 +1191,19 @@ def step1_process_for_preview(
             updated_raw_list = [""] + list_cached_raw_videos()
 
         first_video = next(iter(rendered_map.values()))
+        preview_file = first_video
+        try:
+            preview_file = yield from run_live(
+                make_browser_preview,
+                first_video,
+                str(Path(first_video).with_name(Path(first_video).stem + "_preview.mp4")),
+                badge="PREVIEW · H264",
+                title="تجهيز نسخة معاينة سريعة للمتصفح (H.264 على كرت الشاشة)...",
+                accepts_progress_cb=True,
+            )
+        except Exception as pv_exc:
+            push(f"⚠️ تعذر تجهيز نسخة المعاينة السريعة: {pv_exc} — المعاينة هتستخدم الملف الأصلي.")
+            preview_file = first_video
         all_local = list_local_outputs()
 
         push(f"✅ اكتمل الإنتاج بالكامل! عاين الفيديو الآن، ثم اضغط [S-PORTAL] للرفع السحابي.")
@@ -1200,10 +1227,10 @@ def step1_process_for_preview(
             g2=gr.update(visible=True),
             dls=gr.update(visible=True),
         )
-        # المعاينة تصل في تحديث منفصل بعد اكتمال التحويل (ممكن ياخد دقائق مع ملف كبير)
+        # المعاينة تصل في تحديث منفصل (نسخة H.264 جاهزة مسبقاً فتظهر فوراً بدون تحويل)
         yield pack(
             done_hud,
-            preview_val=first_video,
+            preview_val=preview_file,
             local_dd=gr.update(value=first_video),
         )
     except Exception as exc:
@@ -1653,6 +1680,20 @@ def step_batch_process(
 
         all_local = list_local_outputs()
         first_video = next(iter(rendered.values()), None)
+        preview_file = first_video
+        if first_video:
+            try:
+                preview_file = yield from run_live(
+                    make_browser_preview,
+                    first_video,
+                    str(Path(first_video).with_name(Path(first_video).stem + "_preview.mp4")),
+                    badge="PREVIEW · H264",
+                    title="تجهيز نسخة معاينة سريعة للمتصفح (H.264 على كرت الشاشة)...",
+                    accepts_progress_cb=True,
+                )
+            except Exception as pv_exc:
+                push(f"⚠️ تعذر تجهيز نسخة المعاينة السريعة: {pv_exc} — المعاينة هتستخدم الملف الأصلي.")
+                preview_file = first_video
         done_n, fail_n = len(rendered), len(failed)
 
         if fail_n:
@@ -1684,7 +1725,7 @@ def step_batch_process(
         )
         yield pack(
             done_hud,
-            preview_val=first_video,
+            preview_val=preview_file,
             local_dd=gr.update(value=first_video),
         )
     except Exception as exc:
@@ -2017,7 +2058,7 @@ def build_ui() -> gr.Blocks:
 
         refresh_raw_btn.click(fn=lambda: gr.update(choices=[""] + list_cached_raw_videos()), outputs=[saved_raw_1080])
         refresh_local_btn.click(fn=lambda: gr.update(choices=list_local_outputs()), outputs=[local_dropdown])
-        local_dropdown.change(fn=lambda p: p, inputs=[local_dropdown], outputs=[preview_player])
+        local_dropdown.change(fn=_browser_preview_path, inputs=[local_dropdown], outputs=[preview_player])
 
         step1_btn.click(
             fn=step1_process_for_preview,
