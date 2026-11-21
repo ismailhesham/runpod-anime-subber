@@ -46,6 +46,7 @@ from subtitles_ai import (
 
 BASE_DIR = Path(__file__).resolve().parent
 FONTS_DIR = BASE_DIR / "fonts"
+LOGO_FILE = BASE_DIR / "assets" / "logo.png"
 STORAGE_ROOT = Path(os.environ.get("RUNPOD_OUTPUT_ROOT", "/workspace/outputs"))
 RAW_CACHE_ROOT = Path(os.environ.get("RUNPOD_RAW_CACHE", "/workspace/raw_episodes"))
 LEGACY_TEMP_ROOT = Path(os.environ.get("RUNPOD_TEMP_ROOT", "/workspace/tmp_downloads"))
@@ -732,6 +733,9 @@ def load_settings() -> Dict:
         "credit_translator": "",
         "credit_typesetter": "",
         "credit_encoder": "",
+        "logo_position": "top-right",
+        "logo_opacity": 0.30,
+        "logo_scale": 0.12,
     }
     if SETTINGS_FILE.is_file():
         try:
@@ -750,6 +754,7 @@ def save_settings(
     gdrive_remote, gdrive_folder,
     codec, preset, cq, audio_bitrate,
     credit_translator, credit_typesetter, credit_encoder,
+    logo_position, logo_opacity, logo_scale,
 ) -> str:
     data = {
         "provider": provider,
@@ -767,6 +772,9 @@ def save_settings(
         "credit_translator": credit_translator,
         "credit_typesetter": credit_typesetter,
         "credit_encoder": credit_encoder,
+        "logo_position": logo_position,
+        "logo_opacity": float(logo_opacity),
+        "logo_scale": float(logo_scale),
     }
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -879,6 +887,9 @@ def step1_process_for_preview(
     credit_typesetter: str,
     credit_encoder: str,
     cleanup_temp: bool,
+    logo_position: str,
+    logo_opacity: float,
+    logo_scale: float,
 ):
     logs: List[str] = []
     rendered_map: Dict[str, str] = {}
@@ -1138,6 +1149,10 @@ def step1_process_for_preview(
                 cq=int(cq),
                 preset=preset,
                 audio_bitrate=audio_bitrate,
+                logo_path=str(LOGO_FILE) if LOGO_FILE.is_file() else "",
+                logo_position=logo_position,
+                logo_opacity=float(logo_opacity),
+                logo_scale=float(logo_scale),
                 badge=f"STAGE 4/4 · NVENC ENCODE [{q_label}]",
                 title=f"حرق الترجمة وضغط جودة {q_label} بأعلى جودة وأقل حجم ({codec})...",
                 accepts_progress_cb=True,
@@ -1240,6 +1255,9 @@ def step_batch_process(
     credit_typesetter: str,
     credit_encoder: str,
     cleanup_temp: bool,
+    logo_position: str,
+    logo_opacity: float,
+    logo_scale: float,
 ):
     """Season batch mode: one or more torrent links (each may hold a whole season or more),
     download all episodes, translate + burn + compress each, and collect them into one
@@ -1573,6 +1591,10 @@ def step_batch_process(
                     cq=int(cq),
                     preset=preset,
                     audio_bitrate=audio_bitrate,
+                    logo_path=str(LOGO_FILE) if LOGO_FILE.is_file() else "",
+                    logo_position=logo_position,
+                    logo_opacity=float(logo_opacity),
+                    logo_scale=float(logo_scale),
                     badge=f"ENCODE [{ep_label} {gi}/{total}]",
                     title=f"حرق وضغط حلقة {gi} من {total} ({codec})...",
                     accepts_progress_cb=True,
@@ -1907,6 +1929,15 @@ def build_ui() -> gr.Blocks:
                             cq = gr.Slider(minimum=18, maximum=30, step=1, value=cfg["cq"], label="الجودة CQ")
                             audio_bitrate = gr.Dropdown(choices=["128k", "160k", "192k"], value=cfg["audio_bitrate"], label="صوت AAC")
                         with gr.Row():
+                            logo_position = gr.Dropdown(
+                                choices=[("أعلى اليمين", "top-right"), ("أعلى الشمال", "top-left"), ("أسفل اليمين", "bottom-right"), ("أسفل الشمال", "bottom-left")],
+                                value=cfg.get("logo_position", "top-right"),
+                                label="🛡️ مكان اللوجو المحروق",
+                            )
+                            logo_opacity = gr.Slider(minimum=0.2, maximum=1.0, step=0.05, value=cfg.get("logo_opacity", 0.30), label="شفافية اللوجو")
+                            logo_scale = gr.Slider(minimum=0.06, maximum=0.25, step=0.01, value=cfg.get("logo_scale", 0.12), label="حجم اللوجو (نسبة من عرض الفيديو)")
+                        gr.Markdown("📎 حط ملف اللوجو في `assets/logo.png` جنب الكود — لو الملف مش موجود، الفيديو يطلع بدون لوجو عادي.")
+                        with gr.Row():
                             credit_translator = gr.Textbox(value=cfg["credit_translator"], label="الترجمة")
                             credit_typesetter = gr.Textbox(value=cfg["credit_typesetter"], label="المحاكاة")
                             credit_encoder = gr.Textbox(value=cfg["credit_encoder"], label="الدمج والرفع")
@@ -1965,6 +1996,7 @@ def build_ui() -> gr.Blocks:
                 gdrive_remote, gdrive_folder,
                 codec, preset, cq, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
+                logo_position, logo_opacity, logo_scale,
             ],
             outputs=[save_status],
         )
@@ -1986,6 +2018,7 @@ def build_ui() -> gr.Blocks:
                 codec, cq, preset, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
+                logo_position, logo_opacity, logo_scale,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
@@ -2003,6 +2036,7 @@ def build_ui() -> gr.Blocks:
                 codec, cq, preset, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
+                logo_position, logo_opacity, logo_scale,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
