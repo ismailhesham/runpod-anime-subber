@@ -70,6 +70,52 @@ def probe_video_info(video_path: str) -> Tuple[int, int, float, float]:
     return w, h, max(1.0, fps), max(0.0, dur)
 
 
+_EP_NUM_PATTERNS = [
+    re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})"),
+    re.compile(r"(?:^|[\s_\-\[\(])(?:ep|episode|e)[\s_.\-]*(\d{1,4})(?:v\d+)?(?:[\s_\-\]\)\.\[]|$)", re.IGNORECASE),
+    re.compile(r"-\s*(\d{1,4})(?:v\d+)?\s*[\[\.\-]"),
+    re.compile(r"(?:^|[\s_\-\[\(])(\d{2,4})(?:v\d+)?(?:[\s_\-\]\)\.\[]|$)"),
+]
+
+_RESOLUTION_NUMBERS = {360, 480, 540, 576, 720, 900, 1080, 1440, 2160}
+
+
+def extract_episode_number(name: str) -> Optional[int]:
+    """Best-effort episode number from a fansub filename (S01E05, 'Name - 05', 'Ep 05'...)."""
+    stem = Path(name).stem
+    m = _EP_NUM_PATTERNS[0].search(stem)
+    if m:
+        return int(m.group(2))
+    for pat in _EP_NUM_PATTERNS[1:]:
+        for mm in pat.finditer(stem):
+            num = int(mm.group(1))
+            if num in _RESOLUTION_NUMBERS:
+                continue
+            return num
+    return None
+
+
+def episode_sort_key(path) -> Tuple[int, str]:
+    p = Path(path)
+    num = extract_episode_number(p.name)
+    return (num if num is not None else 99999, p.name.lower())
+
+
+def collect_episode_videos(folder) -> List[Path]:
+    """All fully downloaded videos inside a season folder, sorted in episode order."""
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    if any(folder.rglob("*.aria2")):
+        return []
+    vids = [
+        p for p in folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS and p.stat().st_size > 1024 * 1024
+    ]
+    vids.sort(key=episode_sort_key)
+    return vids
+
+
 def find_completed_video(folder: Path) -> Optional[Path]:
     """Return completed video file (>1MB and no active .aria2 control file) if already downloaded."""
     if not folder.exists():
@@ -125,6 +171,31 @@ def download_torrent_or_url(
     if not target:
         raise ValueError("لم يتم إدخال رابط أو اختيار حلقة محفوظة.")
 
+    _run_aria2(target, output_dir, log_cb=log_cb, progress_cb=progress_cb)
+
+    videos = sorted(
+        [p for p in out_path.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS],
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    if not videos:
+        raise FileNotFoundError(f"لم يتم العثور على ملف فيديو داخل {output_dir}")
+
+    mb = videos[0].stat().st_size / (1024 * 1024)
+    if progress_cb:
+        progress_cb(100.0, "اكتمل التحميل 100% وحُفظ دائماً ✓", f"{mb:.1f} MB · {videos[0].name}")
+    return videos[0]
+
+
+def _run_aria2(
+    target: str,
+    output_dir: str,
+    log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> None:
+    """Run aria2c (torrent/magnet/URL) into output_dir with resume support and live progress."""
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
     has_partial = any(out_path.rglob("*.aria2"))
     overwrite_flag = "--allow-overwrite=false" if has_partial else "--allow-overwrite=true"
 
@@ -179,18 +250,53 @@ def download_torrent_or_url(
     if proc.wait() != 0:
         raise RuntimeError("فشل تحميل aria2c — تأكد من صحة رابط التورنت أو الرابط المباشر.")
 
-    videos = sorted(
-        [p for p in out_path.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS],
-        key=lambda p: p.stat().st_size,
-        reverse=True,
-    )
-    if not videos:
-        raise FileNotFoundError(f"لم يتم العثور على ملف فيديو داخل {output_dir}")
 
-    mb = videos[0].stat().st_size / (1024 * 1024)
+def download_season_batch(
+    source_link: Optional[str],
+    torrent_file: Optional[str],
+    output_dir: str,
+    log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> List[Path]:
+    """Download a whole season/batch torrent and return every episode video in episode order.
+
+    A link may contain one episode or several seasons; all videos found are returned,
+    sorted by the episode number extracted from each filename. Reuses the completed
+    download on later runs (resume-safe).
+    """
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    cached = collect_episode_videos(out_path)
+    if cached:
+        total_mb = sum(p.stat().st_size for p in cached) / (1024 * 1024)
+        if log_cb:
+            log_cb(f"⚡ الموسم محفوظ مسبقاً بالكامل ({len(cached)} ملف فيديو، {total_mb:.0f} MB) — تم تخطي التحميل!")
+        if progress_cb:
+            progress_cb(100.0, "محفوظ مسبقاً على السيرفر ⚡", f"{len(cached)} حلقة · {total_mb:.0f} MB")
+        return cached
+
+    target = None
+    if torrent_file and os.path.isfile(torrent_file):
+        target = torrent_file
+    elif source_link and source_link.strip():
+        target = source_link.strip()
+    if not target:
+        raise ValueError("لم يتم إدخال رابط تورنت للموسم.")
+
+    _run_aria2(target, output_dir, log_cb=log_cb, progress_cb=progress_cb)
+
+    vids = collect_episode_videos(out_path)
+    if not vids:
+        raise FileNotFoundError(f"لم يتم العثور على ملفات فيديو داخل {output_dir}")
+    if log_cb:
+        log_cb(f"✓ اكتمل تحميل الدفعة: {len(vids)} حلقة بالترتيب:")
+        for v in vids:
+            ep = extract_episode_number(v.name)
+            log_cb(f"   • حلقة {ep if ep is not None else '?'} ← {v.name}")
     if progress_cb:
-        progress_cb(100.0, "اكتمل التحميل 100% وحُفظ دائماً ✓", f"{mb:.1f} MB · {videos[0].name}")
-    return videos[0]
+        progress_cb(100.0, "اكتمل تحميل الدفعة 100% ✓", f"{len(vids)} حلقة")
+    return vids
 
 
 def _escape_ffmpeg_path(path: str) -> str:
