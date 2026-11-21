@@ -890,6 +890,7 @@ def step1_process_for_preview(
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         logs.append(line)
         _append_disk_log(line)
+        print(line, flush=True)
 
     push(f"🗂️ نسخة دائمة من هذا السجل تُحفظ تلقائياً في: {RUN_LOG_FILE}")
 
@@ -983,6 +984,11 @@ def step1_process_for_preview(
         for lbl, lnk, fl in [("1080p", link_1080, eff_1080), ("720p", link_720, file_720), ("480p", link_480, file_480)]
         if (lnk and lnk.strip()) or fl
     ]
+    stale_uploads = [lbl for lbl, _lnk, fl in quality_inputs if fl and not os.path.isfile(fl)]
+    if stale_uploads:
+        push(f"⚠️ ملفات الرفع المؤقتة لجودة {'/'.join(stale_uploads)} اتمسحت من السيرفر (الرفع المؤقت بيعيش ساعة تقريباً) — ارفع الملف تاني أو اختر الحلقة من قائمة المحفوظ.")
+        yield pack(render_progress_hud(0.0, "تنبيه · أعد رفع الملف", "الملف المرفوع انتهت صلاحيته — ارفعه تاني أو اختر من المحفوظ على السيرفر", "—", "—", mode="error"), state_val={})
+        return
     if not quality_inputs:
         push("⚠️ أدخل رابط تورنت أو اختر حلقة خام محفوظة من القائمة قبل الانطلاق.")
         yield pack(render_progress_hud(0.0, "تنبيه · لا يوجد مصدر", "أدخل رابط أو اختر حلقة محفوظة", "—", "—", mode="error"), state_val={})
@@ -1244,6 +1250,7 @@ def step_batch_process(
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         logs.append(line)
         _append_disk_log(line)
+        print(line, flush=True)
 
     push(f"🗂️ نسخة دائمة من هذا السجل تُحفظ تلقائياً في: {RUN_LOG_FILE}")
 
@@ -1692,6 +1699,7 @@ def step2_approve_and_upload(
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         logs.append(line)
         _append_disk_log(line)
+        print(line, flush=True)
 
     push(f"🗂️ نسخة دائمة من هذا السجل تُحفظ تلقائياً في: {RUN_LOG_FILE}")
 
@@ -2041,6 +2049,10 @@ if __name__ == "__main__":
         launch_kwargs["css"] = SHADOW_BLADE_CSS
     if "head" in launch_sig:
         launch_kwargs["head"] = SHADOW_BLADE_HEAD
+    if "allowed_paths" in launch_sig:
+        launch_kwargs["allowed_paths"] = [str(STORAGE_ROOT), str(RAW_CACHE_ROOT)]
+    if "delete_cache" in launch_sig:
+        launch_kwargs["delete_cache"] = (86400, 86400)
 
     ui.queue().launch(**launch_kwargs)
 
