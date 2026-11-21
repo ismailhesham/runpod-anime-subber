@@ -89,12 +89,15 @@ _seed_rclone_from_secrets()
 def _drive_restore_glossaries() -> None:
     """Fresh pod: pull back saved per-series glossaries from Drive (best effort)."""
     try:
-        if not rclone_remote_configured("gdrive"):
+        _st = load_settings()
+        _drv_remote = str(_st.get("gdrive_remote", "gdrive")).strip() or "gdrive"
+        if not rclone_remote_configured(_drv_remote):
             return
+        _drv_folder = str(_st.get("gdrive_folder", "Runpod_Anime")).strip() or "Runpod_Anime"
         gdir = _glossary_dir()
         gdir.mkdir(parents=True, exist_ok=True)
         subprocess_res = os.system(
-            "rclone copy gdrive:Runpod_Anime/_state/glossaries "
+            f"rclone copy {_drv_remote}:{_drv_folder}/_state/glossaries "
             + str(gdir) + " --ignore-existing >/dev/null 2>&1"
         )
         _ = subprocess_res
@@ -102,7 +105,22 @@ def _drive_restore_glossaries() -> None:
         pass
 
 
-_drive_restore_glossaries()
+def _drive_backup_glossary(series_name: str) -> bool:
+    """Persist the per-series glossary to Drive so character names survive a pod wipe.
+    Best effort: never raises, never blocks the run."""
+    try:
+        _st = load_settings()
+        drv_remote = str(_st.get("gdrive_remote", "gdrive")).strip() or "gdrive"
+        if not rclone_remote_configured(drv_remote):
+            return False
+        drv_folder = str(_st.get("gdrive_folder", "Runpod_Anime")).strip() or "Runpod_Anime"
+        gfile = _glossary_dir() / f"{_glossary_slug(series_name)}.json"
+        if not gfile.is_file():
+            return False
+        upload_to_rclone(str(gfile), drv_remote, f"{drv_folder}/_state/glossaries", generate_link=False)
+        return True
+    except Exception:
+        return False
 
 SHADOW_BLADE_HEAD = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -645,6 +663,9 @@ def load_settings() -> Dict:
     return defaults
 
 
+_drive_restore_glossaries()
+
+
 def save_settings(
     provider, llm_model, api_key, base_url, style_preset, dood_api_key,
     gdrive_remote, gdrive_folder,
@@ -992,6 +1013,8 @@ def step1_process_for_preview(
             title="حفظ أسماء ومصطلحات الحلقة في قاموس الأنمي...",
             accepts_progress_cb=False,
         )
+        if _drive_backup_glossary(series_name):
+            push("📚☁️ قاموس أسماء «" + (series_name.strip() or "الأنمي") + "» اتحفظ على Drive — الأسماء هتفضل ثابتة حتى لو قفلت السيرفر وبدأت من الأول.")
 
         credits_dict = {
             "translator": credit_translator,
