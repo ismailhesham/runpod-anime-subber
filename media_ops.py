@@ -637,6 +637,46 @@ def upload_to_doodstream(
     }
 
 
+
+def rclone_remote_configured(remote_name: str) -> bool:
+    """True when `rclone listremotes` shows the named remote (e.g. gdrive:)."""
+    try:
+        res = subprocess.run(
+            ["rclone", "listremotes"], capture_output=True, text=True, timeout=20
+        )
+        want = remote_name.strip().rstrip(":") + ":"
+        return want in res.stdout.split()
+    except Exception:
+        return False
+
+
+def drive_download_file(
+    remote_name: str,
+    folder_path: str,
+    fname: str,
+    local_path: str,
+    log_cb: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Best-effort restore of one file from Drive. Never raises; False when absent.
+
+    Uses --ignore-existing so a newer local file (same pod) is never overwritten.
+    """
+    src = f"{remote_name.strip().rstrip(':')}:{folder_path.strip().strip('/')}/{fname}"
+    try:
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run(
+            ["rclone", "copyto", src, local_path, "--ignore-existing"],
+            capture_output=True, text=True, timeout=300,
+        )
+        ok = res.returncode == 0 and Path(local_path).is_file()
+        if ok and log_cb:
+            log_cb(f"☁️ تم استرجاع {fname} من Google Drive.")
+        return ok
+    except Exception as exc:
+        if log_cb:
+            log_cb(f"⚠️ تعذر استرجاع {fname} من Drive ({exc})")
+        return False
+
 def qc_burned_episode(
     source_path: str,
     output_path: str,
