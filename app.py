@@ -549,32 +549,51 @@ html, body, .gradio-container {
     30% { opacity: 1; transform: scale(1); } 80% { opacity: 1; } 100% { opacity: 0; transform: scale(1.02) translateY(-10px); } }
 .sb-fps { color: #FDE68A; font-weight: 800; }
 
-/* ==== Series picker: dark dropdown ==== */
-#series_picker input {
+/* ==== Dark dropdowns (all Gradio dropdowns) ==== */
+input[role="combobox"] {
     background: #0b1020 !important;
     color: #dfe8ff !important;
     border: 1px solid #2a3a66 !important;
 }
-#series_picker input::placeholder { color: #5b6b96 !important; }
-#series_picker .options {
+input[role="combobox"]::placeholder { color: #5b6b96 !important; }
+.options {
     background: #0b1020 !important;
     border: 1px solid #2a3a66 !important;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.65) !important;
 }
-#series_picker ul.option-list { background: #0b1020 !important; }
-#series_picker ul.option-list li.item {
+ul.option-list { background: #0b1020 !important; }
+ul.option-list li.item {
     background: transparent !important;
     color: #dfe8ff !important;
 }
-#series_picker ul.option-list li.item:hover,
-#series_picker ul.option-list li.item.active {
+ul.option-list li.item:hover,
+ul.option-list li.item.active {
     background: #1a2547 !important;
 }
-#series_picker ul.option-list li.item.selected {
+ul.option-list li.item.selected {
     background: #14203f !important;
     color: #8ab4ff !important;
 }
-#series_picker svg, #series_picker .icon { color: #8ab4ff !important; }
+.dropdown-arrow path { fill: #8ab4ff !important; }
+
+/* dropdown wrapper shells (input itself can be transparent) */
+div.wrap:has(input[role="combobox"]) .wrap-inner,
+div.wrap:has(input[role="combobox"]) .secondary-wrap {
+    background: #0b1020 !important;
+    border-color: #2a3a66 !important;
+}
+.options input,
+.options .wrap-inner,
+.options .secondary-wrap {
+    background: #0b1020 !important;
+    color: #dfe8ff !important;
+    border-color: #2a3a66 !important;
+}
+
+/* outer block ring around dropdowns */
+div.block:has(input[role="combobox"]) {
+    border-color: #2a3a66 !important;
+}
 
 """
 
