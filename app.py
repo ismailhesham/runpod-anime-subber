@@ -16,11 +16,9 @@ import gradio as gr
 
 from media_ops import (
     VIDEO_EXTENSIONS,
-    build_inpainted_sign_patches,
     burn_and_compress_native,
     download_torrent_or_url,
     probe_video_info,
-    scan_japanese_signs,
     upload_to_doodstream,
     upload_to_rclone,
 )
@@ -32,7 +30,6 @@ from subtitles_ai import (
     probe_embedded_subtitles,
     save_series_glossary,
     transcribe_with_whisper,
-    translate_detected_signs,
     translate_entries,
     write_responsive_ass,
 )
@@ -43,6 +40,16 @@ STORAGE_ROOT = Path(os.environ.get("RUNPOD_OUTPUT_ROOT", "/workspace/outputs"))
 RAW_CACHE_ROOT = Path(os.environ.get("RUNPOD_RAW_CACHE", "/workspace/raw_episodes"))
 LEGACY_TEMP_ROOT = Path(os.environ.get("RUNPOD_TEMP_ROOT", "/workspace/tmp_downloads"))
 SETTINGS_FILE = Path(os.environ.get("RUNPOD_SETTINGS_FILE", "/workspace/subber_settings.json"))
+
+# مفاتيح محفوظة في ملف subber_secrets.json جنب الكود (بتتقري تلقائياً عند التشغيل)
+_SECRETS_FILE = BASE_DIR / "subber_secrets.json"
+if _SECRETS_FILE.is_file():
+    try:
+        for _k, _v in json.loads(_SECRETS_FILE.read_text(encoding="utf-8")).items():
+            if isinstance(_v, str) and _v.strip():
+                os.environ.setdefault(_k.strip(), _v.strip())
+    except Exception:
+        pass
 
 ensure_style_profile()
 
@@ -215,19 +222,6 @@ html, body, .gradio-container {
     unicode-bidi: plaintext !important;
 }
 
-#sb-scan-btn {
-    min-height: 56px !important;
-    background: linear-gradient(135deg, #1E1B0A 0%, #0F172A 100%) !important;
-    color: #FEF3C7 !important;
-    border: 1.5px solid var(--sb-amber) !important;
-    font-family: 'Cairo', sans-serif !important;
-    font-size: 15.5px !important;
-    font-weight: 900 !important;
-    border-radius: 6px !important;
-    box-shadow: 0 0 20px rgba(251, 191, 36, 0.18) !important;
-    margin: 8px 0 !important;
-}
-
 #sb-step1-btn, #sb-step2-btn {
     min-height: 64px !important;
     border-radius: 6px !important;
@@ -290,21 +284,20 @@ SHADOW_BLADE_HERO_HTML = """
                 </svg>
             </div>
             <div>
-                <div class="sb-title-eyebrow">CELESTIAL ENGINE · DEEPSEEK V4.1 · LAMA INPAINTING</div>
+                <div class="sb-title-eyebrow">CELESTIAL ENGINE · DEEPSEEK V4.1 · WHISPER</div>
                 <h1 class="sb-main-title">
                     نصل الظل · سَبّر الأنمي الاحترافي
-                    <span class="sb-rank-pill">QUICK REVIEW · %W/%H RESPONSIVE</span>
+                    <span class="sb-rank-pill">AUTO-WHISPER · %W/%H RESPONSIVE</span>
                 </h1>
                 <p class="sb-subtitle-desc">
-                    <strong>1 [SCAN]:</strong> فحص اللافتات اليابانية الصامتة والقاموس ومراجعتها بضغطة &nbsp;←&nbsp;
-                    <strong>2 [STRIKE]:</strong> محو الياباني بـ LaMa وترجمة Celestial-Dragons وحرق كل الجودات بالنسب المئوية &nbsp;←&nbsp;
-                    <strong>3 [S-PORTAL]:</strong> الرفع السحابي
+                    <strong>1 [STRIKE]:</strong> ترجمة إنجليزية ← عربية بأسلوب Celestial-Dragons عبر DeepSeek، ولو الحلقة خام بيسمعها Whisper ويفرّغ صوتها، ثم حرق وضغط كل الجودات MP4 &nbsp;←&nbsp;
+                    <strong>2 [S-PORTAL]:</strong> الرفع السحابي (DoodStream / Google Drive)
                 </p>
             </div>
         </div>
         <div class="sb-hud-chip">
             <span class="sb-dot-online"></span>
-            <span>DEEPSEEK-FLASH · LAMA GPU · WHISPER · NVENC</span>
+            <span>DEEPSEEK · WHISPER · NVENC</span>
         </div>
     </div>
 </div>
@@ -336,7 +329,7 @@ _rescue_legacy_tmp_downloads()
 def render_progress_hud(
     pct: float = 0.0,
     badge: str = "HUNTER HUD · STANDBY",
-    title: str = "جاهز للانطلاق — افحص اللافتات [SCAN] للمراجعة السريعة أو اضغط [STRIKE] مباشرة",
+    title: str = "جاهز — اضغط [STRIKE] للترجمة والحرق والضغط MP4",
     metric: str = "السرعة: — · المتبقي: —",
     detail: str = "الحلقات الخام والقواميس والموديلات محفوظة دائماً في /workspace",
     mode: str = "cyan",
@@ -366,18 +359,16 @@ def render_progress_hud(
 def load_settings() -> Dict:
     defaults = {
         "provider": "DeepSeek API (موصى به)",
-        "llm_model": "deepseek-flash",
+        "llm_model": "deepseek-v4-pro",
         "api_key": os.environ.get("DEEPSEEK_API_KEY", os.environ.get("GEMINI_API_KEY", "")),
         "base_url": "https://api.deepseek.com",
         "style_preset": "black_clover_style",
         "dood_api_key": os.environ.get("DOODSTREAM_API_KEY", ""),
-        "mega_remote": "mega",
-        "mega_folder": "Runpod_Anime",
         "gdrive_remote": "gdrive",
         "gdrive_folder": "Runpod_Anime",
-        "codec": "h264_nvenc",
-        "preset": "p6",
-        "cq": 23,
+        "codec": "hevc_nvenc",
+        "preset": "p7",
+        "cq": 24,
         "audio_bitrate": "160k",
         "credit_translator": "",
         "credit_typesetter": "",
@@ -394,7 +385,7 @@ def load_settings() -> Dict:
 
 def save_settings(
     provider, llm_model, api_key, base_url, style_preset, dood_api_key,
-    mega_remote, mega_folder, gdrive_remote, gdrive_folder,
+    gdrive_remote, gdrive_folder,
     codec, preset, cq, audio_bitrate,
     credit_translator, credit_typesetter, credit_encoder,
 ) -> str:
@@ -405,8 +396,6 @@ def save_settings(
         "base_url": base_url,
         "style_preset": style_preset,
         "dood_api_key": dood_api_key,
-        "mega_remote": mega_remote,
-        "mega_folder": mega_folder,
         "gdrive_remote": gdrive_remote,
         "gdrive_folder": gdrive_folder,
         "codec": codec,
@@ -424,7 +413,7 @@ def save_settings(
 
 def _on_provider_change(prov: str) -> Tuple[Any, Any]:
     if "DeepSeek" in prov:
-        return gr.update(value="deepseek-flash"), gr.update(value="https://api.deepseek.com")
+        return gr.update(value="deepseek-v4-pro"), gr.update(value="https://api.deepseek.com")
     if "Gemini" in prov:
         return gr.update(value="gemini-3.8-flash"), gr.update(value="")
     return gr.update(value="deepseek-flash"), gr.update(value="http://localhost:8000/v1")
@@ -448,67 +437,6 @@ def _ms_fmt(ms: int) -> str:
     m = int(s_tot // 60)
     s = s_tot - m * 60
     return f"{m:02d}:{s:05.2f}"
-
-
-def _is_truthy(val: Any) -> bool:
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return val != 0
-    s = str(val or "").strip().lower()
-    return s in ("true", "1", "yes", "y", "نعم", "✓", "on")
-
-
-def _signs_to_table_and_gallery(signs: List[Dict]) -> Tuple[List[List[Any]], List[Tuple[str, str]]]:
-    rows: List[List[Any]] = []
-    gallery: List[Tuple[str, str]] = []
-    for sg in signs:
-        rows.append(
-            [
-                bool(sg.get("enabled", True)),
-                int(sg["id"]),
-                _ms_fmt(sg["start_ms"]),
-                _ms_fmt(sg["end_ms"]),
-                sg.get("jp_text", ""),
-                sg.get("ar_text", ""),
-                sg.get("fill_hex", "#FFFFFF"),
-                sg.get("outline_hex", "#000000"),
-            ]
-        )
-        tp = sg.get("thumb_path", "")
-        if tp and os.path.isfile(tp):
-            cap = f"#{sg['id']} [{_ms_fmt(sg['start_ms'])}] {sg.get('ar_text') or sg.get('jp_text', '')}"
-            gallery.append((tp, cap))
-    return rows, gallery
-
-
-def _merge_table_edits_into_signs(orig_signs: List[Dict], table_rows: Any) -> List[Dict]:
-    if not orig_signs or table_rows is None:
-        return orig_signs
-    if hasattr(table_rows, "values"):
-        rows_list = table_rows.values.tolist()
-    elif isinstance(table_rows, list):
-        rows_list = table_rows
-    else:
-        return orig_signs
-
-    by_id = {int(s["id"]): dict(s) for s in orig_signs}
-    for r in rows_list:
-        if not r or len(r) < 6:
-            continue
-        try:
-            sid = int(float(r[1]))
-        except Exception:
-            continue
-        if sid not in by_id:
-            continue
-        by_id[sid]["enabled"] = _is_truthy(r[0])
-        by_id[sid]["ar_text"] = str(r[5] or "").strip()
-        if len(r) > 6 and str(r[6] or "").strip():
-            by_id[sid]["fill_hex"] = str(r[6]).strip()
-        if len(r) > 7 and str(r[7] or "").strip():
-            by_id[sid]["outline_hex"] = str(r[7]).strip()
-    return [by_id[k] for k in sorted(by_id.keys())]
 
 
 def list_local_outputs() -> List[str]:
@@ -548,207 +476,6 @@ def _raw_cache_dir_for_source(q_label: str, source_link: Optional[str], torrent_
     return RAW_CACHE_ROOT / f"{key}_{q_label}"
 
 
-def step0_quick_scan_signs_and_glossary(
-    episode_name: str,
-    series_name: str,
-    saved_raw_1080: str,
-    link_1080: str, file_1080: Optional[str],
-    link_720: str, file_720: Optional[str],
-    link_480: str, file_480: Optional[str],
-    sub_mode: str,
-    whisper_model: str,
-    min_sign_h_pct: float,
-    skip_op_ed_signs: bool,
-    provider: str,
-    api_key: str,
-    llm_model: str,
-    base_url: str,
-):
-    logs: List[str] = []
-
-    def push(msg: str) -> None:
-        logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-
-    def pack(hud_html: str, gal=gr.update(), tbl=gr.update(), gls=gr.update(), raw_dd=gr.update(), st=gr.update()):
-        return (hud_html, "\n".join(logs[-150:]), gal, tbl, gls, raw_dd, st)
-
-    def run_live(fn: Callable, *args, badge: str, title: str, accepts_progress_cb: bool = True, **kwargs):
-        ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
-        res_box: Dict[str, object] = {}
-        kwargs["log_cb"] = lambda m: ev_q.put(("log", m))
-        if accepts_progress_cb:
-            kwargs["progress_cb"] = lambda p, met, det: ev_q.put(("prog", (p, met, det)))
-
-        def _worker():
-            try:
-                res_box["val"] = fn(*args, **kwargs)
-            except Exception as e:
-                res_box["err"] = e
-
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        cur_pct, cur_met, cur_det = 1.0, "جاري التنفيذ...", ""
-        dirty = True
-        last_y = 0.0
-        while t.is_alive() or not ev_q.empty():
-            try:
-                items = [ev_q.get(timeout=0.25)]
-            except queue.Empty:
-                items = []
-            while not ev_q.empty():
-                try:
-                    items.append(ev_q.get_nowait())
-                except queue.Empty:
-                    break
-            for k, p in items:
-                dirty = True
-                if k == "prog":
-                    cur_pct, cur_met, cur_det = p  # type: ignore[misc]
-                else:
-                    msg_s = str(p)
-                    if msg_s.startswith("[whisper_prog]"):
-                        parts = msg_s.replace("[whisper_prog]", "").strip().split("|")
-                        try:
-                            cur_pct = float(parts[0].replace("%", "").strip())
-                        except Exception:
-                            pass
-                        cur_met = "تفريغ صوتي Faster-Whisper ⚡"
-                        cur_det = parts[1].strip() if len(parts) > 1 else ""
-                    else:
-                        push(msg_s)
-            now_m = time.monotonic()
-            if dirty and (now_m - last_y >= 0.35 or not t.is_alive()):
-                last_y = now_m
-                dirty = False
-                yield pack(render_progress_hud(cur_pct, badge, title, cur_met, cur_det))
-        if "err" in res_box:
-            raise res_box["err"]  # type: ignore[misc]
-        return res_box.get("val")
-
-    eff_1080 = saved_raw_1080 if (saved_raw_1080 and os.path.isfile(saved_raw_1080)) else file_1080
-    q_inputs = [
-        (lbl, lnk, fl)
-        for lbl, lnk, fl in [("1080p", link_1080, eff_1080), ("720p", link_720, file_720), ("480p", link_480, file_480)]
-        if (lnk and lnk.strip()) or fl
-    ]
-    if not q_inputs:
-        push("⚠️ اختر حلقة خام أو أدخل رابط التورنت أولاً قبل الفحص السريع.")
-        yield pack(render_progress_hud(0.0, "SCAN · NO SOURCE", "اختر حلقة أو أدخل رابط أولاً", "—", "—", mode="error"))
-        return
-
-    auto_base = episode_name.strip() or (Path(eff_1080).stem if (eff_1080 and os.path.isfile(eff_1080)) else "")
-    ep_folder_name = _safe_name(auto_base)
-    work_dir = RAW_CACHE_ROOT / "_work" / ep_folder_name
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        q_label, lnk, fl = q_inputs[0]
-        cdir = _raw_cache_dir_for_source(q_label, lnk, fl, ep_folder_name)
-        primary_vid = yield from run_live(
-            download_torrent_or_url,
-            lnk, fl, str(cdir),
-            badge=f"SCAN 1/3 · SOURCE [{q_label}]",
-            title="تجهيز الحلقة الخام للفحص البصري...",
-            accepts_progress_cb=True,
-        )
-
-        source_sub = None
-        is_raw_whisper = False
-        if sub_mode.startswith("Auto"):
-            probe = probe_embedded_subtitles(str(primary_vid))
-            if probe is not None:
-                source_sub = extract_embedded_subtitle(str(primary_vid), probe[0], probe[1], str(work_dir))
-                push(f"✓ تم سحب الترجمة المدمجة ({probe[1]}) لاستخراج السياق والقاموس.")
-
-        if source_sub is None:
-            is_raw_whisper = True
-            source_sub = yield from run_live(
-                transcribe_with_whisper,
-                str(primary_vid),
-                str(work_dir / "whisper.srt"),
-                model_size=whisper_model,
-                badge=f"SCAN 2/3 · WHISPER [{whisper_model}]",
-                title="فيديو خام بدون ترجمة — جاري التفريغ الصوتي بـ Faster-Whisper...",
-                accepts_progress_cb=False,
-            )
-
-        entries = parse_source_subtitles(source_sub)
-
-        signs = yield from run_live(
-            scan_japanese_signs,
-            str(primary_vid),
-            str(work_dir),
-            min_height_pct=float(min_sign_h_pct),
-            skip_op_ed_credits=bool(skip_op_ed_signs),
-            badge="SCAN 3/3 · JAPANESE OCR",
-            title="فحص كوادر الحلقة بـ EasyOCR للقط اللافتات الصامتة وألوانها...",
-            accepts_progress_cb=True,
-        )
-
-        glossary = {}
-        if api_key.strip() or "Local" in provider:
-            glossary = yield from run_live(
-                load_or_extract_series_glossary,
-                series_name=series_name,
-                entries=entries,
-                is_raw_whisper=is_raw_whisper,
-                provider=_provider_key(provider),
-                api_key=api_key,
-                model_name=llm_model,
-                base_url=base_url,
-                badge="SCAN · GLOSSARY AI",
-                title="استخراج قاموس الشخصيات والمصطلحات عبر الذكاء الاصطناعي...",
-                accepts_progress_cb=False,
-            )
-            if signs:
-                signs = yield from run_live(
-                    translate_detected_signs,
-                    signs=signs,
-                    entries=entries,
-                    series_name=series_name,
-                    glossary=glossary,
-                    provider=_provider_key(provider),
-                    api_key=api_key,
-                    model_name=llm_model,
-                    base_url=base_url,
-                    badge="SCAN · SIGN TRANSLATION",
-                    title=f"ترجمة {len(signs)} لافتة يابانية مكتشفة...",
-                    accepts_progress_cb=False,
-                )
-
-        rows, gallery = _signs_to_table_and_gallery(signs)
-        glossary_str = json.dumps(glossary, ensure_ascii=False, indent=2) if glossary else "{}"
-        state_obj = {
-            "primary_vid": str(primary_vid),
-            "source_sub": source_sub,
-            "is_raw_whisper": is_raw_whisper,
-            "signs": signs,
-            "work_dir": str(work_dir),
-        }
-
-        push(f"✅ جاهز للمراجعة السريعة! راجع الجدول والمصغرات بالأسفل، شيل الصح من أي لافتة غير مرغوبة ثم اضغط [STRIKE].")
-        yield pack(
-            render_progress_hud(
-                100.0,
-                "QUICK REVIEW READY · 100%",
-                f"تم لقط {len(signs)} لافتة صامتة وتجهيز القاموس — راجعها بالأسفل ثم اضغط [STRIKE]!",
-                f"{len(entries)} سطر حوار جاهز",
-                primary_vid.name,
-                mode="done",
-            ),
-            gal=gallery,
-            tbl=rows,
-            gls=glossary_str,
-            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
-            st=state_obj,
-        )
-    except Exception as exc:
-        push(f"❌ خطأ أثناء الفحص السريع: {exc}\n{traceback.format_exc()[-450:]}")
-        yield pack(
-            render_progress_hud(0.0, "SCAN ERROR", f"خطأ أثناء الفحص: {str(exc)[:100]}", "راجع السجل", "", mode="error")
-        )
-
-
 def step1_process_for_preview(
     episode_name: str,
     series_name: str,
@@ -759,12 +486,6 @@ def step1_process_for_preview(
     link_480: str, file_480: Optional[str],
     sub_mode: str,
     whisper_model: str,
-    auto_scan_if_skipped: bool,
-    min_sign_h_pct: float,
-    skip_op_ed_signs: bool,
-    signs_table: Any,
-    glossary_box: str,
-    scan_state: Dict,
     provider: str,
     api_key: str,
     llm_model: str,
@@ -790,14 +511,11 @@ def step1_process_for_preview(
         preview_val=gr.update(),
         local_dd=gr.update(),
         raw_dd=gr.update(),
-        gal=gr.update(),
-        tbl=gr.update(),
-        gls=gr.update(),
         vids_val=gr.update(),
         ass_val=gr.update(),
         state_val=gr.update(),
     ):
-        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, gal, tbl, gls, vids_val, ass_val, state_val)
+        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val)
 
     def run_live(fn: Callable, *args, badge: str, title: str, mode: str = "cyan", accepts_progress_cb: bool = True, **kwargs):
         ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
@@ -897,42 +615,30 @@ def step1_process_for_preview(
         updated_raw_list = [""] + list_cached_raw_videos()
         primary_vid = downloaded[quality_inputs[0][0]]
 
-        # Reuse scan_state subtitle if matching same primary video
+        # مصدر الترجمة: سحب الترجمة الإنجليزية المدمجة، وإلا تفريغ صوتي بـ Whisper
         source_sub = None
         is_raw_whisper = False
-        if scan_state and scan_state.get("primary_vid") == str(primary_vid) and os.path.isfile(str(scan_state.get("source_sub", ""))):
-            source_sub = str(scan_state["source_sub"])
-            is_raw_whisper = bool(scan_state.get("is_raw_whisper", False))
-            push("⚡ استخدام ملف التفريغ/الترجمة المستخرج مسبقاً من خطوة المراجعة السريعة.")
-        else:
-            if sub_mode.startswith("Auto"):
-                probe = probe_embedded_subtitles(str(primary_vid))
-                if probe is not None:
-                    source_sub = extract_embedded_subtitle(str(primary_vid), probe[0], probe[1], str(work_dir))
-            if source_sub is None:
-                is_raw_whisper = True
-                source_sub = yield from run_live(
-                    transcribe_with_whisper,
-                    str(primary_vid),
-                    str(work_dir / "whisper.srt"),
-                    model_size=whisper_model,
-                    badge=f"STAGE 2/4 · WHISPER [{whisper_model}]",
-                    title="تفريغ الصوت الياباني بـ Faster-Whisper مع طوابع الكلمات...",
-                    accepts_progress_cb=False,
-                )
+        if sub_mode.startswith("Auto"):
+            probe = probe_embedded_subtitles(str(primary_vid))
+            if probe is not None:
+                source_sub = extract_embedded_subtitle(str(primary_vid), probe[0], probe[1], str(work_dir))
+                push(f"✓ تم سحب الترجمة المدمجة ({probe[1]}).")
+        if source_sub is None:
+            is_raw_whisper = True
+            source_sub = yield from run_live(
+                transcribe_with_whisper,
+                str(primary_vid),
+                str(work_dir / "whisper.srt"),
+                model_size=whisper_model,
+                badge=f"STAGE 2/4 · WHISPER [{whisper_model}]",
+                title="حلقة خام بدون ترجمة — تفريغ الصوت بـ Faster-Whisper مع طوابع الكلمات...",
+                accepts_progress_cb=False,
+            )
 
         entries = parse_source_subtitles(source_sub)
 
-        # Parse edited glossary from UI or auto-extract
         glossary: Dict = {}
-        if glossary_box and glossary_box.strip() and glossary_box.strip() != "{}":
-            try:
-                glossary = json.loads(glossary_box)
-                if series_name.strip():
-                    save_series_glossary(series_name, glossary)
-            except Exception:
-                glossary = {}
-        if not glossary:
+        if api_key.strip() or "Local" in provider:
             glossary = yield from run_live(
                 load_or_extract_series_glossary,
                 series_name=series_name,
@@ -946,40 +652,6 @@ def step1_process_for_preview(
                 title="تجهيز قاموس أسماء ومصطلحات الأنمي...",
                 accepts_progress_cb=False,
             )
-
-        # Merge Quick Review table edits (or auto-scan if user skipped [SCAN] and enabled auto_scan)
-        approved_signs: List[Dict] = []
-        ui_gal = gr.update()
-        ui_tbl = gr.update()
-        if scan_state and scan_state.get("primary_vid") == str(primary_vid) and scan_state.get("signs"):
-            approved_signs = _merge_table_edits_into_signs(scan_state["signs"], signs_table)
-        elif auto_scan_if_skipped:
-            scanned = yield from run_live(
-                scan_japanese_signs,
-                str(primary_vid),
-                str(work_dir),
-                min_height_pct=max(3.2, float(min_sign_h_pct)),
-                skip_op_ed_credits=bool(skip_op_ed_signs),
-                badge="STAGE 2/4 · AUTO SIGN OCR",
-                title="فحص تلقائي للافتات اليابانية الواضحة...",
-                accepts_progress_cb=True,
-            )
-            if scanned:
-                approved_signs = yield from run_live(
-                    translate_detected_signs,
-                    signs=scanned,
-                    entries=entries,
-                    series_name=series_name,
-                    glossary=glossary,
-                    provider=_provider_key(provider),
-                    api_key=api_key,
-                    model_name=llm_model,
-                    base_url=base_url,
-                    badge="STAGE 2/4 · SIGN TRANSLATION",
-                    title=f"ترجمة {len(scanned)} لافتة مكتشفة...",
-                    accepts_progress_cb=False,
-                )
-                ui_tbl, ui_gal = _signs_to_table_and_gallery(approved_signs)
 
         cp_file = str(work_dir / "translation_checkpoint.json")
         translations = yield from run_live(
@@ -1003,7 +675,6 @@ def step1_process_for_preview(
             "encoder": credit_encoder,
         }
         has_credits = any(v.strip() for v in credits_dict.values())
-        active_sign_count = sum(1 for s in approved_signs if s.get("enabled", True) and str(s.get("ar_text", "")).strip())
 
         for q_label, vid_path in downloaded.items():
             vw, vh, _, _ = probe_video_info(str(vid_path))
@@ -1015,24 +686,11 @@ def step1_process_for_preview(
                 target_w=vw,
                 target_h=vh,
                 style_preset=style_preset,
-                approved_visual_signs=approved_signs,
                 credits=credits_dict if has_credits else None,
             )
             if ass_out is None:
                 ass_out = q_ass
-            push(f"📐 تم توليد ملف ASS نسبي لجودة {q_label} ({vw}x{vh} · لافتات ممسوحة={active_sign_count})")
-
-            patches_for_q: List[Dict] = []
-            if active_sign_count > 0:
-                patches_for_q = yield from run_live(
-                    build_inpainted_sign_patches,
-                    str(vid_path),
-                    [s for s in approved_signs if s.get("enabled", True) and str(s.get("ar_text", "")).strip()],
-                    str(work_dir / f"patches_{q_label}"),
-                    badge=f"STAGE 4/4 · LAMA INPAINT [{q_label}]",
-                    title=f"محو الكتابة اليابانية من الفيديو بـ LaMa GPU لجودة {q_label} ({vw}x{vh})...",
-                    accepts_progress_cb=True,
-                )
+            push(f"📐 تم توليد ملف ASS نسبي لجودة {q_label} ({vw}x{vh})")
 
             out_mp4 = str(ep_out_dir / f"{ep_folder_name}_{q_label}_AR.mp4")
             yield from run_live(
@@ -1045,9 +703,8 @@ def step1_process_for_preview(
                 cq=int(cq),
                 preset=preset,
                 audio_bitrate=audio_bitrate,
-                sign_patches=patches_for_q,
                 badge=f"STAGE 4/4 · NVENC ENCODE [{q_label}]",
-                title=f"دمج اللافتات الممسوحة وحرق الترجمة لجودة {q_label} ({codec})...",
+                title=f"حرق الترجمة وضغط جودة {q_label} بأعلى جودة وأقل حجم ({codec})...",
                 accepts_progress_cb=True,
             )
             rendered_map[q_label] = out_mp4
@@ -1067,17 +724,14 @@ def step1_process_for_preview(
             render_progress_hud(
                 100.0,
                 "MISSION COMPLETE · 100%",
-                "اكتملت الترجمة ومحو اللافتات والحرق النسبي بنجاح! الفيديو جاهز للمعاينة",
-                f"تم إنتاج {len(rendered_map)} جودة · محو {active_sign_count} لافتة",
+                "اكتملت الترجمة والحرق والضغط بنجاح! الفيديو جاهز للمعاينة",
+                f"تم إنتاج {len(rendered_map)} جودة MP4",
                 str(ep_out_dir),
                 mode="done",
             ),
             preview_val=first_video,
             local_dd=gr.update(choices=all_local, value=first_video),
             raw_dd=gr.update(choices=updated_raw_list),
-            gal=ui_gal,
-            tbl=ui_tbl,
-            gls=json.dumps(glossary, ensure_ascii=False, indent=2),
             vids_val=list(rendered_map.values()),
             ass_val=ass_out,
             state_val={"folder": str(ep_out_dir), "files": rendered_map},
@@ -1102,7 +756,6 @@ def step1_process_for_preview(
 
 def step2_approve_and_upload(
     job_state: Dict,
-    enable_mega: bool, mega_remote: str, mega_folder: str,
     enable_dood: bool, dood_api_key: str,
     enable_gdrive: bool, gdrive_remote: str, gdrive_folder: str,
 ):
@@ -1171,13 +824,6 @@ def step2_approve_and_upload(
             links_report.append(f"=== جودة {q_label} ({Path(mp4_path).name}) ===")
             links_report.append(f"  Local Path: {mp4_path}")
 
-            if enable_mega:
-                mega_link = yield from run_upload_live(
-                    upload_to_rclone, mp4_path, mega_remote, mega_folder, generate_link=True,
-                    badge=f"S-PORTAL · MEGA [{q_label}]", title=f"جاري رفع نسخة {q_label} على MEGA...",
-                )
-                links_report.append(f"  MEGA: {mega_link}")
-
             if enable_dood:
                 dood_res = yield from run_upload_live(
                     upload_to_doodstream, mp4_path, dood_api_key,
@@ -1229,7 +875,6 @@ def build_ui() -> gr.Blocks:
         gr.HTML(SHADOW_BLADE_HERO_HTML)
 
         job_state = gr.State({})
-        scan_state = gr.State({})
 
         with gr.Row():
             with gr.Column(scale=2):
@@ -1275,50 +920,6 @@ def build_ui() -> gr.Blocks:
                         link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
                         file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
 
-                with gr.Accordion("👁️ المراجعة السريعة للافتات اليابانية الصامتة + قاموس الأنمي (LaMa Inpainting)", open=True, elem_classes=["sb-accordion"]):
-                    with gr.Row():
-                        min_sign_h_pct = gr.Slider(
-                            minimum=1.8, maximum=8.0, step=0.2, value=2.6,
-                            label="أقل حجم للافتة (% من ارتفاع الشاشة لتجاهل التفاصيل الهامشية)",
-                        )
-                        skip_op_ed_signs = gr.Checkbox(
-                            value=True,
-                            label="تجاهل كتل حقوق أغنية البداية والنهاية الكثيفة تلقائياً",
-                        )
-                        auto_scan_if_skipped = gr.Checkbox(
-                            value=False,
-                            label="فحص ومحو تلقائي لو ضغطت [STRIKE] مباشرة بدون فحص مسبق",
-                        )
-
-                    scan_btn = gr.Button(
-                        "🔍 الخطوة 1: فحص سريع للافتات الصامتة واستخراج القاموس للمراجعة [SCAN]",
-                        elem_id="sb-scan-btn",
-                    )
-
-                    signs_gallery = gr.Gallery(
-                        label="🖼️ مصغرات اللافتات اليابانية المكتشفة على الشاشة (راجع الرقم # مع الجدول)",
-                        columns=4,
-                        height=210,
-                        object_fit="contain",
-                    )
-
-                    signs_table = gr.Dataframe(
-                        headers=["محو وترجمة ✓", "#", "البداية", "النهاية", "النص الياباني", "الترجمة العربية (عدّلها بحرية)", "لون الخط", "لون الحواف"],
-                        datatype=["bool", "number", "str", "str", "str", "str", "str", "str"],
-                        col_count=(8, "fixed"),
-                        type="array",
-                        interactive=True,
-                        label="📋 جدول المراجعة السريعة (ارفع علامة ✓ من أي لافتة لا تريد محوها قبل الضغط على STRIKE)",
-                    )
-
-                    with gr.Accordion("📚 قاموس الأنمي المستخرج (يُحفظ تلقائياً لكل حلقات الأنمي القادمة — قابل للتعديل)", open=False):
-                        glossary_box = gr.Code(
-                            value="{}",
-                            language="json",
-                            label="Series Glossary JSON (/workspace/glossaries)",
-                            lines=8,
-                        )
-
                 with gr.Accordion("🔑 مفاتيح DeepSeek / Gemini والإعدادات الدائمة", open=True, elem_classes=["sb-accordion"]):
                     with gr.Row():
                         provider = gr.Dropdown(
@@ -1332,16 +933,13 @@ def build_ui() -> gr.Blocks:
                         base_url = gr.Textbox(value=cfg["base_url"], label="Base URL")
                     with gr.Row():
                         dood_api_key = gr.Textbox(value=cfg["dood_api_key"], label="DoodStream API Key", type="password")
-                        mega_remote = gr.Textbox(value=cfg["mega_remote"], label="MEGA Remote")
-                        mega_folder = gr.Textbox(value=cfg["mega_folder"], label="فولدر MEGA")
-                    with gr.Row():
                         gdrive_remote = gr.Textbox(value=cfg["gdrive_remote"], label="Google Drive Remote")
                         gdrive_folder = gr.Textbox(value=cfg["gdrive_folder"], label="فولدر Drive")
 
                     save_btn = gr.Button("💾 حفظ جميع المفاتيح والإعدادات في النظام", variant="secondary")
                     save_status = gr.Markdown("")
 
-                with gr.Accordion("⚙️ إعدادات Whisper والضغط (NVENC) وحقوق الفريق", open=False, elem_classes=["sb-accordion"]):
+                with gr.Accordion("⚙️ التفريغ الصوتي (Whisper) والضغط (NVENC) وحقوق الفريق", open=False, elem_classes=["sb-accordion"]):
                     with gr.Row():
                         sub_mode = gr.Radio(
                             choices=[
@@ -1367,19 +965,18 @@ def build_ui() -> gr.Blocks:
                 progress_hud = gr.HTML(value=render_progress_hud())
 
                 step1_btn = gr.Button(
-                    "⚔️ الخطوة 2: انطلق — محو اللافتات المختارة والترجمة والحرق النسبي للمعاينة! [STRIKE]",
+                    "⚔️ الخطوة 1: انطلق — ترجمة الذكاء الاصطناعي والحرق وضغط MP4 للمعاينة! [STRIKE]",
                     variant="primary",
                     size="lg",
                     elem_id="sb-step1-btn",
                 )
 
                 with gr.Row():
-                    enable_mega = gr.Checkbox(value=True, label="رفع على MEGA")
                     enable_dood = gr.Checkbox(value=True, label="رفع على DoodStream")
-                    enable_gdrive = gr.Checkbox(value=False, label="رفع على Google Drive")
+                    enable_gdrive = gr.Checkbox(value=True, label="رفع على Google Drive")
 
                 step2_btn = gr.Button(
-                    "🌀 الخطوة 3: عبور البوابة — اعتماد ورفع جميع الجودات [S-PORTAL]",
+                    "🌀 الخطوة 2: عبور البوابة — اعتماد ورفع جميع الجودات [S-PORTAL]",
                     variant="stop",
                     size="lg",
                     elem_id="sb-step2-btn",
@@ -1403,7 +1000,7 @@ def build_ui() -> gr.Blocks:
             fn=save_settings,
             inputs=[
                 provider, llm_model, api_key, base_url, style_preset, dood_api_key,
-                mega_remote, mega_folder, gdrive_remote, gdrive_folder,
+                gdrive_remote, gdrive_folder,
                 codec, preset, cq, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
             ],
@@ -1414,21 +1011,6 @@ def build_ui() -> gr.Blocks:
         refresh_local_btn.click(fn=lambda: gr.update(choices=list_local_outputs()), outputs=[local_dropdown])
         local_dropdown.change(fn=lambda p: p, inputs=[local_dropdown], outputs=[preview_player])
 
-        scan_btn.click(
-            fn=step0_quick_scan_signs_and_glossary,
-            inputs=[
-                episode_name, series_name,
-                saved_raw_1080,
-                link_1080, file_1080,
-                link_720, file_720,
-                link_480, file_480,
-                sub_mode, whisper_model,
-                min_sign_h_pct, skip_op_ed_signs,
-                provider, api_key, llm_model, base_url,
-            ],
-            outputs=[progress_hud, log_box, signs_gallery, signs_table, glossary_box, saved_raw_1080, scan_state],
-        )
-
         step1_btn.click(
             fn=step1_process_for_preview,
             inputs=[
@@ -1438,8 +1020,6 @@ def build_ui() -> gr.Blocks:
                 link_720, file_720,
                 link_480, file_480,
                 sub_mode, whisper_model,
-                auto_scan_if_skipped, min_sign_h_pct, skip_op_ed_signs,
-                signs_table, glossary_box, scan_state,
                 provider, api_key, llm_model, base_url,
                 codec, cq, preset, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
@@ -1447,7 +1027,7 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
-                signs_gallery, signs_table, glossary_box, out_video_files, out_ass_file, job_state,
+                out_video_files, out_ass_file, job_state,
             ],
         )
 
@@ -1455,7 +1035,6 @@ def build_ui() -> gr.Blocks:
             fn=step2_approve_and_upload,
             inputs=[
                 job_state,
-                enable_mega, mega_remote, mega_folder,
                 enable_dood, dood_api_key,
                 enable_gdrive, gdrive_remote, gdrive_folder,
             ],
