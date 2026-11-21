@@ -76,6 +76,7 @@ FONT_FALLBACK_MAP = {
 # lives in the file as "HSN Shahd Regular").
 REAL_FAMILY_ALIAS = {
     "HSN Shahd": "HSN Shahd Regular",
+    "FF Dusha": "FF Dusha Arabic",
 }
 
 STYLE_PROFILE_VERSION = 3
