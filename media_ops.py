@@ -187,6 +187,52 @@ def download_torrent_or_url(
     return videos[0]
 
 
+def _load_bt_trackers(log_cb: Optional[Callable[[str], None]] = None) -> str:
+    """Best-effort public tracker list for magnet/torrent swarms.
+
+    Order: fresh pod cache (/workspace/trackers.txt, 7 days) -> live fetch from
+    ngosang/trackerslist -> list shipped in the repo (trackers.txt). Returns a
+    comma-joined tracker string for aria2's --bt-tracker, or "" on total failure.
+    """
+    cache = Path("/workspace/trackers.txt")
+    try:
+        if cache.is_file() and (time.time() - cache.stat().st_mtime) < 7 * 86400:
+            txt = cache.read_text(encoding="utf-8").strip()
+            if txt:
+                return ",".join(txt.split())
+    except OSError:
+        pass
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+            headers={"User-Agent": "runpod-anime-subber"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            txt = resp.read().decode("utf-8", "replace").strip()
+        if txt:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(txt, encoding="utf-8")
+            except OSError:
+                pass
+            if log_cb:
+                log_cb(f"🧲 تم تحديث قائمة الـ trackers ({len(txt.split())} متتبعاً).")
+            return ",".join(txt.split())
+    except Exception as exc:
+        if log_cb:
+            log_cb(f"ℹ️ تعذر تحديث قائمة الـ trackers ({exc}) — استخدام النسخة المرفقة.")
+    repo_list = Path(__file__).resolve().parent / "trackers.txt"
+    try:
+        if repo_list.is_file():
+            txt = repo_list.read_text(encoding="utf-8").strip()
+            if txt:
+                return ",".join(txt.split())
+    except OSError:
+        pass
+    return ""
+
+
 def _run_aria2(
     target: str,
     output_dir: str,
@@ -213,6 +259,13 @@ def _run_aria2(
         "--summary-interval=1",
         target,
     ]
+    bt_trackers = _load_bt_trackers(log_cb=log_cb)
+    if bt_trackers:
+        cmd[-1:-1] = [
+            f"--bt-tracker={bt_trackers}",
+            "--bt-tracker-connect-timeout=10",
+            "--bt-tracker-timeout=10",
+        ]
     if log_cb:
         mode_txt = "استكمال التحميل السابق" if has_partial else "بدء التحميل وحفظه دائماً"
         log_cb(f"[aria2c] {mode_txt} في: {output_dir}")
