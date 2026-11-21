@@ -708,6 +708,15 @@ def load_or_extract_series_glossary(
             if isinstance(t_items, dict):
                 existing[section].update({str(k): str(v) for k, v in t_items.items()})
 
+    if g_path.is_file() and any(existing.get(s) for s in ("names", "transliterate", "translate")):
+        if log_cb:
+            n_terms = sum(len(existing.get(s) or {}) for s in ("names", "transliterate", "translate"))
+            log_cb(
+                f"📚 قاموس «{existing['series']}» محمّل من الحفظ ({n_terms} مصطلح) — "
+                "مفيش استخراج من الأول، والتعلم التلقائي بيضيف الجديد بعد كل حلقة."
+            )
+        return existing
+
     sample_lines = [e.plain_text for e in entries if not e.keep_untranslated][:160]
     if not sample_lines:
         return existing
@@ -878,7 +887,17 @@ def translate_entries(
     sys_prompt = _build_celestial_system_prompt(series_name=series_name, glossary=glossary)
     total_batches = (len(remaining) + batch_size - 1) // batch_size
 
-    for b_idx in range(total_batches):
+    def _save_ckpt() -> None:
+        if checkpoint_path:
+            try:
+                Path(checkpoint_path).write_text(
+                    json.dumps({str(k): v for k, v in translations.items()}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+
+    def _do_batch(b_idx: int) -> Dict[int, str]:
         chunk = remaining[b_idx * batch_size : (b_idx + 1) * batch_size]
         payload = json.dumps(
             [{"id": str(e.index), "style": e.target_style, "actor": e.actor, "text": e.plain_text} for e in chunk],
@@ -893,24 +912,35 @@ def translate_entries(
             base_url=base_url,
             log_cb=log_cb,
         )
+        out: Dict[int, str] = {}
         for k, v in parsed.items():
             try:
-                idx_int = int(k)
-                translations[idx_int] = str(v)
+                out[int(k)] = str(v)
             except ValueError:
                 continue
+        return out
 
-        if checkpoint_path:
-            try:
-                Path(checkpoint_path).write_text(
-                    json.dumps({str(k): v for k, v in translations.items()}, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            except OSError:
-                pass
-
+    workers = min(3, total_batches)
+    if workers > 1:
         if log_cb:
-            log_cb(f"Translated batch {b_idx + 1}/{total_batches}")
+            log_cb(f"⚡ ترجمة متوازية: {workers} دفعات معاً في نفس الوقت ({total_batches} دفعة إجمالاً)")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_do_batch, b_idx) for b_idx in range(total_batches)]
+            for fut in as_completed(futures):
+                translations.update(fut.result())
+                done += 1
+                _save_ckpt()
+                if log_cb:
+                    log_cb(f"Translated batch {done}/{total_batches}")
+    else:
+        for b_idx in range(total_batches):
+            translations.update(_do_batch(b_idx))
+            _save_ckpt()
+            if log_cb:
+                log_cb(f"Translated batch {b_idx + 1}/{total_batches}")
 
     return translations
 
