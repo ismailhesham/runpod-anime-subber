@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import subprocess
 import time
@@ -14,6 +15,32 @@ import pysubs2
 BASE_DIR = Path(__file__).resolve().parent
 STYLE_JSON_PATH = BASE_DIR / "translator_style_celestial.json"
 GLOSSARY_DIR = Path(os.environ.get("RUNPOD_GLOSSARY_ROOT", "/workspace/glossaries"))
+
+
+def _glossary_dir() -> Path:
+    """Resolve the glossary root: env override -> pod path -> repo-bundled folder."""
+    env_root = os.environ.get("RUNPOD_GLOSSARY_ROOT", "").strip()
+    if env_root:
+        return Path(env_root)
+    pod = Path("/workspace/glossaries")
+    try:
+        pod.mkdir(parents=True, exist_ok=True)
+        return pod
+    except OSError:
+        return BASE_DIR / "glossaries"
+
+
+def _repo_glossary_template() -> Dict:
+    """Bundled starter glossary (repo: glossaries/glossary.example.json), or empty."""
+    tmpl = BASE_DIR / "glossaries" / "glossary.example.json"
+    try:
+        if tmpl.is_file():
+            data = json.loads(tmpl.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
 TEXT_SUB_CODECS = {"ass", "ssa", "subrip", "srt", "webvtt", "mov_text"}
 
 INSTALLED_SAFE_FONTS = {
@@ -520,7 +547,7 @@ def _call_llm_json(
 
     last_err: Optional[Exception] = None
     for m_idx, cand_model in enumerate(candidates):
-        for attempt in range(2):
+        for attempt in range(5):
             try:
                 if "gemini" in prov:
                     from google import genai
@@ -538,7 +565,7 @@ def _call_llm_json(
                     raw_out = resp.text or "{}"
                 else:
                     from openai import OpenAI
-                    client = OpenAI(api_key=key or "local-key", base_url=base_url.strip() or None)
+                    client = OpenAI(api_key=key or "local-key", base_url=base_url.strip() or None, timeout=180.0, max_retries=0)
                     kwargs = {
                         "model": cand_model,
                         "temperature": 0.25,
@@ -559,7 +586,10 @@ def _call_llm_json(
                 return json.loads(cleaned)
             except Exception as exc:
                 last_err = exc
-                time.sleep(1.5 * (attempt + 1))
+                wait_s = min(30.0, 2.0 * (2 ** attempt)) + random.uniform(0.0, 1.5)
+                if log_cb:
+                    log_cb(f"⚠️ محاولة {attempt + 1}/5 فشلت مع {cand_model} — إعادة المحاولة بعد {wait_s:.0f} ثانية...")
+                time.sleep(wait_s)
         if m_idx + 1 < len(candidates) and log_cb:
             log_cb(f"⚠️ تعذر الاستجابة من {cand_model} — جاري التحويل التلقائي للبديل {candidates[m_idx + 1]}...")
 
@@ -571,11 +601,78 @@ def _glossary_slug(series_name: str) -> str:
     return slug or "general_anime"
 
 
-def save_series_glossary(series_name: str, glossary_data: Dict, glossary_root: Path = GLOSSARY_DIR) -> str:
-    glossary_root.mkdir(parents=True, exist_ok=True)
-    path = glossary_root / f"{_glossary_slug(series_name)}.json"
+def save_series_glossary(series_name: str, glossary_data: Dict, glossary_root: Optional[Path] = None) -> str:
+    root = glossary_root or _glossary_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{_glossary_slug(series_name)}.json"
     path.write_text(json.dumps(glossary_data, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(path)
+
+
+def learn_glossary_from_translation(
+    series_name: str,
+    entries: List["SubEntry"],
+    translations: Dict[int, str],
+    glossary: Optional[Dict],
+    provider: str,
+    api_key: str,
+    model_name: str,
+    base_url: str,
+    log_cb: Optional[Callable[[str], None]] = None,
+) -> Dict:
+    """After an episode is translated, persist the actual name/term choices back into the
+    per-series glossary file and the in-memory dict, so later episodes stay consistent.
+    Existing entries always win; only new keys are added. Never breaks the pipeline."""
+    merged = glossary if isinstance(glossary, dict) else {}
+    if not translations or not (api_key.strip() or "local" in (provider or "").lower()):
+        return merged
+    pairs = [
+        {"en": e.plain_text, "ar": translations[e.index]}
+        for e in entries
+        if e.index in translations and not e.keep_untranslated
+    ][:120]
+    if not pairs:
+        return merged
+
+    sys_p = f"""أنت محرّر قواميس ترجمة أنمي بأسلوب فريق Celestial-Dragons (چ لصوت j و ڤ لصوت v).
+من أزواج (النص الأصلي ↔ الترجمة العربية النهائية) للأنمي «{series_name or 'غير محدد'}» استخرج فقط الأعلام والتقنيات والرتب والمفاهيم الخاصة كما تُرجمت فعلياً، وأرجع JSON فقط بهذا الهيكل:
+{{
+  "names": {{"SourceName": "الاسم بالعربية"}},
+  "transliterate": {{"SpecialTerm": "المصطلح بنطقه مع ال"}},
+  "translate": {{"WorldConcept": "الترجمة الفصيحة"}}
+}}
+تجاهل الكلمات العادية والعبارات العامة، واقتصر على ما ظهر فعلاً في الأزواج."""
+
+    try:
+        extracted = _call_llm_json(
+            sys_p,
+            json.dumps(pairs, ensure_ascii=False),
+            provider=provider,
+            api_key=api_key,
+            model_name=model_name,
+            base_url=base_url,
+            log_cb=log_cb,
+        )
+        merged.setdefault("series", series_name.strip() or "أنمي عام")
+        merged.setdefault("keep_honorifics", True)
+        added = 0
+        for section in ("names", "transliterate", "translate"):
+            merged.setdefault(section, {})
+            new_items = extracted.get(section) or {}
+            if isinstance(new_items, dict):
+                for k, v in new_items.items():
+                    k_s, v_s = str(k).strip(), str(v).strip()
+                    if k_s and v_s and k_s not in merged[section]:
+                        merged[section][k_s] = v_s
+                        added += 1
+        if added:
+            save_series_glossary(series_name, merged)
+            if log_cb:
+                log_cb(f"📚 القاموس اتعلم تلقائياً: +{added} مصطلح جديد محفوظ للحلقات الجاية.")
+    except Exception as exc:
+        if log_cb:
+            log_cb(f"⚠️ تم تخطي التعلم التلقائي للقاموس: {exc}")
+    return merged
 
 
 def load_or_extract_series_glossary(
@@ -589,8 +686,9 @@ def load_or_extract_series_glossary(
     log_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict:
     """Load saved per-series glossary or extract new terms from ASS/SRT or Whisper JP audio."""
-    GLOSSARY_DIR.mkdir(parents=True, exist_ok=True)
-    g_path = GLOSSARY_DIR / f"{_glossary_slug(series_name)}.json"
+    g_dir = _glossary_dir()
+    g_dir.mkdir(parents=True, exist_ok=True)
+    g_path = g_dir / f"{_glossary_slug(series_name)}.json"
     existing: Dict = {
         "series": series_name.strip() or "أنمي عام",
         "names": {},
@@ -603,6 +701,12 @@ def load_or_extract_series_glossary(
             existing.update(json.loads(g_path.read_text(encoding="utf-8")))
         except Exception:
             pass
+    else:
+        template = _repo_glossary_template()
+        for section in ("names", "transliterate", "translate"):
+            t_items = template.get(section) or {}
+            if isinstance(t_items, dict):
+                existing[section].update({str(k): str(v) for k, v in t_items.items()})
 
     sample_lines = [e.plain_text for e in entries if not e.keep_untranslated][:160]
     if not sample_lines:
