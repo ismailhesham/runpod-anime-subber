@@ -122,6 +122,38 @@ def _drive_backup_glossary(series_name: str) -> bool:
     except Exception:
         return False
 
+
+SERIES_NEW_OPT = "➕ أنمي جديد — اكتب الاسم بنفسك"
+
+
+def list_saved_series() -> List[Tuple[str, str]]:
+    """(label, value) choices for every saved per-series glossary, newest first.
+    Runs after the Drive restore at startup, so a fresh pod still lists his anime."""
+    out: List[Tuple[str, str]] = []
+    try:
+        gdir = _glossary_dir()
+        if gdir.is_dir():
+            files = sorted(gdir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+            for fp in files:
+                name = ""
+                try:
+                    data = json.loads(fp.read_text(encoding="utf-8"))
+                    name = str(data.get("series", "")).strip()
+                except Exception:
+                    pass
+                if not name:
+                    name = fp.stem.replace("_", " ").strip().title()
+                if name:
+                    out.append((f"📚 {name}", name))
+    except Exception:
+        pass
+    return out
+
+
+def _default_series_pick() -> str:
+    saved = list_saved_series()
+    return saved[0][1] if saved else SERIES_NEW_OPT
+
 SHADOW_BLADE_HEAD = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -516,6 +548,34 @@ html, body, .gradio-container {
 @keyframes sbAlertIn { 0% { opacity: 0; transform: scale(.65); } 14% { opacity: 1; transform: scale(1.05); } 22% { opacity: .3; }
     30% { opacity: 1; transform: scale(1); } 80% { opacity: 1; } 100% { opacity: 0; transform: scale(1.02) translateY(-10px); } }
 .sb-fps { color: #FDE68A; font-weight: 800; }
+
+/* ==== Series picker: dark dropdown ==== */
+#series_picker input {
+    background: #0b1020 !important;
+    color: #dfe8ff !important;
+    border: 1px solid #2a3a66 !important;
+}
+#series_picker input::placeholder { color: #5b6b96 !important; }
+#series_picker .options {
+    background: #0b1020 !important;
+    border: 1px solid #2a3a66 !important;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.65) !important;
+}
+#series_picker ul.option-list { background: #0b1020 !important; }
+#series_picker ul.option-list li.item {
+    background: transparent !important;
+    color: #dfe8ff !important;
+}
+#series_picker ul.option-list li.item:hover,
+#series_picker ul.option-list li.item.active {
+    background: #1a2547 !important;
+}
+#series_picker ul.option-list li.item.selected {
+    background: #14203f !important;
+    color: #8ab4ff !important;
+}
+#series_picker svg, #series_picker .icon { color: #8ab4ff !important; }
+
 """
 
 SHADOW_BLADE_HERO_HTML = """
@@ -780,6 +840,7 @@ def _raw_cache_dir_for_source(q_label: str, source_link: Optional[str], torrent_
 def step1_process_for_preview(
     episode_name: str,
     series_name: str,
+    series_pick: str,
     style_preset: str,
     saved_raw_1080: str,
     link_1080: str, file_1080: Optional[str],
@@ -803,6 +864,8 @@ def step1_process_for_preview(
     logs: List[str] = []
     rendered_map: Dict[str, str] = {}
     ass_out: Optional[str] = None
+    if series_pick and series_pick != SERIES_NEW_OPT:
+        series_name = series_pick
 
     def push(msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -1136,6 +1199,7 @@ def step1_process_for_preview(
 def step_batch_process(
     batch_links: str,
     series_name: str,
+    series_pick: str,
     style_preset: str,
     sub_mode: str,
     whisper_model: str,
@@ -1241,6 +1305,8 @@ def step_batch_process(
             raise res_box["err"]  # type: ignore[misc]
         return res_box.get("val")
 
+    if series_pick and series_pick != SERIES_NEW_OPT:
+        series_name = series_pick
     links = [ln.strip() for ln in (batch_links or "").splitlines() if ln.strip()]
     if not links:
         push("⚠️ أدخل رابط تورنت واحد على الأقل (رابط في كل سطر).")
@@ -1730,11 +1796,18 @@ def build_ui() -> gr.Blocks:
                             placeholder="مثال: Bleach_EP366 (أو اتركه فارغاً ليأخذ اسم الملف)",
                             scale=2,
                         )
-                        series_name = gr.Textbox(
-                            label="🎌 اسم الأنمي (لتوحيد وحفظ قاموس الأسماء والمصطلحات تلقائياً)",
-                            placeholder="مثال: Bleach أو Black Clover أو Jujutsu Kaisen",
-                            scale=2,
-                        )
+                        with gr.Column(scale=2):
+                            series_picker = gr.Dropdown(
+                                choices=[(SERIES_NEW_OPT, SERIES_NEW_OPT)] + list_saved_series(),
+                                value=_default_series_pick(),
+                                label="🎌 الأنمي الشغال عليه — القاموس بيتحفظ وبيترجع لوحده",
+                                elem_id="series_picker",
+                            )
+                            series_name = gr.Textbox(
+                                label="✍️ اسم الأنمي الجديد (لتوحيد وحفظ قاموس الأسماء والمصطلحات تلقائياً)",
+                                placeholder="مثال: Bleach أو Black Clover أو Jujutsu Kaisen",
+                                visible=(_default_series_pick() == SERIES_NEW_OPT),
+                            )
                         style_preset = gr.Dropdown(
                             choices=[
                                 ("Black Clover Style (ScaleX 90% · MarginV 4.35%H · Top Style)", "black_clover_style"),
@@ -1860,6 +1933,12 @@ def build_ui() -> gr.Blocks:
 
         provider.change(fn=_on_provider_change, inputs=[provider], outputs=[llm_model, base_url])
 
+        series_picker.change(
+            fn=lambda pick: gr.update(visible=(pick == SERIES_NEW_OPT), value=""),
+            inputs=[series_picker],
+            outputs=[series_name],
+        )
+
         save_btn.click(
             fn=save_settings,
             inputs=[
@@ -1878,7 +1957,7 @@ def build_ui() -> gr.Blocks:
         step1_btn.click(
             fn=step1_process_for_preview,
             inputs=[
-                episode_name, series_name, style_preset,
+                episode_name, series_name, series_picker, style_preset,
                 saved_raw_1080,
                 link_1080, file_1080,
                 link_720, file_720,
@@ -1899,7 +1978,7 @@ def build_ui() -> gr.Blocks:
         batch_btn.click(
             fn=step_batch_process,
             inputs=[
-                batch_links, series_name, style_preset,
+                batch_links, series_name, series_picker, style_preset,
                 sub_mode, whisper_model,
                 provider, api_key, llm_model, base_url,
                 codec, cq, preset, audio_bitrate,
