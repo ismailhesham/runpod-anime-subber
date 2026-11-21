@@ -635,3 +635,86 @@ def upload_to_doodstream(
         "watch_url": item.get("download_url") or f"https://doodstream.com/d/{code}",
         "embed_url": item.get("protected_embed") or f"https://doodstream.com/e/{code}",
     }
+
+
+def qc_burned_episode(
+    source_path: str,
+    output_path: str,
+    ass_path: str = "",
+    expected_lines: int = 0,
+    qc_dir: str = "",
+    log_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, object]:
+    """Post-burn QC: output exists and is sizable, duration matches source,
+    3 sample frames extracted for review, ASS dialogue count vs translation count."""
+    def log(m: str) -> None:
+        if log_cb:
+            log_cb(m)
+
+    report: Dict[str, object] = {"ok": True, "issues": []}
+
+    def issue(msg: str) -> None:
+        report["ok"] = False
+        report["issues"].append(msg)  # type: ignore[attr-defined]
+        log(f"⚠️ QC: {msg}")
+
+    out = Path(output_path)
+    name = out.name
+    if not out.is_file() or out.stat().st_size < 256 * 1024:
+        issue(f"الملف الناتج مفقود أو صغير بشكل غير طبيعي: {name}")
+
+    size_mb = out.stat().st_size / (1024 * 1024) if out.is_file() else 0.0
+    src_dur = out_dur = 0.0
+    try:
+        _, _, _, src_dur = probe_video_info(source_path)
+        _, _, _, out_dur = probe_video_info(output_path)
+        report["src_dur"] = src_dur
+        report["out_dur"] = out_dur
+        if src_dur > 0 and out_dur > 0 and abs(src_dur - out_dur) > max(2.0, src_dur * 0.01):
+            issue(f"مدة الناتج ({out_dur:.1f}s) مختلفة عن الأصل ({src_dur:.1f}s)")
+    except Exception as exc:
+        log(f"⚠️ QC: تعذر فحص المدة ({exc})")
+
+    frames_ok = 0
+    if qc_dir and out_dur > 0:
+        try:
+            Path(qc_dir).mkdir(parents=True, exist_ok=True)
+            for i, frac in enumerate((0.1, 0.5, 0.9), 1):
+                jpg = Path(qc_dir) / f"{out.stem}_qc{i}.jpg"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-ss", f"{out_dur * frac:.1f}",
+                     "-i", str(out), "-frames:v", "1", "-q:v", "4", str(jpg)],
+                    capture_output=True, timeout=90,
+                )
+                if jpg.is_file() and jpg.stat().st_size > 4096:
+                    frames_ok += 1
+            if frames_ok < 3:
+                issue(f"تم استخراج {frames_ok}/3 لقطات معاينة فقط")
+        except Exception as exc:
+            log(f"⚠️ QC: تعذر استخراج لقطات المعاينة ({exc})")
+
+    n_dlg = 0
+    if ass_path and os.path.isfile(ass_path) and expected_lines:
+        try:
+            with open(ass_path, encoding="utf-8", errors="ignore") as fh:
+                n_dlg = sum(1 for ln in fh if ln.startswith("Dialogue:"))
+            report["ass_lines"] = n_dlg
+            report["expected_lines"] = expected_lines
+            if abs(n_dlg - expected_lines) > max(2, int(expected_lines * 0.02)):
+                issue(f"أسطر الحوار في ASS ({n_dlg}) مختلفة عن الأسطر المترجمة ({expected_lines})")
+        except Exception as exc:
+            log(f"⚠️ QC: تعذر عد أسطر ASS ({exc})")
+
+    report["size_mb"] = round(size_mb, 1)
+    report["frames"] = frames_ok
+    if report["ok"]:
+        log(
+            f"✅ QC سليم لـ {name}: المدة {out_dur:.0f}s"
+            + (f" (الأصل {src_dur:.0f}s)" if src_dur else "")
+            + f" · الحجم {size_mb:.0f}MB"
+            + (f" · الأسطر {n_dlg}/{expected_lines}" if expected_lines else "")
+            + (f" · {frames_ok} لقطات معاينة" if frames_ok else "")
+        )
+    else:
+        log(f"⚠️ QC لـ {name}: {len(report['issues'])} ملاحظة — راجع السجل")
+    return report
