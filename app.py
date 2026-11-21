@@ -701,27 +701,45 @@ def _ms_fmt(ms: int) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
+RUN_LOG_FILE = STORAGE_ROOT / "_logs" / "hunter_log.txt"
+
+
+def _append_disk_log(line: str) -> None:
+    try:
+        RUN_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(RUN_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
 def list_local_outputs() -> List[str]:
-    if not STORAGE_ROOT.exists():
+    try:
+        if not STORAGE_ROOT.exists():
+            return []
+        mp4s = sorted(STORAGE_ROOT.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return [str(p) for p in mp4s[:50]]
+    except OSError:
         return []
-    mp4s = sorted(STORAGE_ROOT.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [str(p) for p in mp4s[:50]]
 
 
 def list_cached_raw_videos() -> List[str]:
-    _rescue_legacy_tmp_downloads()
-    if not RAW_CACHE_ROOT.exists():
+    try:
+        _rescue_legacy_tmp_downloads()
+        if not RAW_CACHE_ROOT.exists():
+            return []
+        vids = [
+            p for p in RAW_CACHE_ROOT.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in VIDEO_EXTENSIONS
+            and "_work" not in p.parts
+            and p.stat().st_size > 1024 * 1024
+            and not any(p.parent.glob("*.aria2"))
+        ]
+        vids.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return [str(p) for p in vids[:60]]
+    except OSError:
         return []
-    vids = [
-        p for p in RAW_CACHE_ROOT.rglob("*")
-        if p.is_file()
-        and p.suffix.lower() in VIDEO_EXTENSIONS
-        and "_work" not in p.parts
-        and p.stat().st_size > 1024 * 1024
-        and not any(p.parent.glob("*.aria2"))
-    ]
-    vids.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return [str(p) for p in vids[:60]]
 
 
 def _raw_cache_dir_for_source(q_label: str, source_link: Optional[str], torrent_file: Optional[str], ep_name: str) -> Path:
@@ -766,7 +784,11 @@ def step1_process_for_preview(
     ass_out: Optional[str] = None
 
     def push(msg: str) -> None:
-        logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+
+    push(f"🗂️ نسخة دائمة من هذا السجل تُحفظ تلقائياً في: {RUN_LOG_FILE}")
 
     def pack(
         hud_html: str,
@@ -791,7 +813,7 @@ def step1_process_for_preview(
         def _worker():
             try:
                 res_box["val"] = fn(*args, **kwargs)
-            except Exception as e:
+            except BaseException as e:
                 res_box["err"] = e
 
         t = threading.Thread(target=_worker, daemon=True)
@@ -999,7 +1021,7 @@ def step1_process_for_preview(
                 qc_dir=str(ep_out_dir / "_qc" / q_label),
                 badge=f"QC [{q_label}]",
                 title=f"فحص جودة نسخة {q_label} بعد الحرق...",
-                accepts_progress_cb=False,
+                accepts_progress_cb=True,
             )
             rendered_map[q_label] = out_mp4
 
@@ -1031,21 +1053,40 @@ def step1_process_for_preview(
             state_val={"folder": str(ep_out_dir), "files": rendered_map},
         )
     except Exception as exc:
-        push(f"❌ حدث خطأ أثناء التجهيز: {exc}\n{traceback.format_exc()[-500:]}")
-        yield pack(
-            render_progress_hud(
+        push(f"❌ حدث خطأ أثناء التجهيز: {exc}\n{traceback.format_exc()[-1500:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
+        try:
+            err_hud = render_progress_hud(
                 0.0,
                 "ERROR · SYSTEM HALTED",
                 f"توقف بسبب خطأ: {str(exc)[:110]}",
                 "نقطة حفظ الترجمة والملف الخام ما زالا محفوظين",
                 "راجع سجل العمليات",
                 mode="error",
-            ),
-            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
-            vids_val=list(rendered_map.values()) or None,
-            ass_val=ass_out,
+            )
+        except Exception:
+            err_hud = ""
+        try:
+            raw_choices = [""] + list_cached_raw_videos()
+        except Exception:
+            raw_choices = [""]
+        try:
+            done_vids = list(rendered_map.values()) or None
+        except Exception:
+            done_vids = None
+        try:
+            ass_safe = ass_out
+        except Exception:
+            ass_safe = None
+        yield pack(
+            err_hud,
+            raw_dd=gr.update(choices=raw_choices),
+            vids_val=done_vids,
+            ass_val=ass_safe,
             state_val={},
         )
+    except BaseException as exc:
+        push(f"🛑 توقف مفاجئ خارج معالجة الأخطاء ({type(exc).__name__}): {exc}\n{traceback.format_exc()[-800:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
+        raise
 
 
 def step_batch_process(
@@ -1073,7 +1114,11 @@ def step_batch_process(
     logs: List[str] = []
 
     def push(msg: str) -> None:
-        logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+
+    push(f"🗂️ نسخة دائمة من هذا السجل تُحفظ تلقائياً في: {RUN_LOG_FILE}")
 
     def pack(
         hud_html: str,
@@ -1096,7 +1141,7 @@ def step_batch_process(
         def _worker():
             try:
                 res_box["val"] = fn(*args, **kwargs)
-            except Exception as e:
+            except BaseException as e:
                 res_box["err"] = e
 
         t = threading.Thread(target=_worker, daemon=True)
@@ -1385,7 +1430,7 @@ def step_batch_process(
                     qc_dir=str(series_root / "_qc" / ep_label),
                     badge=f"QC [{ep_label} {gi}/{total}]",
                     title=f"فحص جودة حلقة {gi} من {total} بعد الحرق...",
-                    accepts_progress_cb=False,
+                    accepts_progress_cb=True,
                 )
                 rendered[ep_label] = str(out_mp4)
                 if drive_ok:
@@ -1450,19 +1495,30 @@ def step_batch_process(
             state_val={"folder": str(series_root), "files": rendered},
         )
     except Exception as exc:
-        push(f"❌ خطأ عام في وضع الموسم: {exc}\n{traceback.format_exc()[-500:]}")
-        yield pack(
-            render_progress_hud(
+        push(f"❌ خطأ عام في وضع الموسم: {exc}\n{traceback.format_exc()[-1500:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
+        try:
+            err_hud = render_progress_hud(
                 0.0,
                 "ERROR · SEASON HALTED",
                 f"توقف الموسم بسبب خطأ: {str(exc)[:110]}",
                 "الحلقات الجاهزة ونقاط الحفظ محفوظة — أعد التشغيل للاستكمال",
                 "راجع سجل العمليات",
                 mode="error",
-            ),
-            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+            )
+        except Exception:
+            err_hud = ""
+        try:
+            raw_choices = [""] + list_cached_raw_videos()
+        except Exception:
+            raw_choices = [""]
+        yield pack(
+            err_hud,
+            raw_dd=gr.update(choices=raw_choices),
             state_val={},
         )
+    except BaseException as exc:
+        push(f"🛑 توقف مفاجئ خارج معالجة الأخطاء في وضع الموسم ({type(exc).__name__}): {exc}\n{traceback.format_exc()[-800:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
+        raise
 
 
 def step2_approve_and_upload(
@@ -1482,7 +1538,11 @@ def step2_approve_and_upload(
     links_report: List[str] = [f"📁 مسار الحفظ المحلي على RunPod:\n  {job_state['folder']}\n"]
 
     def push(msg: str) -> None:
-        logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+
+    push(f"🗂️ نسخة دائمة من هذا السجل تُحفظ تلقائياً في: {RUN_LOG_FILE}")
 
     def run_upload_live(fn: Callable, *args, badge: str, title: str, **kwargs):
         ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
@@ -1493,7 +1553,7 @@ def step2_approve_and_upload(
         def _worker():
             try:
                 res_box["val"] = fn(*args, **kwargs)
-            except Exception as e:
+            except BaseException as e:
                 res_box["err"] = e
 
         t = threading.Thread(target=_worker, daemon=True)
@@ -1558,12 +1618,19 @@ def step2_approve_and_upload(
             "\n".join(links_report),
         )
     except Exception as exc:
-        push(f"❌ خطأ أثناء الرفع: {exc}")
+        push(f"❌ خطأ أثناء الرفع: {exc}\n{traceback.format_exc()[-1500:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
+        try:
+            err_hud = render_progress_hud(0.0, "S-PORTAL · ERROR", f"خطأ أثناء الرفع: {str(exc)[:100]}", "راجع السجل", "", mode="error")
+        except Exception:
+            err_hud = ""
         yield (
-            render_progress_hud(0.0, "S-PORTAL · ERROR", f"خطأ أثناء الرفع: {str(exc)[:100]}", "راجع السجل", "", mode="error"),
+            err_hud,
             "\n".join(logs[-150:]),
             "\n".join(links_report),
         )
+    except BaseException as exc:
+        push(f"🛑 توقف مفاجئ أثناء الرفع ({type(exc).__name__}): {exc}\n{traceback.format_exc()[-800:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
+        raise
 
 
 def _build_blocks_kwargs() -> Dict:
@@ -1801,3 +1868,4 @@ if __name__ == "__main__":
         launch_kwargs["head"] = SHADOW_BLADE_HEAD
 
     ui.queue().launch(**launch_kwargs)
+
