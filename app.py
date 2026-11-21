@@ -17,7 +17,11 @@ import gradio as gr
 from media_ops import (
     VIDEO_EXTENSIONS,
     burn_and_compress_native,
+    collect_episode_videos,
+    download_season_batch,
     download_torrent_or_url,
+    episode_sort_key,
+    extract_episode_number,
     probe_video_info,
     upload_to_doodstream,
     upload_to_rclone,
@@ -754,6 +758,319 @@ def step1_process_for_preview(
         )
 
 
+def step_batch_process(
+    batch_links: str,
+    series_name: str,
+    style_preset: str,
+    sub_mode: str,
+    whisper_model: str,
+    provider: str,
+    api_key: str,
+    llm_model: str,
+    base_url: str,
+    codec: str,
+    cq: int,
+    preset: str,
+    audio_bitrate: str,
+    credit_translator: str,
+    credit_typesetter: str,
+    credit_encoder: str,
+    cleanup_temp: bool,
+):
+    """Season batch mode: one or more torrent links (each may hold a whole season or more),
+    download all episodes, translate + burn + compress each, and collect them into one
+    folder split into sub-folders of 35 episodes for long anime. Resume-safe."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+    def pack(
+        hud_html: str,
+        preview_val=gr.update(),
+        local_dd=gr.update(),
+        raw_dd=gr.update(),
+        vids_val=gr.update(),
+        ass_val=gr.update(),
+        state_val=gr.update(),
+    ):
+        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val)
+
+    def run_live(fn: Callable, *args, badge: str, title: str, mode: str = "cyan", accepts_progress_cb: bool = True, **kwargs):
+        ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+        res_box: Dict[str, object] = {}
+        kwargs["log_cb"] = lambda m: ev_q.put(("log", m))
+        if accepts_progress_cb:
+            kwargs["progress_cb"] = lambda p, met, det: ev_q.put(("prog", (p, met, det)))
+
+        def _worker():
+            try:
+                res_box["val"] = fn(*args, **kwargs)
+            except Exception as e:
+                res_box["err"] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        cur_pct, cur_met, cur_det = 0.0, "جاري البدء...", ""
+        dirty = True
+        last_yield = 0.0
+
+        while t.is_alive() or not ev_q.empty():
+            try:
+                items = [ev_q.get(timeout=0.25)]
+            except queue.Empty:
+                items = []
+            while not ev_q.empty():
+                try:
+                    items.append(ev_q.get_nowait())
+                except queue.Empty:
+                    break
+            for k, p in items:
+                dirty = True
+                if k == "prog":
+                    cur_pct, cur_met, cur_det = p  # type: ignore[misc]
+                else:
+                    msg_s = str(p)
+                    if msg_s.startswith("[whisper_prog]"):
+                        parts = msg_s.replace("[whisper_prog]", "").strip().split("|")
+                        try:
+                            cur_pct = float(parts[0].replace("%", "").strip())
+                        except Exception:
+                            pass
+                        cur_met = "تفريغ صوتي بـ Faster-Whisper ⚡"
+                        cur_det = parts[1].strip() if len(parts) > 1 else ""
+                    else:
+                        push(msg_s)
+                        bm = re.search(r"Translated batch\s+(\d+)/(\d+)", msg_s)
+                        if bm:
+                            bx, by = int(bm.group(1)), int(bm.group(2))
+                            cur_pct = (bx / max(1, by)) * 100.0
+                            cur_met = f"تمت ترجمة الدفعة {bx} من {by}"
+                            cur_det = llm_model
+
+            now_m = time.monotonic()
+            if dirty and (now_m - last_yield >= 0.35 or not t.is_alive()):
+                last_yield = now_m
+                dirty = False
+                yield pack(render_progress_hud(cur_pct, badge, title, cur_met, cur_det, mode=mode))
+
+        if "err" in res_box:
+            raise res_box["err"]  # type: ignore[misc]
+        return res_box.get("val")
+
+    links = [ln.strip() for ln in (batch_links or "").splitlines() if ln.strip()]
+    if not links:
+        push("⚠️ أدخل رابط تورنت واحد على الأقل (رابط في كل سطر).")
+        yield pack(render_progress_hud(0.0, "تنبيه · لا توجد روابط", "أدخل روابط التورنت أولاً", "—", "—", mode="error"), state_val={})
+        return
+
+    series_safe = _safe_name(series_name.strip() or "Anime_Season")
+    series_root = STORAGE_ROOT / series_safe
+    ass_root = series_root / "_ass_files"
+    series_root.mkdir(parents=True, exist_ok=True)
+    ass_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # ═══ المرحلة 1: تحميل كل الروابط وجمع كل الحلقات ═══
+        all_eps: List[Path] = []
+        for idx, lnk in enumerate(links, 1):
+            cdir = _raw_cache_dir_for_source("season", lnk, None, f"{series_safe}_{idx}")
+            vids = yield from run_live(
+                download_season_batch,
+                lnk, None, str(cdir),
+                badge=f"SEASON DOWNLOAD [{idx}/{len(links)}]",
+                title=f"تحميل / فحص الدفعة رقم {idx} من {len(links)} (ممكن تحتوي موسماً كاملاً)",
+                accepts_progress_cb=True,
+            )
+            all_eps.extend(vids)
+
+        unique = {str(p.resolve()): p for p in all_eps}
+        all_eps = sorted(unique.values(), key=episode_sort_key)
+        total = len(all_eps)
+        if total == 0:
+            raise FileNotFoundError("لم يتم العثور على أي حلقة في الروابط المدخلة.")
+
+        push(f"📚 إجمالي الحلقات المكتشفة: {total} حلقة.")
+        for pos, vp in enumerate(all_eps, 1):
+            epn = extract_episode_number(vp.name)
+            push(f"   {pos:03d}. {vp.name}" + (f"  (حلقة {epn})" if epn is not None else ""))
+
+        # ═══ هيكل الإخراج: فولدر واحد، يتقسم لفولدرات 35 حلقة للأنمي الطويل ═══
+        split_parts = total > 35
+
+        def part_dir_for(global_i: int) -> Path:
+            if not split_parts:
+                return series_root
+            part = (global_i - 1) // 35 + 1
+            lo = (part - 1) * 35 + 1
+            hi = min(part * 35, total)
+            d = series_root / f"Part {part:02d} (EP{lo:03d}-{hi:03d})"
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+
+        if split_parts:
+            n_parts = (total + 34) // 35
+            push(f"🗂️ أنمي طويل ({total} حلقة): سيتم التقسيم إلى {n_parts} فولدرات × 35 حلقة.")
+
+        credits_dict = {
+            "translator": credit_translator,
+            "typesetter": credit_typesetter,
+            "encoder": credit_encoder,
+        }
+        has_credits = any(v.strip() for v in credits_dict.values())
+
+        rendered: Dict[str, str] = {}
+        failed: List[str] = []
+        glossary: Dict = {}
+        last_ass: Optional[str] = None
+
+        # ═══ المرحلة 2: معالجة كل حلقة (ترجمة ← حرق ← ضغط) ═══
+        for gi, vid in enumerate(all_eps, 1):
+            ep_label = f"EP{gi:03d}"
+            out_mp4 = part_dir_for(gi) / f"{series_safe}_{ep_label}_AR.mp4"
+
+            if out_mp4.exists() and out_mp4.stat().st_size > 1024 * 1024:
+                push(f"⏭️ {ep_label} جاهزة مسبقاً — تخطي ({out_mp4.name})")
+                rendered[ep_label] = str(out_mp4)
+                continue
+
+            push(f"━━━━━━ {ep_label} ({gi}/{total}): {vid.name} ━━━━━━")
+            work_dir = RAW_CACHE_ROOT / "_work" / series_safe / ep_label
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                source_sub = None
+                is_raw_whisper = False
+                if sub_mode.startswith("Auto"):
+                    probe = probe_embedded_subtitles(str(vid))
+                    if probe is not None:
+                        source_sub = extract_embedded_subtitle(str(vid), probe[0], probe[1], str(work_dir))
+                        push(f"✓ {ep_label}: تم سحب الترجمة المدمجة ({probe[1]}).")
+                if source_sub is None:
+                    is_raw_whisper = True
+                    source_sub = yield from run_live(
+                        transcribe_with_whisper,
+                        str(vid),
+                        str(work_dir / "whisper.srt"),
+                        model_size=whisper_model,
+                        badge=f"WHISPER [{ep_label} {gi}/{total}]",
+                        title=f"حلقة {gi} من {total} خام بدون ترجمة — تفريغ الصوت...",
+                        accepts_progress_cb=False,
+                    )
+
+                entries = parse_source_subtitles(source_sub)
+
+                if (api_key.strip() or "Local" in provider) and not glossary:
+                    glossary = yield from run_live(
+                        load_or_extract_series_glossary,
+                        series_name=series_name,
+                        entries=entries,
+                        is_raw_whisper=is_raw_whisper,
+                        provider=_provider_key(provider),
+                        api_key=api_key,
+                        model_name=llm_model,
+                        base_url=base_url,
+                        badge=f"SERIES GLOSSARY [{ep_label}]",
+                        title="تجهيز قاموس أسماء ومصطلحات الأنمي (مرة واحدة لكل الموسم)...",
+                        accepts_progress_cb=False,
+                    )
+
+                translations = yield from run_live(
+                    translate_entries,
+                    entries=entries,
+                    provider=_provider_key(provider),
+                    api_key=api_key,
+                    model_name=llm_model,
+                    base_url=base_url,
+                    series_name=series_name,
+                    glossary=glossary,
+                    checkpoint_path=str(work_dir / "translation_checkpoint.json"),
+                    badge=f"TRANSLATION [{ep_label} {gi}/{total}]",
+                    title=f"ترجمة حلقة {gi} من {total} بأسلوب Celestial-Dragons ({len(entries)} سطر)...",
+                    accepts_progress_cb=False,
+                )
+
+                vw, vh, _, _ = probe_video_info(str(vid))
+                ep_ass = ass_root / f"{series_safe}_{ep_label}_AR.ass"
+                write_responsive_ass(
+                    entries=entries,
+                    translations=translations,
+                    out_ass_path=str(ep_ass),
+                    target_w=vw,
+                    target_h=vh,
+                    style_preset=style_preset,
+                    credits=credits_dict if has_credits else None,
+                )
+                last_ass = str(ep_ass)
+
+                yield from run_live(
+                    burn_and_compress_native,
+                    video_path=str(vid),
+                    ass_path=str(ep_ass),
+                    output_path=str(out_mp4),
+                    fonts_dir=str(FONTS_DIR),
+                    codec=codec,
+                    cq=int(cq),
+                    preset=preset,
+                    audio_bitrate=audio_bitrate,
+                    badge=f"ENCODE [{ep_label} {gi}/{total}]",
+                    title=f"حرق وضغط حلقة {gi} من {total} ({codec})...",
+                    accepts_progress_cb=True,
+                )
+                rendered[ep_label] = str(out_mp4)
+                shutil.rmtree(work_dir, ignore_errors=True)
+                if cleanup_temp:
+                    try:
+                        vid.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            except Exception as ep_exc:
+                failed.append(f"{ep_label} ({vid.name}): {ep_exc}")
+                push(f"❌ فشلت {ep_label}: {ep_exc} — متابعة باقي الحلقات...")
+                continue
+
+        all_local = list_local_outputs()
+        first_video = next(iter(rendered.values()), None)
+        done_n, fail_n = len(rendered), len(failed)
+
+        if fail_n:
+            push(f"⚠️ حلقات فشلت ({fail_n}):")
+            for f_ in failed:
+                push(f"   • {f_}")
+
+        push(f"✅ اكتمل الموسم! {done_n}/{total} حلقة جاهزة في: {series_root}")
+        yield pack(
+            render_progress_hud(
+                100.0 if not fail_n else 97.0,
+                "SEASON COMPLETE" if not fail_n else "SEASON DONE WITH ERRORS",
+                f"تم إنتاج {done_n} من {total} حلقة" + (f" · {fail_n} فشلت" if fail_n else " بنجاح كامل!"),
+                f"الفولدر: {series_root}" + (" · مقسم ×35" if split_parts else ""),
+                f"{done_n} MP4",
+                mode="done" if not fail_n else "error",
+            ),
+            preview_val=first_video,
+            local_dd=gr.update(choices=all_local, value=first_video),
+            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+            vids_val=list(rendered.values())[:40],
+            ass_val=last_ass,
+            state_val={"folder": str(series_root), "files": rendered},
+        )
+    except Exception as exc:
+        push(f"❌ خطأ عام في وضع الموسم: {exc}\n{traceback.format_exc()[-500:]}")
+        yield pack(
+            render_progress_hud(
+                0.0,
+                "ERROR · SEASON HALTED",
+                f"توقف الموسم بسبب خطأ: {str(exc)[:110]}",
+                "الحلقات الجاهزة ونقاط الحفظ محفوظة — أعد التشغيل للاستكمال",
+                "راجع سجل العمليات",
+                mode="error",
+            ),
+            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+            state_val={},
+        )
+
+
 def step2_approve_and_upload(
     job_state: Dict,
     enable_dood: bool, dood_api_key: str,
@@ -920,6 +1237,19 @@ def build_ui() -> gr.Blocks:
                         link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
                         file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
 
+                with gr.Accordion("📚 وضع المواسم الكاملة — روابط دفعات (الرابط الواحد ممكن يحتوي موسماً أو أكثر)", open=True, elem_classes=["sb-accordion"]):
+                    batch_links = gr.Textbox(
+                        label="روابط التورنت / الماجنت — رابط واحد في كل سطر",
+                        placeholder="magnet:?xt=urn:btih:...\nhttps://example.com/Season2.torrent",
+                        lines=4,
+                    )
+                    batch_btn = gr.Button(
+                        "🚀 شغّل الموسم كاملاً: تحميل كل الحلقات ← ترجمة بأسلوب المترجم ← حرق ← ضغط ← فولدرات 35 حلقة [SEASON STRIKE]",
+                        variant="primary",
+                        size="lg",
+                        elem_id="sb-batch-btn",
+                    )
+
                 with gr.Accordion("🔑 مفاتيح DeepSeek / Gemini والإعدادات الدائمة", open=True, elem_classes=["sb-accordion"]):
                     with gr.Row():
                         provider = gr.Dropdown(
@@ -1019,6 +1349,22 @@ def build_ui() -> gr.Blocks:
                 link_1080, file_1080,
                 link_720, file_720,
                 link_480, file_480,
+                sub_mode, whisper_model,
+                provider, api_key, llm_model, base_url,
+                codec, cq, preset, audio_bitrate,
+                credit_translator, credit_typesetter, credit_encoder,
+                cleanup_temp,
+            ],
+            outputs=[
+                progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
+                out_video_files, out_ass_file, job_state,
+            ],
+        )
+
+        batch_btn.click(
+            fn=step_batch_process,
+            inputs=[
+                batch_links, series_name, style_preset,
                 sub_mode, whisper_model,
                 provider, api_key, llm_model, base_url,
                 codec, cq, preset, audio_bitrate,
