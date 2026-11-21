@@ -29,3 +29,12 @@ apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg aria2
 
 ## بديل: نوتبوك Jupyter
 `run_in_jupyter.ipynb` فيه نفس الخطوات خلايا جاهزة (تجهيز ← جوجل درايف ← تشغيل الواجهة ← متصفح Chrome).
+
+## v4 — Long-Season Reliability & Consistency
+
+- **Retry hardening**: كل نداء لـ DeepSeek يعيد المحاولة حتى 5 مرات بتراجع أسّي (exponential backoff) مع مهلة اتصال 180 ثانية — المواسم الطويلة تكمل حتى لو الشبكة اتقطعت لحظياً.
+- **Tracker injection**: تحميل الماجنت/التورنت بيحقن تلقائياً قائمة trackers عامة (بتتحدث من ngosang/trackerslist وتتخزن في `/workspace/trackers.txt` لمدة 7 أيام، ومعها نسخة احتياطية مرفقة في `trackers.txt`) — التورنتات القديمة ضعيفة السيد بتلتقط أسرع بكتير.
+- **Auto-learning glossary**: بعد كل حلقة، الأداة بتحفظ الأسماء والتقنيات زي ما اترجمت فعلاً في قاموس الموسم `/workspace/glossaries/<series>.json` — الحلقة 30 تطلع بنفس أسماء الحلقة 2. في قالب جاهز في `glossaries/glossary.example.json` تقدر تنسخه وتعدله لأي أنمي.
+
+الترتيب ده تراكمي على v3: نفس الـ one-liner ونفس الواجهة، مفيش أي تغيير في طريقة التشغيل.
+
