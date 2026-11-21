@@ -535,6 +535,89 @@ def burn_and_compress_native(
     return output_path
 
 
+def make_browser_preview(
+    video_path: str,
+    output_path: str,
+    log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> str:
+    """Fast browser-playable copy (H.264/AAC mp4) of a finished episode for the
+    Gradio preview player, so the player never triggers Gradio's own slow CPU
+    re-encode of the HEVC master. Tries h264_nvenc (GPU) first and falls back to
+    libx264 veryfast on CPU. Returns output_path; raises only if both attempts fail."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    _, _, _, total_dur = probe_video_info(video_path)
+
+    attempts: List[Tuple[str, List[str]]] = []
+    if _has_nvenc("h264_nvenc"):
+        attempts.append(("h264_nvenc", [
+            "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "28", "-b:v", "0",
+            "-pix_fmt", "yuv420p",
+        ]))
+    attempts.append(("libx264", [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
+    ]))
+
+    PROGRESS_KEYS = (
+        "frame=", "fps=", "stream_", "bitrate=", "total_size=",
+        "out_time", "dup_frames=", "drop_frames=", "speed=", "progress=",
+    )
+    last_err = ""
+    for engine, v_args in attempts:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-map", "0:v:0", "-map", "0:a:0?",
+            *v_args,
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            output_path,
+        ]
+        if log_cb:
+            log_cb(f"[preview] تجهيز نسخة معاينة سريعة للمتصفح بمحرك {engine}...")
+        if progress_cb:
+            progress_cb(0.5, f"تشغيل محرك {engine} للمعاينة...", Path(output_path).name)
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert proc.stdout is not None
+        tail: List[str] = []
+        pstate: Dict[str, str] = {}
+        last_log_t = 0.0
+        for line in proc.stdout:
+            clean = line.strip()
+            if not clean:
+                continue
+            if clean.startswith(PROGRESS_KEYS) and "=" in clean:
+                k, v = clean.split("=", 1)
+                pstate[k.strip()] = v.strip()
+                if k.strip() == "progress":
+                    cur_sec = _parse_hms(pstate.get("out_time", "00:00:00"))
+                    spd_v = pstate.get("speed", "—")
+                    pct = min(99.8, (cur_sec / total_dur) * 100.0) if total_dur > 0 else 50.0
+                    if progress_cb:
+                        progress_cb(pct, f"معاينة {engine} · السرعة: {spd_v}", Path(output_path).name)
+                    now_t = time.monotonic()
+                    if log_cb and (now_t - last_log_t >= 8.0):
+                        last_log_t = now_t
+                        log_cb(f"[preview] {pct:.1f}% | السرعة: {spd_v}")
+            else:
+                tail.append(clean)
+                if len(tail) > 25:
+                    tail.pop(0)
+        if proc.wait() == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+            src_mb = os.path.getsize(video_path) / (1024 * 1024)
+            pv_mb = os.path.getsize(output_path) / (1024 * 1024)
+            if progress_cb:
+                progress_cb(100.0, "نسخة المعاينة جاهزة ✓", f"{pv_mb:.0f} MB · {engine}")
+            if log_cb:
+                log_cb(f"[preview] نسخة المعاينة جاهزة: {src_mb:.1f} MB -> {pv_mb:.1f} MB ({engine})")
+            return output_path
+        last_err = "\n".join(tail[-8:])
+        if log_cb:
+            log_cb(f"[preview] محرك {engine} لم ينجح — تجربة بديل أبطأ...")
+    raise RuntimeError("تعذر تجهيز نسخة المعاينة:\n" + last_err)
+
+
 def upload_to_rclone(
     local_file: str,
     remote_name: str,
