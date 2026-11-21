@@ -71,6 +71,13 @@ FONT_FALLBACK_MAP = {
     "Bahij Tanseek Pro": "Hayah",
 }
 
+# Family name inside the user-supplied font file when it differs from the name the
+# translator's ASS styles request (fc-match needs the real family, e.g. "HSN Shahd"
+# lives in the file as "HSN Shahd Regular").
+REAL_FAMILY_ALIAS = {
+    "HSN Shahd": "HSN Shahd Regular",
+}
+
 STYLE_PROFILE_VERSION = 3
 
 DEFAULT_CELESTIAL_PROFILE = {
@@ -235,6 +242,8 @@ def _safe_font(font_name: str) -> str:
         return "Bahij Nassim"
     if font_name in INSTALLED_SAFE_FONTS:
         return font_name
+    if font_name in REAL_FAMILY_ALIAS and _user_added_font_file(REAL_FAMILY_ALIAS[font_name]):
+        return REAL_FAMILY_ALIAS[font_name]
     if _user_added_font_file(font_name):
         return font_name
     return FONT_FALLBACK_MAP.get(font_name, "Bahij Nassim")
