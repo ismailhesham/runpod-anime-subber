@@ -1,6 +1,9 @@
 import json
 import os
+import re
 import subprocess
+import threading
+import time
 import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -17,6 +20,8 @@ REQUIRED_FONT_FILES = [
     "Sovba_Regular.otf",
 ]
 
+ProgressCallback = Callable[[float, str, str], None]
+
 
 def verify_required_fonts(fonts_dir: str) -> None:
     """Strictly verify all 7 custom fonts exist in fonts/ so libass never substitutes random fonts."""
@@ -29,58 +34,128 @@ def verify_required_fonts(fonts_dir: str) -> None:
         )
 
 
+def find_completed_video(folder: Path) -> Optional[Path]:
+    """Return completed video file (>1MB and no active .aria2 control file) if already downloaded."""
+    if not folder.exists():
+        return None
+    if any(folder.rglob("*.aria2")):
+        return None
+    videos = sorted(
+        [
+            p for p in folder.rglob("*")
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS and p.stat().st_size > 1024 * 1024
+        ],
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    return videos[0] if videos else None
+
+
 def download_torrent_or_url(
     source_link: Optional[str],
     torrent_file: Optional[str],
     output_dir: str,
     log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
 ) -> Path:
-    """Download a single quality (magnet link, URL, or .torrent/.mkv file) via aria2c."""
-    os.makedirs(output_dir, exist_ok=True)
+    """Download or resume via aria2c into persistent storage, skipping immediately if already cached."""
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Direct video file selected from server or uploaded
+    if torrent_file and os.path.isfile(torrent_file) and Path(torrent_file).suffix.lower() in VIDEO_EXTENSIONS:
+        vp = Path(torrent_file)
+        mb = vp.stat().st_size / (1024 * 1024)
+        if log_cb:
+            log_cb(f"⚡ استخدام ملف الفيديو المحفوظ مباشرة ({mb:.1f} MB): {vp.name}")
+        if progress_cb:
+            progress_cb(100.0, "جاهز محلياً بدون تحميل ⚡", f"{mb:.1f} MB · {vp.name}")
+        return vp
+
+    # Instant Cache Hit if already downloaded completely in persistent folder
+    cached = find_completed_video(out_path)
+    if cached is not None:
+        mb = cached.stat().st_size / (1024 * 1024)
+        if log_cb:
+            log_cb(f"⚡ الحلقة محفوظة مسبقاً بالكامل ({mb:.1f} MB): {cached.name} — تم تخطي التحميل!")
+        if progress_cb:
+            progress_cb(100.0, "محفوظة مسبقاً على السيرفر ⚡", f"{mb:.1f} MB · {cached.name}")
+        return cached
 
     target = None
     if torrent_file and os.path.isfile(torrent_file):
-        if Path(torrent_file).suffix.lower() in VIDEO_EXTENSIONS:
-            return Path(torrent_file)
         target = torrent_file
     elif source_link and source_link.strip():
         target = source_link.strip()
 
     if not target:
-        raise ValueError("No download link or file provided.")
+        raise ValueError("لم يتم إدخال رابط أو اختيار حلقة محفوظة.")
+
+    has_partial = any(out_path.rglob("*.aria2"))
+    overwrite_flag = "--allow-overwrite=false" if has_partial else "--allow-overwrite=true"
 
     cmd = [
         "aria2c",
         "--dir", output_dir,
+        "--continue=true",
+        overwrite_flag,
+        "--auto-file-renaming=false",
         "--seed-time=0",
         "--bt-stop-timeout=300",
         "--max-connection-per-server=8",
         "--split=8",
         "--file-allocation=none",
-        "--summary-interval=5",
-        "--allow-overwrite=true",
+        "--summary-interval=1",
         target,
     ]
     if log_cb:
-        log_cb(f"[aria2c] Downloading into {output_dir} (--seed-time=0)...")
+        mode_txt = "استكمال التحميل السابق" if has_partial else "بدء التحميل وحفظه دائماً"
+        log_cb(f"[aria2c] {mode_txt} في: {output_dir}")
+    if progress_cb:
+        progress_cb(1.0, "جاري الاتصال بالمصدر وجلب البيانات...", output_dir)
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert proc.stdout is not None
+
+    last_log_t = 0.0
     for line in proc.stdout:
         clean = line.strip()
-        if clean and log_cb and any(k in clean for k in ("DL:", "Download complete", "ERROR", "%")):
+        if not clean:
+            continue
+        pct_m = re.search(r"\((\d+(?:\.\d+)?)%\)", clean)
+        if pct_m:
+            pct = float(pct_m.group(1))
+            dl_m = re.search(r"DL:([^\s\]]+)", clean)
+            eta_m = re.search(r"ETA:([^\s\]]+)", clean)
+            sz_m = re.search(r"([\d.]+\w*B/[\d.]+\w*B)", clean)
+            dl_spd = dl_m.group(1) if dl_m else "—"
+            eta_str = eta_m.group(1) if eta_m else "—"
+            sz_str = sz_m.group(1) if sz_m else ""
+            if progress_cb:
+                progress_cb(pct, f"السرعة: {dl_spd}/s · المتبقي: {eta_str}", sz_str or "جاري التحميل...")
+            now_t = time.monotonic()
+            if log_cb and (now_t - last_log_t >= 6.0):
+                last_log_t = now_t
+                log_cb(f"[aria2c] {pct:.0f}% | السرعة: {dl_spd}/s | الحجم: {sz_str} | المتبقي: {eta_str}")
+        elif "METADATA" in clean.upper() and progress_cb:
+            progress_cb(2.0, "جاري سحب بيانات التورنت (Metadata)...", "الاتصال بالـ Seeders")
+        elif log_cb and any(k in clean for k in ("Download complete", "ERROR")):
             log_cb(f"[aria2c] {clean}")
 
     if proc.wait() != 0:
-        raise RuntimeError("aria2c download failed. Check the magnet/link or Runpod P2P ports.")
+        raise RuntimeError("فشل تحميل aria2c — تأكد من صحة رابط التورنت أو الرابط المباشر.")
 
     videos = sorted(
-        [p for p in Path(output_dir).rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS],
+        [p for p in out_path.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS],
         key=lambda p: p.stat().st_size,
         reverse=True,
     )
     if not videos:
-        raise FileNotFoundError(f"No video file found in {output_dir}")
+        raise FileNotFoundError(f"لم يتم العثور على ملف فيديو داخل {output_dir}")
+
+    mb = videos[0].stat().st_size / (1024 * 1024)
+    if progress_cb:
+        progress_cb(100.0, "اكتمل التحميل 100% وحُفظ دائماً ✓", f"{mb:.1f} MB · {videos[0].name}")
     return videos[0]
 
 
@@ -93,6 +168,34 @@ def _has_nvenc(codec: str) -> bool:
     return codec in (res.stdout or "")
 
 
+def _probe_duration_seconds(video_path: str) -> float:
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return max(0.0, float((res.stdout or "0").strip()))
+    except Exception:
+        return 0.0
+
+
+def _parse_hms(val: str) -> float:
+    try:
+        parts = val.strip().split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except Exception:
+        pass
+    return 0.0
+
+
 def burn_and_compress_native(
     video_path: str,
     ass_path: str,
@@ -103,8 +206,9 @@ def burn_and_compress_native(
     preset: str = "p6",
     audio_bitrate: str = "160k",
     log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
 ) -> str:
-    """Burn Arabic ASS subtitles + compress at the video's NATIVE resolution on NVIDIA NVENC."""
+    """Burn Arabic ASS subtitles + compress at native resolution on NVIDIA NVENC with live % telemetry."""
     verify_required_fonts(fonts_dir)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     vf = f"ass='{_escape_ffmpeg_path(os.path.abspath(ass_path))}':fontsdir='{_escape_ffmpeg_path(os.path.abspath(fonts_dir))}'"
@@ -125,36 +229,79 @@ def burn_and_compress_native(
         if cpu_codec == "libx265":
             v_args += ["-tag:v", "hvc1"]
 
+    total_dur = _probe_duration_seconds(video_path)
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-vf", vf, *v_args,
         "-c:a", "aac", "-b:a", audio_bitrate,
         "-movflags", "+faststart",
+        "-progress", "pipe:1",
         output_path,
     ]
     if log_cb:
-        log_cb(f"[ffmpeg] Encoding {Path(output_path).name} ({v_args[1]}, CQ={cq})...")
+        log_cb(f"[ffmpeg] بدء الحرق والضغط لـ {Path(output_path).name} ({v_args[1]}, CQ={cq})...")
+    if progress_cb:
+        progress_cb(0.5, f"تشغيل محرك {v_args[1]}...", Path(output_path).name)
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert proc.stdout is not None
+
+    PROGRESS_KEYS = (
+        "frame=", "fps=", "stream_", "bitrate=", "total_size=",
+        "out_time", "dup_frames=", "drop_frames=", "speed=", "progress=",
+    )
     tail: List[str] = []
+    pstate: Dict[str, str] = {}
+    last_log_t = 0.0
+
     for line in proc.stdout:
         clean = line.strip()
         if not clean:
             continue
-        tail.append(clean)
-        if len(tail) > 20:
-            tail.pop(0)
-        if log_cb and "frame=" in clean and "speed=" in clean:
-            log_cb(f"[ffmpeg] {clean}")
+        if clean.startswith(PROGRESS_KEYS) and "=" in clean:
+            k, v = clean.split("=", 1)
+            pstate[k.strip()] = v.strip()
+            if k.strip() == "progress":
+                cur_sec = _parse_hms(pstate.get("out_time", "00:00:00"))
+                fps_v = pstate.get("fps", "0")
+                spd_v = pstate.get("speed", "—")
+                sz_mb = int(pstate.get("total_size", "0") or "0") / (1024 * 1024)
+                pct = min(99.8, (cur_sec / total_dur) * 100.0) if total_dur > 0 else 50.0
+                spd_num = 0.0
+                try:
+                    spd_num = float(spd_v.replace("x", "").strip())
+                except Exception:
+                    pass
+                eta_txt = "—"
+                if total_dur > 0 and spd_num > 0.05:
+                    rem = max(0, int((total_dur - cur_sec) / spd_num))
+                    eta_txt = f"{rem // 60:02d}:{rem % 60:02d}"
+                cm, cs = divmod(int(cur_sec), 60)
+                tm, ts = divmod(int(total_dur), 60)
+                if progress_cb:
+                    progress_cb(
+                        pct,
+                        f"السرعة: {spd_v} · {fps_v} fps · المتبقي: {eta_txt}",
+                        f"{cm:02d}:{cs:02d} / {tm:02d}:{ts:02d} · {sz_mb:.1f} MB",
+                    )
+                now_t = time.monotonic()
+                if log_cb and (now_t - last_log_t >= 8.0):
+                    last_log_t = now_t
+                    log_cb(f"[ffmpeg] {pct:.1f}% | السرعة: {spd_v} | الحجم: {sz_mb:.1f} MB | المتبقي: {eta_txt}")
+        else:
+            tail.append(clean)
+            if len(tail) > 25:
+                tail.pop(0)
 
     if proc.wait() != 0:
-        raise RuntimeError("FFmpeg failed:\n" + "\n".join(tail[-8:]))
+        raise RuntimeError("FFmpeg failed:\n" + "\n".join(tail[-10:]))
 
     orig_mb = os.path.getsize(video_path) / (1024 * 1024)
     new_mb = os.path.getsize(output_path) / (1024 * 1024)
+    if progress_cb:
+        progress_cb(100.0, "اكتمل الحرق والضغط 100% ✓", f"{orig_mb:.1f} MB → {new_mb:.1f} MB")
     if log_cb:
-        log_cb(f"[ffmpeg] Done: {orig_mb:.1f} MB -> {new_mb:.1f} MB ({output_path})")
+        log_cb(f"[ffmpeg] اكتمل بنجاح: {orig_mb:.1f} MB -> {new_mb:.1f} MB ({output_path})")
     return output_path
 
 
@@ -164,29 +311,48 @@ def upload_to_rclone(
     folder_path: str = "Runpod_Anime",
     generate_link: bool = True,
     log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
 ) -> str:
-    """Upload file via Rclone (MEGA or Google Drive) and optionally return public share link."""
+    """Upload file via Rclone with 1s live percentage updates."""
     fname = os.path.basename(local_file)
     dest_dir = f"{remote_name.strip().rstrip(':')}:{folder_path.strip().strip('/')}"
     dest_file = f"{dest_dir}/{fname}"
+    if progress_cb:
+        progress_cb(1.0, f"بدء الرفع إلى {remote_name}...", fname)
 
     proc = subprocess.Popen(
-        ["rclone", "copy", local_file, dest_dir, "--stats=5s", "--stats-one-line", "-v"],
+        ["rclone", "copy", local_file, dest_dir, "--stats=1s", "--stats-one-line", "-v"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
     assert proc.stdout is not None
-    tail = []
+    tail: List[str] = []
+    last_log_t = 0.0
     for line in proc.stdout:
         clean = line.strip()
-        if clean:
-            tail.append(clean)
-            if len(tail) > 12:
-                tail.pop(0)
-            if log_cb and ("%" in clean or "Transferred" in clean or "ERROR" in clean):
-                log_cb(f"[rclone:{remote_name}] {clean}")
+        if not clean:
+            continue
+        tail.append(clean)
+        if len(tail) > 15:
+            tail.pop(0)
+        pct_m = re.search(r"(\d+(?:\.\d+)?)%", clean)
+        if pct_m:
+            pct = float(pct_m.group(1))
+            spd_m = re.search(r"([\d.]+\s*\w+B/s)", clean)
+            eta_m = re.search(r"ETA\s*([^\s,]+)", clean)
+            spd = spd_m.group(1) if spd_m else "—"
+            eta = eta_m.group(1) if eta_m else "—"
+            if progress_cb:
+                progress_cb(pct, f"السرعة: {spd} · المتبقي: {eta}", fname)
+            now_t = time.monotonic()
+            if log_cb and (now_t - last_log_t >= 6.0):
+                last_log_t = now_t
+                log_cb(f"[rclone:{remote_name}] {pct:.0f}% | {spd} | ETA {eta}")
 
     if proc.wait() != 0:
         raise RuntimeError(f"Rclone upload to {remote_name} failed:\n" + "\n".join(tail[-6:]))
+
+    if progress_cb:
+        progress_cb(100.0, f"اكتمل الرفع على {remote_name} ✓", fname)
 
     if generate_link:
         link_res = subprocess.run(["rclone", "link", dest_file], capture_output=True, text=True)
@@ -199,33 +365,74 @@ def upload_to_doodstream(
     local_file: str,
     api_key: str,
     log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
 ) -> Dict[str, str]:
-    """Upload video to DoodStream via official REST API using streaming curl."""
+    """Upload video to DoodStream via official REST API with live curl % progress."""
     key = api_key.strip()
     if not key:
-        raise ValueError("Please enter your DoodStream API Key.")
+        raise ValueError("يرجى إدخال مفتاح DoodStream API Key.")
 
     req = urllib.request.Request(f"https://doodapi.co/api/upload/server?key={key}", headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         server_data = json.loads(resp.read().decode("utf-8"))
-
     if server_data.get("status") != 200 or not server_data.get("result"):
         raise RuntimeError(f"DoodStream server error: {server_data}")
 
     upload_url = f"{server_data['result']}?{key}"
+    fname = os.path.basename(local_file)
     if log_cb:
-        log_cb(f"[DoodStream] Streaming {os.path.basename(local_file)}...")
+        log_cb(f"[DoodStream] جاري رفع {fname}...")
+    if progress_cb:
+        progress_cb(1.0, "جاري الرفع على سيرفر DoodStream...", fname)
 
-    res = subprocess.run(
-        ["curl", "-sS", "-X", "POST", "-F", f"api_key={key}", "-F", f"file=@{local_file}", upload_url],
-        capture_output=True, text=True,
+    proc = subprocess.Popen(
+        ["curl", "--no-buffer", "-#", "-X", "POST", "-F", f"api_key={key}", "-F", f"file=@{local_file}", upload_url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    if res.returncode != 0:
-        raise RuntimeError(f"DoodStream curl error: {res.stderr[-300:]}")
+    out_chunks: List[bytes] = []
 
-    data = json.loads(res.stdout or "{}")
+    def _collect_stdout() -> None:
+        assert proc.stdout is not None
+        while True:
+            b = proc.stdout.read(4096)
+            if not b:
+                break
+            out_chunks.append(b)
+
+    t_out = threading.Thread(target=_collect_stdout, daemon=True)
+    t_out.start()
+
+    assert proc.stderr is not None
+    buf = ""
+    last_pct = -1.0
+    while True:
+        chunk = proc.stderr.read(128)
+        if not chunk:
+            break
+        buf += chunk.decode("utf-8", errors="ignore")
+        parts = re.split(r"[\r\n]+", buf)
+        buf = parts[-1]
+        for seg in parts[:-1]:
+            m = re.search(r"(\d+(?:\.\d+)?)%", seg)
+            if m:
+                pct = float(m.group(1))
+                if pct - last_pct >= 0.5 or pct >= 100.0:
+                    last_pct = pct
+                    if progress_cb:
+                        progress_cb(pct, "رفع مباشر إلى DoodStream", fname)
+
+    t_out.join()
+    if proc.wait() != 0:
+        raise RuntimeError(f"DoodStream curl error: {buf[-300:]}")
+
+    raw_json = b"".join(out_chunks).decode("utf-8", errors="replace")
+    data = json.loads(raw_json or "{}")
     if data.get("status") != 200 or not data.get("result"):
         raise RuntimeError(f"DoodStream API error: {data}")
+
+    if progress_cb:
+        progress_cb(100.0, "اكتمل الرفع على DoodStream ✓", fname)
 
     item = data["result"][0] if isinstance(data["result"], list) else data["result"]
     code = item.get("filecode", "")
