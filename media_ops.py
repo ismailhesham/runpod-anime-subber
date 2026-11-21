@@ -394,10 +394,16 @@ def burn_and_compress_native(
     cq: int = 23,
     preset: str = "p6",
     audio_bitrate: str = "160k",
+    logo_path: str = "",
+    logo_position: str = "top-right",
+    logo_opacity: float = 0.30,
+    logo_scale: float = 0.12,
     log_cb: Optional[Callable[[str], None]] = None,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> str:
-    """Single-pass NVENC burn: responsive ASS subtitles burned + compressed to MP4."""
+    """Single-pass NVENC burn: responsive ASS subtitles burned + compressed to MP4.
+    When logo_path exists, the logo is overlaid (scaled, opacity-adjusted) in the chosen
+    corner, subtitles burned on top. Missing logo = clean no-op."""
     verify_required_fonts(fonts_dir)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     ass_filter = f"ass='{_escape_ffmpeg_path(os.path.abspath(ass_path))}':fontsdir='{_escape_ffmpeg_path(os.path.abspath(fonts_dir))}'"
@@ -423,16 +429,44 @@ def burn_and_compress_native(
         if cpu_codec == "libx265":
             v_args += ["-tag:v", "hvc1"]
 
-    _, _, _, total_dur = probe_video_info(video_path)
+    vw_, vh_, _, total_dur = probe_video_info(video_path)
 
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-vf", ass_filter, *v_args,
-        "-c:a", "aac", "-b:a", audio_bitrate,
-        "-movflags", "+faststart",
-        "-progress", "pipe:1",
-        output_path,
-    ]
+    if logo_path and os.path.isfile(logo_path):
+        op = min(1.0, max(0.05, float(logo_opacity)))
+        sc = min(0.5, max(0.03, float(logo_scale)))
+        logo_w = max(16, round(vw_ * sc)) if vw_ > 0 else 160
+        margin = max(8, round(vw_ * 0.018)) if vw_ > 0 else 24
+        pos = (logo_position or "top-right").strip().lower()
+        x_expr = str(margin) if "left" in pos else f"W-w-{margin}"
+        y_expr = str(margin) if "top" in pos else f"H-h-{margin}"
+        fc = (
+            f"[1:v]format=rgba,scale={logo_w}:-1,colorchannelmixer=aa={op:.2f}[logo];"
+            f"[0:v][logo]overlay={x_expr}:{y_expr}[vt];"
+            f"[vt]{ass_filter}[vout]"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
+            "-filter_complex", fc,
+            "-map", "[vout]", "-map", "0:a?", *v_args,
+            "-c:a", "aac", "-b:a", audio_bitrate,
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            output_path,
+        ]
+        if log_cb:
+            log_cb(
+                f"[logo] حرق اللوجو ({Path(logo_path).name}): الركن {pos}"
+                f" · شفافية {int(op * 100)}% · عرض {logo_w}px"
+            )
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vf", ass_filter, *v_args,
+            "-c:a", "aac", "-b:a", audio_bitrate,
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            output_path,
+        ]
 
     if log_cb:
         log_cb(f"[ffmpeg] بدء الحرق والضغط لـ {Path(output_path).name} ({v_args[1]})...")
