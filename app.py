@@ -24,10 +24,14 @@ from media_ops import (
     episode_sort_key,
     extract_episode_number,
     probe_video_info,
+    rclone_remote_configured,
+    drive_download_file,
     upload_to_doodstream,
     upload_to_rclone,
 )
 from subtitles_ai import (
+    _glossary_dir,
+    _glossary_slug,
     ensure_style_profile,
     extract_embedded_subtitle,
     learn_glossary_from_translation,
@@ -58,6 +62,47 @@ if _SECRETS_FILE.is_file():
         pass
 
 ensure_style_profile()
+
+
+def _seed_rclone_from_secrets() -> None:
+    """Fresh pod: rebuild ~/.config/rclone/rclone.conf for the gdrive remote from the
+    saved Drive token in subber_secrets.json, so backups work without notebook cell 2.
+    rclone refreshes the access token by itself via the refresh_token."""
+    try:
+        if shutil.which("rclone") is None:
+            return
+        conf = Path.home() / ".config" / "rclone" / "rclone.conf"
+        tok = os.environ.get("GDRIVE_TOKEN", "").strip()
+        if tok and not conf.is_file():
+            conf.parent.mkdir(parents=True, exist_ok=True)
+            conf.write_text(
+                f"[gdrive]\ntype = drive\nscope = drive\ntoken = {tok}\n",
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+
+_seed_rclone_from_secrets()
+
+
+def _drive_restore_glossaries() -> None:
+    """Fresh pod: pull back saved per-series glossaries from Drive (best effort)."""
+    try:
+        if not rclone_remote_configured("gdrive"):
+            return
+        gdir = _glossary_dir()
+        gdir.mkdir(parents=True, exist_ok=True)
+        subprocess_res = os.system(
+            "rclone copy gdrive:Runpod_Anime/_state/glossaries "
+            + str(gdir) + " --ignore-existing >/dev/null 2>&1"
+        )
+        _ = subprocess_res
+    except Exception:
+        pass
+
+
+_drive_restore_glossaries()
 
 SHADOW_BLADE_HEAD = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1170,6 +1215,19 @@ def step_batch_process(
         glossary: Dict = {}
         last_ass: Optional[str] = None
 
+        # ☁️ نسخ احتياطي على Google Drive: البود مؤقت وكل حاجة بتتمسح لما يتقفل
+        _st = load_settings()
+        drv_remote = str(_st.get("gdrive_remote", "gdrive")).strip() or "gdrive"
+        drv_folder = str(_st.get("gdrive_folder", "Runpod_Anime")).strip() or "Runpod_Anime"
+        drive_ok = rclone_remote_configured(drv_remote)
+        if drive_ok:
+            push("☁️ Google Drive متربط — هيتم رفع كل حلقة أول بأول + حفظ الذاكرة والقاموس.")
+            drive_download_file(drv_remote, f"{drv_folder}/_state/{series_safe}", "_translation_memory.json", str(series_root / "_translation_memory.json"))
+            if drive_download_file(drv_remote, f"{drv_folder}/_state/glossaries", f"{_glossary_slug(series_name)}.json", str(_glossary_dir() / f"{_glossary_slug(series_name)}.json")):
+                push("♻️ تم استرجاع قاموس الأنمي من Drive — الأسماء والمصطلحات زي ما وصلتله آخر مرة.")
+        else:
+            push("⚠️ Google Drive مش متربط (rclone) — الشغل هيتحفظ محلياً بس وهيتمسح لو البود اتقفل!")
+
         # ذاكرة ترجمة الموسم: الأسطر المكررة (الأوبنينج/الإندينج) تترجم مرة واحدة فقط
         tmem_path = series_root / "_translation_memory.json"
         tmem: Dict[str, str] = {}
@@ -1330,6 +1388,28 @@ def step_batch_process(
                     accepts_progress_cb=False,
                 )
                 rendered[ep_label] = str(out_mp4)
+                if drive_ok:
+                    try:
+                        yield from run_live(
+                            upload_to_rclone,
+                            str(out_mp4), drv_remote, f"{drv_folder}/{series_safe}",
+                            generate_link=False,
+                            badge=f"DRIVE BACKUP [{ep_label} {gi}/{total}]",
+                            title=f"نسخ احتياطي لحلقة {gi} من {total} على Google Drive...",
+                            accepts_progress_cb=True,
+                        )
+                        for _sf, _sub in ((tmem_path, f"_state/{series_safe}"), (_glossary_dir() / f"{_glossary_slug(series_name)}.json", "_state/glossaries")):
+                            if _sf.is_file():
+                                yield from run_live(
+                                    upload_to_rclone,
+                                    str(_sf), drv_remote, f"{drv_folder}/{_sub}",
+                                    generate_link=False,
+                                    badge=f"STATE BACKUP [{ep_label}]",
+                                    title="حفظ ذاكرة الترجمة والقاموس على Drive...",
+                                    accepts_progress_cb=False,
+                                )
+                    except Exception as up_exc:
+                        push(f"⚠️ فشل النسخ الاحتياطي لـ {ep_label} على Drive: {up_exc} — الحلقة محفوظة محلياً ومكملين.")
                 shutil.rmtree(work_dir, ignore_errors=True)
                 if cleanup_temp:
                     try:
