@@ -832,7 +832,7 @@ def translate_detected_signs(
     return signs
 
 
-def _enforce_celestial_punctuation(text: str, style_name: str) -> str:
+def _enforce_celestial_punctuation(text: str, style_name: str, source_text: str = "") -> str:
     """Deterministic post-processor enforcing Celestial-Dragons non-RLE libass punctuation & grammar."""
     prof = ensure_style_profile()
     t = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", (text or "")).strip()
@@ -860,6 +860,39 @@ def _enforce_celestial_punctuation(text: str, style_name: str) -> str:
     elif t.endswith("،") and not t.startswith("،"):
         core = t.rstrip("، ").strip()
         t = f"،{core}"
+
+    # ضبط النقاط (...) عند طرفي السطر: libass يعامل السطر كأن اتجاهه الأساسي LTR،
+    # فيضع النقاط الطرفية في الجهة المعاكسة منطقياً. التحقق التجريبي:
+    #   "...نص" (بدون علامات)  ← تظهر النقاط يساراً (نهاية السطر)
+    #   "نص..." (بدون علامات)  ← تظهر النقاط يميناً (بداية السطر)
+    #   RLM + "...نص"          ← يميناً | "نص..." + RLM ← يساراً
+    # القاعدة: نقاط البداية (تكملة من سطر سابق) تُثبَّت يميناً بـ RLM + "..." في البداية المنطقية،
+    # ونقاط النهاية (كلام مبتور) تُكتب "..." في البداية المنطقية بدون علامات (أسلوب Celestial) فتظهر يساراً.
+    # موضع النقاط في سطر المصدر الإنجليزي هو الفيصل؛ بدونه نثبّت موضعها في الترجمة نفسها.
+    RLM = "\u200f"
+    t = re.sub(r"^\s*\.{2,}\s*", "...", t)
+    t = re.sub(r"\s*\.{2,}\s*$", "...", t)
+    src = (source_text or "").replace("…", "...")
+    src_lead = bool(re.match(r"^\s*(?:\.\s*){2,}", src))
+    src_trail = bool(re.search(r"(?:\.\s*){2,}\s*[\"'»)\]]*$", src))
+    has_lead = t.startswith("...")
+    has_trail = t.endswith("...")
+    if has_lead or has_trail:
+        core = t[3:] if has_lead else t
+        if has_trail and core.endswith("..."):
+            core = core[:-3]
+        core = core.strip()
+        if core:
+            if src_lead or src_trail:
+                lead_sem, trail_sem = src_lead, src_trail
+            else:
+                lead_sem, trail_sem = has_lead, has_trail
+            if lead_sem and trail_sem:
+                t = f"{RLM}...{core}...{RLM}"
+            elif lead_sem:
+                t = f"{RLM}...{core}"
+            elif trail_sem:
+                t = f"...{core}"
 
     return t
 
@@ -1103,7 +1136,7 @@ def write_responsive_ass(
                 continue
 
         raw_final = entry.plain_text if entry.keep_untranslated else translations.get(entry.index, entry.plain_text)
-        final_text = _enforce_celestial_punctuation(raw_final, entry.target_style)
+        final_text = _enforce_celestial_punctuation(raw_final, entry.target_style, source_text=entry.plain_text)
 
         eff_style = entry.target_style
         inline_an8 = ""
