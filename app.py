@@ -731,6 +731,7 @@ def load_settings() -> Dict:
         "gdrive_folder": "Runpod_Anime",
         "codec": "hevc_nvenc",
         "preset": "p7",
+        "x265_preset": "slow",
         "cq": 26,
         "audio_bitrate": "160k",
         "credit_translator": "",
@@ -755,7 +756,7 @@ _drive_restore_glossaries()
 def save_settings(
     provider, llm_model, api_key, base_url, style_preset, wrap_mode, soften_exclaim, dood_api_key,
     gdrive_remote, gdrive_folder,
-    codec, preset, cq, audio_bitrate,
+    codec, preset, x265_preset, cq, audio_bitrate,
     credit_translator, credit_typesetter, credit_encoder,
     logo_position, logo_opacity, logo_scale,
 ) -> str:
@@ -772,6 +773,7 @@ def save_settings(
         "gdrive_folder": gdrive_folder,
         "codec": codec,
         "preset": preset,
+        "x265_preset": x265_preset,
         "cq": int(cq),
         "audio_bitrate": audio_bitrate,
         "credit_translator": credit_translator,
@@ -902,6 +904,7 @@ def step1_process_for_preview(
     codec: str,
     cq: int,
     preset: str,
+    x265_preset: str,
     audio_bitrate: str,
     credit_translator: str,
     credit_typesetter: str,
@@ -1170,6 +1173,7 @@ def step1_process_for_preview(
                 codec=codec,
                 cq=int(cq),
                 preset=preset,
+                x265_preset=x265_preset,
                 audio_bitrate=audio_bitrate,
                 logo_path=str(LOGO_FILE) if LOGO_FILE.is_file() else "",
                 logo_position=logo_position,
@@ -1295,6 +1299,7 @@ def step_batch_process(
     codec: str,
     cq: int,
     preset: str,
+    x265_preset: str,
     audio_bitrate: str,
     credit_translator: str,
     credit_typesetter: str,
@@ -1637,6 +1642,7 @@ def step_batch_process(
                     codec=codec,
                     cq=int(cq),
                     preset=preset,
+                    x265_preset=x265_preset,
                     audio_bitrate=audio_bitrate,
                     logo_path=str(LOGO_FILE) if LOGO_FILE.is_file() else "",
                     logo_position=logo_position,
@@ -2014,7 +2020,16 @@ def build_ui() -> gr.Blocks:
                                 value=cfg["codec"],
                                 label="الكوديك",
                             )
-                            preset = gr.Dropdown(choices=["p7", "p6", "p5", "p4"], value=cfg["preset"], label="دقة الضغط")
+                            preset = gr.Dropdown(choices=["p7", "p6", "p5", "p4"], value=cfg["preset"], label="دقة الضغط (كرت الشاشة)")
+                            x265_preset = gr.Dropdown(
+                                choices=[
+                                    ("slow · أصغر حجم (الافتراضي)", "slow"),
+                                    ("medium · أسرع ~2.5x وحجم شبه مماثل", "medium"),
+                                    ("fast · أقصى سرعة", "fast"),
+                                ],
+                                value=cfg.get("x265_preset", "slow"),
+                                label="سرعة x265 (المعالج)",
+                            )
                             cq = gr.Slider(minimum=18, maximum=30, step=1, value=cfg["cq"], label="الجودة CQ")
                             audio_bitrate = gr.Dropdown(choices=["128k", "160k", "192k"], value=cfg["audio_bitrate"], label="صوت AAC")
                         with gr.Row():
@@ -2083,7 +2098,7 @@ def build_ui() -> gr.Blocks:
             inputs=[
                 provider, llm_model, api_key, base_url, style_preset, wrap_mode, soften_exclaim, dood_api_key,
                 gdrive_remote, gdrive_folder,
-                codec, preset, cq, audio_bitrate,
+                codec, preset, x265_preset, cq, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
                 logo_position, logo_opacity, logo_scale,
             ],
@@ -2104,7 +2119,7 @@ def build_ui() -> gr.Blocks:
                 link_480, file_480,
                 sub_mode, whisper_model,
                 provider, api_key, llm_model, base_url,
-                codec, cq, preset, audio_bitrate,
+                codec, cq, preset, x265_preset, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
                 logo_position, logo_opacity, logo_scale,
@@ -2122,7 +2137,7 @@ def build_ui() -> gr.Blocks:
                 batch_links, series_name, series_picker, style_preset, wrap_mode, soften_exclaim,
                 sub_mode, whisper_model,
                 provider, api_key, llm_model, base_url,
-                codec, cq, preset, audio_bitrate,
+                codec, cq, preset, x265_preset, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
                 logo_position, logo_opacity, logo_scale,
