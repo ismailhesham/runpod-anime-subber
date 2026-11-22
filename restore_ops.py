@@ -16,6 +16,8 @@ import zipfile
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+import re
+
 import numpy as np
 
 from media_ops import probe_video_info, _has_nvenc
@@ -26,8 +28,10 @@ _V3_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/rea
 _V3_FILE = "realesr-animevideov3.pth"
 _CUGAN_ZIP_URL = "https://github.com/bilibili/ailab/releases/download/Real-CUGAN/updated_weights.zip"
 _CUGAN_ZIP = "cugan_updated_weights.zip"
-_CUGAN_MEMBER = "updated_weights/up4x-latest-denoise3x.pth"
-_CUGAN_FILE = "up4x-latest-denoise3x.pth"
+
+
+def _cugan_weight_name(scale: int) -> str:
+    return f"up{scale}x-latest-denoise3x.pth"
 
 MODEL_LABELS = {
     "cugan": "Real-CUGAN denoise3x ×4",
@@ -59,7 +63,7 @@ def _download_with_progress(url: str, dest: Path, log_cb: Callable[[str], None])
     log_cb(f"✓ اكتمل تحميل الموديل ({dest.stat().st_size / 1e6:.1f}MB) في {time.time() - t0:.0f} ثانية → {dest}")
 
 
-def ensure_restore_model(model_key: str, log_cb: Callable[[str], None]) -> Path:
+def ensure_restore_model(model_key: str, log_cb: Callable[[str], None], scale: int = 4) -> Path:
     """Download (once) and return the weights path for the chosen model."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     if model_key == "v3":
@@ -70,23 +74,25 @@ def ensure_restore_model(model_key: str, log_cb: Callable[[str], None]) -> Path:
             log_cb(f"✓ موديل {MODEL_LABELS['v3']} موجود مسبقاً: {pth}")
         return pth
     if model_key == "cugan":
-        pth = MODELS_DIR / _CUGAN_FILE
+        scale = scale if scale in (2, 3, 4) else 4
+        fname = _cugan_weight_name(scale)
+        pth = MODELS_DIR / fname
         if pth.is_file():
-            log_cb(f"✓ موديل {MODEL_LABELS['cugan']} موجود مسبقاً: {pth}")
+            log_cb(f"✓ موديل Real-CUGAN denoise3x ×{scale} موجود مسبقاً: {pth}")
             return pth
         zpath = MODELS_DIR / _CUGAN_ZIP
         if not zpath.is_file():
             _download_with_progress(_CUGAN_ZIP_URL, zpath, log_cb)
-        log_cb("📦 فك ضغط حزمة موديلات Real-CUGAN...")
+        log_cb(f"📦 فك ضغط موديل ×{scale} من حزمة Real-CUGAN...")
         with zipfile.ZipFile(str(zpath)) as zf:
-            with zf.open(_CUGAN_MEMBER) as src, open(str(pth), "wb") as dst:
+            with zf.open(f"updated_weights/{fname}") as src, open(str(pth), "wb") as dst:
                 dst.write(src.read())
-        log_cb(f"✓ موديل {MODEL_LABELS['cugan']} جاهز: {pth}")
+        log_cb(f"✓ موديل Real-CUGAN denoise3x ×{scale} جاهز: {pth}")
         return pth
     raise RuntimeError(f"❌ موديل ترميم غير معروف: {model_key}")
 
 
-def _load_model(model_key: str, weights: Path, device, dtype, log_cb):
+def _load_model(model_key: str, weights: Path, device, dtype, log_cb, scale: int = 4):
     import torch
     import restore_nets
 
@@ -98,10 +104,12 @@ def _load_model(model_key: str, weights: Path, device, dtype, log_cb):
         )
         model.load_state_dict(params, strict=True)
     else:
-        model = restore_nets.UpCunet4x(in_channels=3, out_channels=3)
+        cls = {2: restore_nets.UpCunet2x, 3: restore_nets.UpCunet3x, 4: restore_nets.UpCunet4x}.get(scale, restore_nets.UpCunet4x)
+        model = cls(in_channels=3, out_channels=3)
         model.load_state_dict(torch.load(str(weights), map_location="cpu"), strict=True)
     model = model.to(device).to(dtype).eval()
-    log_cb(f"✓ موديل {MODEL_LABELS[model_key]} اتحمل على الجهاز ({device.type}, {str(dtype).split('.')[-1]}).")
+    name = MODEL_LABELS[model_key] if model_key == "v3" else f"Real-CUGAN denoise3x ×{scale}"
+    log_cb(f"✓ موديل {name} اتحمل على الجهاز ({device.type}, {str(dtype).split('.')[-1]}).")
     return model
 
 
@@ -149,6 +157,36 @@ def _sr_batch(model, model_key: str, frames: np.ndarray, device, dtype, tile_mod
     return out.permute(0, 2, 3, 1).contiguous().cpu().numpy()
 
 
+def _detect_telecine(video_path: str, sample_ss: float, log: Callable[[str], None]) -> Optional[int]:
+    """يكتشف مصادر DVD المسحوقة تليسين (interlaced 29.97) عبر idet على عينة قصيرة.
+    يعيد ترتيب الحقول (1=TFF أو 0=BFF) لو المصدر متشابك، و None لو progressive."""
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-ss", f"{max(0.0, sample_ss):.3f}", "-t", "8",
+            "-i", video_path, "-vf", "idet", "-an", "-f", "null", "-",
+        ]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        out = (p.stderr or "") + (p.stdout or "")
+        multi = None
+        for line in out.splitlines():
+            if "Multi frame detection:" in line:
+                multi = line
+        if not multi:
+            log("🔎 فحص idet: لا توجد قراءة — اعتبار المصدر progressive.")
+            return None
+        nums = dict(re.findall(r"(TFF|BFF|Progressive|Undetermined):\s*(\d+)", multi))
+        tff = int(nums.get("TFF", "0"))
+        bff = int(nums.get("BFF", "0"))
+        prog_n = int(nums.get("Progressive", "0"))
+        log(f"🔎 فحص نوع الإطارات (idet): TFF={tff} · BFF={bff} · Progressive={prog_n}")
+        if (tff + bff) > prog_n:
+            return 1 if tff >= bff else 0
+        return None
+    except Exception as exc:
+        log(f"⚠️ تعذر فحص التليسين ({exc}) — اعتبار المصدر progressive.")
+        return None
+
+
 def restore_video(
     video_path: str,
     out_path: str,
@@ -158,6 +196,7 @@ def restore_video(
     max_seconds: Optional[float] = None,
     start_seconds: Optional[float] = None,
     crf: int = 14,
+    scale: int = 4,
 ) -> str:
     """Restore a video x4 with the chosen model. Fails loudly without a CUDA GPU."""
     t_start = time.time()
@@ -193,7 +232,12 @@ def restore_video(
         dtype = torch.float16
         log(f"🎮 كرت الشاشة: {torch.cuda.get_device_name(0)}")
 
-    label = MODEL_LABELS.get(model_key, model_key)
+    if scale not in (2, 3, 4):
+        scale = 4
+    if model_key == "v3" and scale != 4:
+        log("ℹ️ موديل v3 ثابت على ×4 — المقياس المختار يُتجاهل معه.")
+        scale = 4
+    label = f"Real-CUGAN denoise3x ×{scale}" if model_key == "cugan" else MODEL_LABELS.get(model_key, model_key)
     w, h, fps, dur = probe_video_info(video_path)
     if dur <= 0:
         dur = 0.0
@@ -201,14 +245,24 @@ def restore_video(
     start_at = 0.0
     if start_seconds and dur > 0:
         start_at = max(0.0, min(float(start_seconds), max(0.0, dur - (eff_seconds or 0.0))))
-    est_frames = int((eff_seconds or dur or 0) * fps)
+
+    out_fps = fps
+    dec_vf: Optional[str] = None
+    ivtc_env = os.environ.get("RUNPOD_RESTORE_IVTC", "auto").strip().lower()
+    if ivtc_env != "off" and 25.0 < fps <= 31.0 and (dur or 0) > 20:
+        order = 1 if ivtc_env == "force" else _detect_telecine(video_path, start_at, log)
+        if order is not None:
+            dec_vf = f"fieldmatch=order={order}:combmatch=full,yadif=deint=interlaced,decimate"
+            out_fps = fps * 4.0 / 5.0
+            log(f"🎞️ المصدر متشابك/مسحوق تليسين (DVD قديم) — IVTC تلقائي: إزالة التشابك واسترجاع {out_fps:.3f}fps قبل الترميم (ده كان سبب الحركة المهزوزة).")
+    est_frames = int((eff_seconds or dur or 0) * out_fps)
     log(
-        f"🧪 بدء الترميم بـ {label}: {w}x{h} → {w * 4}x{h * 4} · {fps:.3f}fps"
+        f"🧪 بدء الترميم بـ {label}: {w}x{h} → {w * scale}x{h * scale} · {out_fps:.3f}fps"
         + ((f" · معاينة {eff_seconds:g} ثانية" + (f" من منتصف الحلقة (تبدأ ~{int(start_at // 60)}:{int(start_at % 60):02d})" if start_at > 0 else " من البداية")) if eff_seconds else f" · {est_frames} فريم تقريباً")
     )
 
-    weights = ensure_restore_model(model_key, log)
-    model = _load_model(model_key, weights, device, dtype, log)
+    weights = ensure_restore_model(model_key, log, scale)
+    model = _load_model(model_key, weights, device, dtype, log, scale)
 
     px = w * h
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if device.type == "cuda" else 0.0
@@ -223,13 +277,16 @@ def restore_video(
         + (f" · VRAM={vram_gb:.0f}GB" if vram_gb else "")
     )
 
-    ow, oh = w * 4, h * 4
+    ow, oh = w * scale, h * scale
     dec_cmd = ["ffmpeg", "-v", "error"]
     if start_at > 0:
         dec_cmd += ["-ss", f"{start_at:.3f}"]
     if eff_seconds:
         dec_cmd += ["-t", f"{eff_seconds:.3f}"]
-    dec_cmd += ["-i", video_path, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    dec_cmd += ["-i", video_path]
+    if dec_vf:
+        dec_cmd += ["-vf", dec_vf]
+    dec_cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
 
     use_nv = _has_nvenc("hevc_nvenc") and device.type == "cuda"
     if use_nv:
@@ -240,7 +297,7 @@ def restore_video(
     def _build_enc_cmd(nv: bool) -> List[str]:
         cmd = [
             "ffmpeg", "-y", "-v", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", f"{fps:.6f}", "-i", "pipe:0",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", f"{out_fps:.6f}", "-i", "pipe:0",
         ]
         if start_at > 0:
             cmd += ["-ss", f"{start_at:.3f}"]
