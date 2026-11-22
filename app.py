@@ -2293,8 +2293,9 @@ def _live_gen(fn: Callable, push: Callable[[str], None], pack: Callable, *args, 
     return res_box.get("val")
 
 
-def rtab_load(links_txt: str):
-    """تبويب الترميم: تحميل/فحص المصادر (تورنت أو ملفات/مجلدات محلية) وسرد الحلقات."""
+def rtab_load(links_txt: str, rtab_picks_sel: Optional[List[str]] = None, rtab_map_val: Optional[Dict[str, Any]] = None):
+    """تبويب الترميم: تحميل/فحص المصادر (تورنت أو ملفات/مجلدات محلية) وسرد الحلقات.
+    لو في حلقات مختارة من قايمة ملفات التورنت، يُحمَّل المختار فقط (الباقي في التورنت يُترك)."""
     logs: List[str] = []
 
     def push(msg: str) -> None:
@@ -2319,6 +2320,14 @@ def rtab_load(links_txt: str):
                 yield pack(render_progress_hud(0.0, "تنبيه · لا توجد مصادر", "الصق رابطاً أو حمّل من التبويب الرئيسي أولاً", "—", "—", mode="error"))
                 return
             push(f"🗂️ المربع فاضي — عرضت كل الحلقات المحمّلة مسبقاً في الكاش: {len(eps)} حلقة (المحمَّلة من أي تبويب؛ المرمَّمة والمضغوطة مستثناة).")
+        sel_map: Dict[int, List[int]] = {}
+        if rtab_picks_sel and rtab_map_val:
+            for val in rtab_picks_sel:
+                pair = rtab_map_val.get(val)
+                if pair:
+                    sel_map.setdefault(int(pair[0]), []).append(int(pair[1]))
+        if sel_map:
+            push(f"🎯 وضع الاختيار الانتقائي: {sum(len(v) for v in sel_map.values())} ملفاً مختاراً من {len(sel_map)} رابط.")
         for i, lnk in enumerate(lines, 1):
             if os.path.isdir(lnk):
                 vids = collect_episode_videos(lnk)
@@ -2327,10 +2336,15 @@ def rtab_load(links_txt: str):
                 vids = [Path(lnk)]
                 push(f"📄 ملف محلي [{i}]: {Path(lnk).name}")
             else:
+                sel = sel_map.get(i - 1) if sel_map else None
+                if sel_map and not sel:
+                    push(f"⏭️ الرابط {i}: لا توجد حلقات مختارة منه — تم تخطيه.")
+                    continue
                 cdir = _raw_cache_dir_for_source("season", lnk, None, f"restore_tab_{i}")
                 vids = yield from _live_gen(
                     download_season_batch, push, pack,
                     lnk, None, str(cdir),
+                    select_files=sel,
                     badge=f"DOWNLOAD [{i}/{len(lines)}]",
                     title=f"تحميل / فحص الدفعة {i} من {len(lines)}",
                 )
@@ -2983,6 +2997,18 @@ def build_ui() -> gr.Blocks:
                     placeholder="اتركه فاضياً لعرض كل الحلقات المحمّلة مسبقاً — أو الصق: magnet:?xt=urn:btih:... / مسار مجلد محلي",
                     lines=3,
                 )
+                rtab_list_btn = gr.Button(
+                    "📋 اعرض ملفات التورنت واختر حلقات بعينها (بدون تحميل)",
+                    size="sm",
+                    elem_id="rtab-list-btn",
+                )
+                rtab_picks = gr.CheckboxGroup(
+                    label="اختيار حلقات معينة من التورنت — سيبها فاضية لو عايز الكل",
+                    choices=[],
+                    value=[],
+                    elem_classes=["sb-batch-picker"],
+                )
+                rtab_pick_map = gr.State({})
                 with gr.Row():
                     rtab_model = gr.Dropdown(
                         choices=[
@@ -3025,9 +3051,14 @@ def build_ui() -> gr.Blocks:
                 rtab_log = gr.Textbox(label="📋 سجل الترميم [RESTORE LOG]", lines=12, max_lines=18, interactive=False)
                 rtab_state = gr.State([])
 
+        rtab_list_btn.click(
+            fn=step_list_batch_files,
+            inputs=[rtab_links],
+            outputs=[rtab_picks, rtab_pick_map, rtab_log],
+        )
         rtab_load_btn.click(
             fn=rtab_load,
-            inputs=[rtab_links],
+            inputs=[rtab_links, rtab_picks, rtab_pick_map],
             outputs=[rtab_hud, rtab_log, rtab_eps, rtab_state],
         )
         rtab_preview_btn.click(
