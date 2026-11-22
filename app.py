@@ -25,6 +25,7 @@ from media_ops import (
     download_season_batch,
     download_torrent_or_url,
     episode_sort_key,
+    list_torrent_files,
     extract_episode_number,
     make_browser_preview,
     probe_video_info,
@@ -1310,6 +1311,47 @@ def step1_process_for_preview(
         raise
 
 
+def step_list_batch_files(batch_links: str):
+    """Peek inside the pasted torrent/magnet links and list their video files with sizes,
+    so he can tick only the episodes he wants instead of downloading the whole batch.
+    Nothing is downloaded here: magnets are resolved with --bt-metadata-only."""
+    links = [ln.strip() for ln in (batch_links or "").splitlines() if ln.strip()]
+    if not links:
+        return (
+            gr.update(choices=[], value=[]),
+            {},
+            "⚠️ الصق رابط تورنت/ماجنت الأول في خانة الروابط، بعدين دوس الزر ده.",
+        )
+    choices: List[Tuple[str, str]] = []
+    mapping: Dict[str, Tuple[int, int]] = {}
+    notes: List[str] = []
+    multi = len(links) > 1
+    for li, lnk in enumerate(links):
+        if os.path.isdir(lnk) or (os.path.isfile(lnk) and Path(lnk).suffix.lower() in VIDEO_EXTENSIONS):
+            notes.append(f"ℹ️ رابط {li+1}: ملف/مجلد محلي — الاختيار الانتقائي متاح للتورنت فقط.")
+            continue
+        try:
+            files = list_torrent_files(lnk, None)
+        except Exception as exc:
+            notes.append(f"❌ رابط {li+1}: تعذرت قراءة التورنت ({str(exc)[:140]})")
+            continue
+        vids = [f for f in files if Path(f[1]).suffix.lower() in VIDEO_EXTENSIONS]
+        if not vids:
+            notes.append(f"⚠️ رابط {li+1}: لا توجد ملفات فيديو داخله.")
+            continue
+        for fidx, rel, size_b in vids:
+            label = f"{Path(rel).name} ({size_b/1048576:.0f} MB)"
+            if multi:
+                label += f" — رابط {li+1}"
+            val = f"{li}:{fidx}"
+            choices.append((label, val))
+            mapping[val] = (li, fidx)
+        notes.append(f"✅ رابط {li+1}: {len(vids)} ملف فيديو — اختر من القايمة تحت، أو سيبها فاضية لتحميل الموسم كله.")
+    if not choices and not notes:
+        notes.append("⚠️ لم يتم العثور على ملفات فيديو في الروابط.")
+    return gr.update(choices=choices, value=[]), mapping, "\n".join(notes)
+
+
 def step_batch_process(
     batch_links: str,
     series_name: str,
@@ -1337,6 +1379,8 @@ def step_batch_process(
     logo_scale: float,
     restore_model: str = "off",
     restore_scale: str = "2",
+    batch_file_picks_sel: Optional[List[str]] = None,
+    batch_file_map_val: Optional[Dict[str, Any]] = None,
 ):
     """Season batch mode: one or more torrent links (each may hold a whole season or more),
     download all episodes, translate + burn + compress each, and collect them into one
@@ -1461,6 +1505,15 @@ def step_batch_process(
 
     try:
         # ═══ المرحلة 1: تحميل كل الروابط وجمع كل الحلقات ═══
+        sel_map: Dict[int, List[int]] = {}
+        if batch_file_picks_sel and batch_file_map_val:
+            for val in batch_file_picks_sel:
+                pair = batch_file_map_val.get(val)
+                if pair:
+                    sel_map.setdefault(int(pair[0]), []).append(int(pair[1]))
+        if sel_map:
+            push(f"🎯 وضع الاختيار الانتقائي: {sum(len(v) for v in sel_map.values())} ملفاً مختاراً من {len(sel_map)} رابط.")
+
         all_eps: List[Path] = []
         for idx, lnk in enumerate(links, 1):
             if os.path.isdir(lnk):
@@ -1470,10 +1523,15 @@ def step_batch_process(
                 vids = [Path(lnk)]
                 push(f"📄 ملف محلي [{idx}]: {Path(lnk).name}")
             else:
+                sel = sel_map.get(idx - 1) if sel_map else None
+                if sel_map and not sel:
+                    push(f"⏭️ الرابط {idx}: لا توجد حلقات مختارة منه — تم تخطيه.")
+                    continue
                 cdir = _raw_cache_dir_for_source("season", lnk, None, f"{series_safe}_{idx}")
                 vids = yield from run_live(
                     download_season_batch,
                     lnk, None, str(cdir),
+                    select_files=sel,
                     badge=f"SEASON DOWNLOAD [{idx}/{len(links)}]",
                     title=f"تحميل / فحص الدفعة رقم {idx} من {len(links)} (ممكن تحتوي موسماً كاملاً)",
                     accepts_progress_cb=True,
@@ -2780,6 +2838,18 @@ def build_ui() -> gr.Blocks:
                                     placeholder="magnet:?xt=urn:btih:...\nhttps://example.com/Season2.torrent",
                                     lines=4,
                                 )
+                                batch_list_btn = gr.Button(
+                                    "📋 اعرض ملفات التورنت واختر حلقات بعينها (بدون تحميل)",
+                                    size="sm",
+                                    elem_id="sb-batch-list-btn",
+                                )
+                                batch_file_picks = gr.CheckboxGroup(
+                                    label="اختيار حلقات معينة من التورنت — سيبها فاضية لو عايز الموسم كله",
+                                    choices=[],
+                                    value=[],
+                                    elem_classes=["sb-batch-picker"],
+                                )
+                                batch_file_map = gr.State({})
                                 batch_btn = gr.Button(
                                     "🚀 شغّل الموسم كاملاً: تحميل كل الحلقات ← ترجمة بأسلوب المترجم ← حرق ← ضغط ← فولدرات 35 حلقة [SEASON STRIKE]",
                                     variant="primary",
@@ -3045,6 +3115,12 @@ def build_ui() -> gr.Blocks:
             outputs=[progress_hud, log_box, restore_preview_video],
         )
 
+        batch_list_btn.click(
+            fn=step_list_batch_files,
+            inputs=[batch_links],
+            outputs=[batch_file_picks, batch_file_map, log_box],
+        )
+
         batch_btn.click(
             fn=step_batch_process,
             inputs=[
@@ -3056,6 +3132,7 @@ def build_ui() -> gr.Blocks:
                 cleanup_temp,
                 logo_position, logo_opacity, logo_scale,
                 restore_model, restore_scale,
+                batch_file_picks, batch_file_map,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
