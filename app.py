@@ -918,6 +918,7 @@ def step1_process_for_preview(
     logo_opacity: float,
     logo_scale: float,
     restore_model: str = "off",
+    restore_scale: str = "2",
 ):
     logs: List[str] = []
     rendered_map: Dict[str, str] = {}
@@ -1085,8 +1086,9 @@ def step1_process_for_preview(
                     restore_video,
                     str(vid_path), str(r_out),
                     model_key=restore_model,
-                    badge=f"STAGE 2/{stage_total} · AI RESTORE ×4 [{q_label}]",
-                    title=f"ترميم الحلقة {q_label} ×4 بموديل {MODEL_LABELS.get(restore_model, restore_model)}...",
+                    scale=int(restore_scale),
+                    badge=f"STAGE 2/{stage_total} · AI RESTORE ×{int(restore_scale)} [{q_label}]",
+                    title=f"ترميم الحلقة {q_label} ×{int(restore_scale)} بموديل {MODEL_LABELS.get(restore_model, restore_model)}...",
                     accepts_progress_cb=True,
                 )
                 restored_videos[q_label] = Path(r_out)
@@ -1334,6 +1336,7 @@ def step_batch_process(
     logo_opacity: float,
     logo_scale: float,
     restore_model: str = "off",
+    restore_scale: str = "2",
 ):
     """Season batch mode: one or more torrent links (each may hold a whole season or more),
     download all episodes, translate + burn + compress each, and collect them into one
@@ -1659,7 +1662,7 @@ def step_batch_process(
 
             vw_p, vh_p, _, _ = probe_video_info(str(vid_p))
             if restore_on:
-                vw_p, vh_p = vw_p * 4, vh_p * 4  # ملف الترجمة يُبنى على أبعاد الفيديو المرمَّم ×4
+                vw_p, vh_p = vw_p * int(restore_scale), vh_p * int(restore_scale)  # ملف الترجمة يُبنى على أبعاد الفيديو المرمَّم
             ep_ass_p = ass_root / f"{series_safe}_{ep_label_p}_AR.ass"
             write_responsive_ass(
                 entries=entries_p,
@@ -1774,8 +1777,9 @@ def step_batch_process(
                         restore_video,
                         str(vid), str(Path(prep["work_dir"]) / f"restored_{vid.stem}.mp4"),
                         model_key=restore_model,
-                        badge=f"RESTORE ×4 [{ep_label} {gi}/{total}]",
-                        title=f"ترميم حلقة {gi} من {total} ×4 بموديل {MODEL_LABELS.get(restore_model, restore_model)}...",
+                        scale=int(restore_scale),
+                        badge=f"RESTORE ×{int(restore_scale)} [{ep_label} {gi}/{total}]",
+                        title=f"ترميم حلقة {gi} من {total} ×{int(restore_scale)} بموديل {MODEL_LABELS.get(restore_model, restore_model)}...",
                         accepts_progress_cb=True,
                     )
 
@@ -2035,6 +2039,7 @@ def step2_approve_and_upload(
 
 def step_restore_preview(
     restore_model: str,
+    restore_scale: str,
     episode_name: str,
     saved_raw_1080: str,
     link_1080: str, file_1080: Optional[str],
@@ -2149,6 +2154,7 @@ def step_restore_preview(
             restore_video,
             str(vid_path), out_prev,
             model_key=restore_model,
+            scale=int(restore_scale),
             max_seconds=10.0,
             start_seconds=_mid_preview_start(str(vid_path)),
             crf=18,
@@ -2366,7 +2372,7 @@ def _compress_video_file(src_path: str, dst_path: str, codec: str, cq: int,
     raise RuntimeError(f"فشل ضغط {os.path.basename(src_path)} بعد {' ← '.join(attempts or ['لا محرك'])}: {last_err[-200:]}")
 
 
-def rtab_preview(model: str, ep_names, eps_state: List[str]):
+def rtab_preview(model: str, scale: str, ep_names, eps_state: List[str]):
     """تبويب الترميم: معاينة 10 ثوانٍ لأول حلقة مختارة."""
     logs: List[str] = []
 
@@ -2392,7 +2398,7 @@ def rtab_preview(model: str, ep_names, eps_state: List[str]):
         yield from _live_gen(
             restore_video, push, pack,
             str(ep), out_prev,
-            model_key=model, max_seconds=10.0, start_seconds=_mid_preview_start(str(ep)), crf=18,
+            model_key=model, scale=int(scale), max_seconds=10.0, start_seconds=_mid_preview_start(str(ep)), crf=18,
             badge="PREVIEW · AI RESTORE ×4",
             title=f"معاينة الترميم: 10 ثوانٍ من منتصف {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)}",
         )
@@ -2406,7 +2412,7 @@ def rtab_preview(model: str, ep_names, eps_state: List[str]):
         yield pack(render_progress_hud(0.0, "ERROR · PREVIEW", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
 
 
-def rtab_run(model: str, sel_names, eps_state: List[str]):
+def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
     """تبويب الترميم: ترميم الحلقات المختارة فقط؛ الأصلية تُمسح بعد نجاح كل حلقة (كاش الأداة فقط)."""
     logs: List[str] = []
 
@@ -2430,9 +2436,9 @@ def rtab_run(model: str, sel_names, eps_state: List[str]):
         total = len(picked)
         done_n = 0
         failed: List[str] = []
-        push(f"🚀 بدء ترميم {total} حلقة مختارة بموديل {MODEL_LABELS.get(model, model)}.")
+        push(f"🚀 بدء ترميم {total} حلقة مختارة بموديل {MODEL_LABELS.get(model, model)} ×{int(scale)}.")
         for i, ep in enumerate(picked, 1):
-            out = restored_dir / f"{ep.stem}_x4.mp4"
+            out = restored_dir / f"{ep.stem}_x{int(scale)}.mp4"
             if out.exists() and out.stat().st_size > 1024 * 1024:
                 push(f"⏭️ [{i}/{total}] {ep.name} مترممة مسبقاً — تخطي ({out.name})")
                 done_n += 1
@@ -2443,8 +2449,9 @@ def rtab_run(model: str, sel_names, eps_state: List[str]):
                     restore_video, push, pack,
                     str(ep), str(out),
                     model_key=model,
-                    badge=f"RESTORE ×4 [{i}/{total}]",
-                    title=f"ترميم حلقة {i} من {total} بموديل {MODEL_LABELS.get(model, model)}...",
+                    scale=int(scale),
+                    badge=f"RESTORE ×{int(scale)} [{i}/{total}]",
+                    title=f"ترميم حلقة {i} من {total} ×{int(scale)} بموديل {MODEL_LABELS.get(model, model)}...",
                 )
                 done_n += 1
                 try:
@@ -2477,6 +2484,16 @@ def rtab_run(model: str, sel_names, eps_state: List[str]):
         yield pack(render_progress_hud(0.0, "ERROR · RESTORE", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
 
 
+def _rtab_master_for(restored_dir: Path, stem: str) -> Optional[Path]:
+    """يجد الملف المرمَّم لحلقة بأي مقياس (x2/x3/x4) مع تجاهل النسخ المضغوطة."""
+    import glob as _glob
+    pat = str(restored_dir / _glob.escape(f"{stem}_x")) + "*.mp4"
+    for p in sorted(_glob.glob(pat)):
+        if not p.endswith("_comp.mp4"):
+            return Path(p)
+    return None
+
+
 def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
     """تبويب الترميم: ضغط مرمَّمات الحلقات المختارة إلى ملفات نهائية صغيرة في كاش compressed."""
     logs: List[str] = []
@@ -2504,9 +2521,9 @@ def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
         skipped: List[str] = []
         failed: List[str] = []
         for i, ep in enumerate(picked, 1):
-            master = restored_dir / f"{ep.stem}_x4.mp4"
-            out = comp_dir / f"{ep.stem}_x4_comp.mp4"
-            if not master.exists() or master.stat().st_size < 1024 * 1024:
+            master = _rtab_master_for(restored_dir, ep.stem)
+            out = comp_dir / f"{master.stem}_comp.mp4" if master else None
+            if master is None or not master.exists() or master.stat().st_size < 1024 * 1024:
                 skipped.append(ep.name)
                 push(f"⏭️ [{i}/{total}] {ep.name} لا توجد لها نسخة مرمَّمة بعد — رمّمها أولاً.")
                 continue
@@ -2569,9 +2586,9 @@ def rtab_accept(sel_names, eps_state: List[str]):
     freed = 0.0
     kept = 0
     for ep in picked:
-        master = restored_dir / f"{ep.stem}_x4.mp4"
-        comp = comp_dir / f"{ep.stem}_x4_comp.mp4"
-        if not master.exists():
+        master = _rtab_master_for(restored_dir, ep.stem)
+        comp = (comp_dir / f"{master.stem}_comp.mp4") if master else None
+        if master is None or not master.exists():
             push(f"⏭️ {ep.name}: لا توجد نسخة مرمَّمة أصلاً — لا شيء للمسح.")
             continue
         if not comp.exists() or comp.stat().st_size < 100 * 1024:
@@ -2607,18 +2624,21 @@ def rtab_reject(sel_names, eps_state: List[str]):
         push("⚠️ اختر الحلقات المرفوضة أولاً.")
         return (render_progress_hud(0.0, "تنبيه", "اختر الحلقات أولاً", "—", "—", mode="error"), "\n".join(logs[-150:]), gr.update())
     comp_dir = RAW_CACHE_ROOT / "compressed"
+    import glob as _glob
     removed = 0
     for ep in picked:
-        comp = comp_dir / f"{ep.stem}_x4_comp.mp4"
-        if not comp.exists():
+        pat = str(comp_dir / _glob.escape(f"{ep.stem}_x")) + "*_comp.mp4"
+        comps = [Path(p) for p in sorted(_glob.glob(pat))]
+        if not comps:
             push(f"⏭️ {ep.name}: لا توجد نسخة مضغوطة — المرمَّم محفوظ كما هو.")
             continue
-        try:
-            comp.unlink()
-            removed += 1
-            push(f"🗑️ {ep.name}: مسحنا المضغوطة، والمرمَّم ×4 محفوظ — غيّر الكوديك أو CQ واضغط تاني.")
-        except Exception as de:
-            push(f"⚠️ تعذر مسح {comp.name}: {de}")
+        for comp in comps:
+            try:
+                comp.unlink()
+                removed += 1
+                push(f"🗑️ {ep.name}: مسحنا المضغوطة ({comp.name})، والمرمَّم محفوظ — غيّر الكوديك أو CQ واضغط تاني.")
+            except Exception as de:
+                push(f"⚠️ تعذر مسح {comp.name}: {de}")
     push(f"🏁 الرفض اكتمل: {removed} ملف مضغوط ممسوح. المرمَّمة كلها محفوظة وجاهزة لضغط جديد.")
     return (
         render_progress_hud(100.0, "REJECTED", f"{removed} ملف مضغوط ممسوح — المرمَّمة محفوظة", "غيّر الإعدادات واضغط تاني", "", mode="done"),
@@ -2704,6 +2724,15 @@ def build_ui() -> gr.Blocks:
                                     ],
                                     value="off",
                                     label="موديل الترميم — يُحمَّل تلقائياً أول مرة فقط ويُحفظ في /workspace/models",
+                                )
+                                restore_scale = gr.Dropdown(
+                                    choices=[
+                                        ("×2 — موصى به لمصادر DVD/480p القديمة (أسرع ~4x وحجم أصغر بكتير)", "2"),
+                                        ("×3 — حل وسط", "3"),
+                                        ("×4 — للمصادر 720p/1080p النظيفة فقط", "4"),
+                                    ],
+                                    value="2",
+                                    label="مقياس الترميم (لـ CUGAN — v3 ثابت ×4)",
                                 )
                                 restore_preview_btn = gr.Button(
                                     "👁️ معاينة الترميم — 10 ثوانٍ من منتصف الحلقة",
@@ -2860,6 +2889,15 @@ def build_ui() -> gr.Blocks:
                         value="cugan",
                         label="موديل الترميم",
                     )
+                    rtab_scale = gr.Dropdown(
+                        choices=[
+                                        ("×2 — موصى به لمصادر DVD/480p القديمة (أسرع ~4x وحجم أصغر بكتير)", "2"),
+                                        ("×3 — حل وسط", "3"),
+                                        ("×4 — للمصادر 720p/1080p النظيفة فقط", "4"),
+                                    ],
+                        value="2",
+                        label="المقياس",
+                    )
                     rtab_load_btn = gr.Button("⬇️ تحميل / فحص الحلقات", variant="primary", scale=1)
                 rtab_eps = gr.Dropdown(choices=[], multiselect=True, label="الحلقات — اختر أي عدد (الكل محدد افتراضياً)", interactive=True)
                 rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ من منتصف أول حلقة مختارة", size="sm")
@@ -2890,12 +2928,12 @@ def build_ui() -> gr.Blocks:
         )
         rtab_preview_btn.click(
             fn=rtab_preview,
-            inputs=[rtab_model, rtab_eps, rtab_state],
+            inputs=[rtab_model, rtab_scale, rtab_eps, rtab_state],
             outputs=[rtab_hud, rtab_log, rtab_preview_video],
         )
         rtab_run_btn.click(
             fn=rtab_run,
-            inputs=[rtab_model, rtab_eps, rtab_state],
+            inputs=[rtab_model, rtab_scale, rtab_eps, rtab_state],
             outputs=[rtab_hud, rtab_log, saved_raw_1080],
         )
         rtab_compress_btn.click(
@@ -2952,7 +2990,7 @@ def build_ui() -> gr.Blocks:
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
                 logo_position, logo_opacity, logo_scale,
-                restore_model,
+                restore_model, restore_scale,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
@@ -2964,7 +3002,7 @@ def build_ui() -> gr.Blocks:
         restore_preview_btn.click(
             fn=step_restore_preview,
             inputs=[
-                restore_model, episode_name, saved_raw_1080,
+                restore_model, restore_scale, episode_name, saved_raw_1080,
                 link_1080, file_1080,
                 link_720, file_720,
                 link_480, file_480,
@@ -2983,7 +3021,7 @@ def build_ui() -> gr.Blocks:
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
                 logo_position, logo_opacity, logo_scale,
-                restore_model,
+                restore_model, restore_scale,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
