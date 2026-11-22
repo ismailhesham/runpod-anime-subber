@@ -2,7 +2,9 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -233,11 +235,95 @@ def _load_bt_trackers(log_cb: Optional[Callable[[str], None]] = None) -> str:
     return ""
 
 
+def list_torrent_files(
+    source_link: Optional[str],
+    torrent_file: Optional[str] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+    timeout: int = 180,
+) -> List[Tuple[int, str, int]]:
+    """List files inside a magnet / .torrent (path or URL) WITHOUT downloading content.
+
+    Returns [(1-based index, relative path, size bytes)] in the torrent's own order.
+    For magnets, aria2c first fetches metadata only (--bt-metadata-only) into a temp dir.
+    """
+    tmpdir: Optional[str] = None
+    try:
+        target_path: Optional[str] = None
+        if torrent_file and os.path.isfile(torrent_file) and Path(torrent_file).suffix.lower() == ".torrent":
+            target_path = torrent_file
+        else:
+            link = (source_link or "").strip()
+            if not link:
+                raise ValueError("لم يتم إدخال رابط تورنت.")
+            if os.path.isfile(link) and Path(link).suffix.lower() == ".torrent":
+                target_path = link
+            elif link.lower().startswith("magnet:"):
+                tmpdir = tempfile.mkdtemp(prefix="torr_meta_")
+                cmd = [
+                    "aria2c", "--dir", tmpdir,
+                    "--bt-metadata-only=true", "--bt-save-metadata=true",
+                    "--seed-time=0", "--bt-stop-timeout=90",
+                    "--max-connection-per-server=8", "--summary-interval=0",
+                    "--console-log-level=warn",
+                    link,
+                ]
+                bt_trackers = _load_bt_trackers()
+                if bt_trackers:
+                    cmd[2:2] = [
+                        f"--bt-tracker={bt_trackers}",
+                        "--bt-tracker-connect-timeout=10",
+                        "--bt-tracker-timeout=10",
+                    ]
+                if log_cb:
+                    log_cb("🧲 جاري سحب بيانات التورنت (metadata) لعرض الملفات بدون تحميل...")
+                subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                torr = sorted(Path(tmpdir).glob("*.torrent"))
+                if not torr:
+                    raise RuntimeError("تعذر سحب بيانات التورنت خلال المهلة — الرابط قد يكون ميتاً أو بدون سيدرز كافيين.")
+                target_path = str(torr[0])
+            elif link.lower().split("?")[0].endswith(".torrent"):
+                tmpdir = tempfile.mkdtemp(prefix="torr_meta_")
+                req = urllib.request.Request(link, headers={"User-Agent": "runpod-anime-subber"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                target_path = str(Path(tmpdir) / "link.torrent")
+                Path(target_path).write_bytes(data)
+            else:
+                raise ValueError("عرض الملفات متاح لروابط التورنت/الماجنت فقط.")
+
+        res = subprocess.run(
+            ["aria2c", "--show-files=true", target_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        files: List[Tuple[int, str, int]] = []
+        cur_idx: Optional[int] = None
+        cur_path = ""
+        for line in (res.stdout or "").splitlines():
+            m = re.match(r"^\s*(\d+)\|(.*)$", line)
+            if m:
+                cur_idx = int(m.group(1))
+                cur_path = m.group(2).strip()
+                if cur_path.startswith("./"):
+                    cur_path = cur_path[2:]
+                continue
+            m2 = re.match(r"^\s+\|[^|]*\(([\d,]+)\)", line)
+            if m2 and cur_idx is not None:
+                files.append((cur_idx, cur_path, int(m2.group(1).replace(",", ""))))
+                cur_idx = None
+        if not files:
+            raise RuntimeError("لم يتم التعرف على ملفات داخل هذا التورنت.")
+        return files
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _run_aria2(
     target: str,
     output_dir: str,
     log_cb: Optional[Callable[[str], None]] = None,
     progress_cb: Optional[ProgressCallback] = None,
+    select_files: Optional[List[int]] = None,
 ) -> None:
     """Run aria2c (torrent/magnet/URL) into output_dir with resume support and live progress."""
     out_path = Path(output_dir)
@@ -259,6 +345,10 @@ def _run_aria2(
         "--summary-interval=1",
         target,
     ]
+    if select_files:
+        cmd[-1:-1] = [
+            f"--select-file={','.join(str(i) for i in select_files)}",
+        ]
     bt_trackers = _load_bt_trackers(log_cb=log_cb)
     if bt_trackers:
         cmd[-1:-1] = [
@@ -268,6 +358,8 @@ def _run_aria2(
         ]
     if log_cb:
         mode_txt = "استكمال التحميل السابق" if has_partial else "بدء التحميل وحفظه دائماً"
+        if select_files:
+            mode_txt += f" — تحميل انتقائي ({len(select_files)} ملفاً فقط من التورنت)"
         log_cb(f"[aria2c] {mode_txt} في: {output_dir}")
     if progress_cb:
         progress_cb(1.0, "جاري الاتصال بالمصدر وجلب البيانات...", output_dir)
@@ -304,21 +396,90 @@ def _run_aria2(
         raise RuntimeError("فشل تحميل aria2c — تأكد من صحة رابط التورنت أو الرابط المباشر.")
 
 
+def _download_selected_files(
+    source_link: Optional[str],
+    torrent_file: Optional[str],
+    out_path: Path,
+    wanted: List[int],
+    log_cb: Optional[Callable[[str], None]],
+    progress_cb: Optional[ProgressCallback],
+) -> List[Path]:
+    """Download only the chosen torrent file indices (1-based, same as --show-files / --select-file).
+
+    Files already fully downloaded are kept and skipped, so he can come back later and
+    pick more episodes from the same torrent without re-downloading anything.
+    """
+    listing = list_torrent_files(source_link, torrent_file, log_cb=log_cb)
+    by_idx = {i: (p, s) for i, p, s in listing}
+    missing_meta = [i for i in wanted if i not in by_idx]
+    if missing_meta:
+        raise ValueError(f"أرقام ملفات غير موجودة داخل التورنت: {missing_meta}")
+
+    present: List[Path] = []
+    to_fetch: List[int] = []
+    for i in wanted:
+        rel, _size = by_idx[i]
+        fp = out_path / rel
+        ctrl = Path(str(fp) + ".aria2")
+        if fp.is_file() and fp.stat().st_size > 1024 * 1024 and not ctrl.exists():
+            present.append(fp)
+        else:
+            to_fetch.append(i)
+
+    if log_cb:
+        log_cb(f"🎯 تحميل انتقائي: اخترت {len(wanted)} ملفاً — {len(present)} محفوظ مسبقاً، {len(to_fetch)} سيُحمَّل الآن.")
+        for i in to_fetch:
+            mb = by_idx[i][1] / (1024 * 1024)
+            log_cb(f"   ⬇ {by_idx[i][0]} ({mb:.0f} MB)")
+
+    if to_fetch:
+        target = None
+        if torrent_file and os.path.isfile(torrent_file):
+            target = torrent_file
+        elif source_link and source_link.strip():
+            target = source_link.strip()
+        if not target:
+            raise ValueError("لم يتم إدخال رابط تورنت للموسم.")
+        _run_aria2(target, str(out_path), log_cb=log_cb, progress_cb=progress_cb, select_files=to_fetch)
+        for i in to_fetch:
+            rel, _size = by_idx[i]
+            fp = out_path / rel
+            ctrl = Path(str(fp) + ".aria2")
+            if fp.is_file() and fp.stat().st_size > 1024 * 1024 and not ctrl.exists():
+                present.append(fp)
+
+    if not present:
+        raise FileNotFoundError("لم يكتمل تحميل أي من الملفات المنتقاة — راجع السجل.")
+    missing = [i for i in wanted if not any((out_path / by_idx[i][0]) == p for p in present)]
+    if missing and log_cb:
+        names = ", ".join(Path(by_idx[i][0]).name for i in missing)
+        log_cb(f"⚠️ ملفات لم تكتمل بعد (قد تحتاج إعادة تشغيل لاستكمالها): {names}")
+    present.sort(key=episode_sort_key)
+    return present
+
+
 def download_season_batch(
     source_link: Optional[str],
     torrent_file: Optional[str],
     output_dir: str,
     log_cb: Optional[Callable[[str], None]] = None,
     progress_cb: Optional[ProgressCallback] = None,
+    select_files: Optional[List[int]] = None,
 ) -> List[Path]:
     """Download a whole season/batch torrent and return every episode video in episode order.
 
     A link may contain one episode or several seasons; all videos found are returned,
     sorted by the episode number extracted from each filename. Reuses the completed
-    download on later runs (resume-safe).
+    download on later runs (resume-safe). Pass select_files (1-based torrent indices)
+    to download only those episodes; everything else in the torrent is left untouched.
     """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    if select_files:
+        return _download_selected_files(
+            source_link, torrent_file, out_path, sorted(set(select_files)), log_cb, progress_cb
+        )
 
     cached = collect_episode_videos(out_path)
     if cached:
