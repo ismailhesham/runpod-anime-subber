@@ -92,9 +92,19 @@ def ensure_restore_model(model_key: str, log_cb: Callable[[str], None], scale: i
     raise RuntimeError(f"❌ موديل ترميم غير معروف: {model_key}")
 
 
+_MODEL_CACHE: dict = {}
+_IVTC_CACHE: dict = {}
+
+
 def _load_model(model_key: str, weights: Path, device, dtype, log_cb, scale: int = 4):
     import torch
     import restore_nets
+
+    cache_key = (model_key, scale, str(device), str(dtype))
+    if cache_key in _MODEL_CACHE:
+        log_cb("✓ الموديل جاهز في الذاكرة من التشغيل السابق — بدون إعادة تحميل (التسخين مرة واحدة لكل تشغيلة).")
+        return _MODEL_CACHE[cache_key]
+    t0 = time.time()
 
     if model_key == "v3":
         sd = torch.load(str(weights), map_location="cpu", weights_only=True)
@@ -110,8 +120,9 @@ def _load_model(model_key: str, weights: Path, device, dtype, log_cb, scale: int
     model = model.to(device).to(dtype).eval()
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
+    _MODEL_CACHE[cache_key] = model
     name = MODEL_LABELS[model_key] if model_key == "v3" else f"Real-CUGAN denoise3x ×{scale}"
-    log_cb(f"✓ موديل {name} اتحمل على الجهاز ({device.type}, {str(dtype).split('.')[-1]}).")
+    log_cb(f"✓ موديل {name} اتحمل على الجهاز ({device.type}, {str(dtype).split('.')[-1]}) في {time.time() - t0:.0f} ثانية.")
     return model
 
 
@@ -144,8 +155,9 @@ def _pick_v3_batch(px: int, vram_gb: float) -> int:
     return 4 if vram_gb >= 12 else (2 if vram_gb >= 8 else 1)
 
 
-def _sr_batch(model, model_key: str, frames: np.ndarray, device, dtype, tile_mode: int) -> np.ndarray:
-    """Run a batch of RGB uint8 frames (n,h,w,3) -> x4 RGB uint8 (n,4h,4w,3)."""
+def _sr_batch(model, model_key: str, frames: np.ndarray, device, dtype, tile_mode: int, target_hw: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """Run a batch of RGB uint8 frames (n,h,w,3) -> upscaled RGB uint8.
+    v3 يكبّر ×4 دائماً؛ لو الهدف أصغر يُصغّر على الكرت مباشرة (أسرع بكتير من lanczos على المعالج)."""
     import torch
 
     x = torch.from_numpy(frames)
@@ -158,6 +170,8 @@ def _sr_batch(model, model_key: str, frames: np.ndarray, device, dtype, tile_mod
     with torch.no_grad():
         if model_key == "v3":
             out = model(x)  # float 0..1
+            if target_hw is not None and (out.shape[2], out.shape[3]) != target_hw:
+                out = torch.nn.functional.interpolate(out, size=target_hw, mode="bicubic", align_corners=False, antialias=True)
             out = out.mul_(255.0).round_().clamp_(0, 255).byte()
         else:
             out = model(x, tile_mode=tile_mode, cache_mode=0, alpha=1.0, pro=False)  # uint8
@@ -165,6 +179,22 @@ def _sr_batch(model, model_key: str, frames: np.ndarray, device, dtype, tile_mod
 
 
 def _detect_telecine(video_path: str, sample_ss: float, log: Callable[[str], None]) -> Optional[int]:
+    try:
+        ck = (video_path, os.path.getmtime(video_path), round(float(sample_ss), 1))
+        if ck in _IVTC_CACHE:
+            log("✓ نتيجة فحص التليسين محفوظة من المرة السابقة.")
+            return _IVTC_CACHE[ck]
+    except Exception:
+        ck = None
+    t0 = time.time()
+    res = _detect_telecine_uncached(video_path, sample_ss, log)
+    log(f"⏱️ فحص التليسين أخذ {time.time() - t0:.0f} ثانية.")
+    if ck:
+        _IVTC_CACHE[ck] = res
+    return res
+
+
+def _detect_telecine_uncached(video_path: str, sample_ss: float, log: Callable[[str], None]) -> Optional[int]:
     """يكتشف مصادر DVD المسحوقة تليسين (interlaced 29.97) عبر idet على عينة قصيرة.
     يعيد ترتيب الحقول (1=TFF أو 0=BFF) لو المصدر متشابك، و None لو progressive."""
     try:
@@ -263,7 +293,7 @@ def restore_video(
     est_frames = int((eff_seconds or dur or 0) * out_fps)
     log(
         f"🧪 بدء الترميم بـ {label}: {w}x{h} → {w * scale}x{h * scale}"
-        + (f" (v3 ×{model_scale} ثم تصغير lanczos)" if model_scale != scale else "")
+        + (f" (v3 ×4 ثم تصغير على الكرت)" if model_scale != scale else "")
         + f" · {out_fps:.3f}fps"
         + ((f" · معاينة {eff_seconds:g} ثانية" + (f" من منتصف الحلقة (تبدأ ~{int(start_at // 60)}:{int(start_at % 60):02d})" if start_at > 0 else " من البداية")) if eff_seconds else f" · {est_frames} فريم تقريباً")
     )
@@ -304,15 +334,13 @@ def restore_video(
     def _build_enc_cmd(nv: bool) -> List[str]:
         cmd = [
             "ffmpeg", "-y", "-v", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w * model_scale}x{h * model_scale}", "-r", f"{out_fps:.6f}", "-i", "pipe:0",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", f"{out_fps:.6f}", "-i", "pipe:0",
         ]
         if start_at > 0:
             cmd += ["-ss", f"{start_at:.3f}"]
         if eff_seconds:
             cmd += ["-t", f"{eff_seconds:.3f}"]
         cmd += ["-i", video_path, "-map", "0:v", "-map", "1:a?"]
-        if model_scale != scale:
-            cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
         if nv:
             cmd += [
                 "-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr",
@@ -326,6 +354,7 @@ def restore_video(
         return cmd
 
     frame_bytes = w * h * 3
+    t_proc = time.time()
 
     while True:
         done_frames = 0
@@ -342,7 +371,7 @@ def restore_video(
             if not batch:
                 return
             arr = np.stack(batch, axis=0)
-            out = _sr_batch(model, model_key, arr, device, dtype, tile_mode)
+            out = _sr_batch(model, model_key, arr, device, dtype, tile_mode, target_hw=(oh, ow))
             enc.stdin.write(out.tobytes())
             done_frames += len(batch)
             fps_win_n += len(batch)
