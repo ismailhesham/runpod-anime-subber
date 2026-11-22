@@ -352,7 +352,9 @@ def restore_video(
             ]
         else:
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
-        cmd += ["-c:a", "aac", "-b:a", "160k", "-shortest", out_path]
+        # +faststart: moov atom في مقدمة الملف عشان المتصفح يشغّل المرمَّم فوراً من المشغّل
+        # (من غيرها ملفات المرمَّم الكبيرة لا تظهر في المشغّل إلا بعد تحميل الملف كله)
+        cmd += ["-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", out_path]
         return cmd
 
     frame_bytes = w * h * 3
