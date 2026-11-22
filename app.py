@@ -2412,7 +2412,7 @@ def rtab_preview(model: str, scale: str, ep_names, eps_state: List[str]):
         yield pack(render_progress_hud(0.0, "ERROR · PREVIEW", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
 
 
-def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
+def rtab_run(model: str, scale: str, force: bool, sel_names, eps_state: List[str]):
     """تبويب الترميم: ترميم الحلقات المختارة فقط؛ الأصلية تُمسح بعد نجاح كل حلقة (كاش الأداة فقط)."""
     logs: List[str] = []
 
@@ -2439,11 +2439,30 @@ def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
         failed: List[str] = []
         push(f"🚀 بدء ترميم {total} حلقة مختارة بموديل {MODEL_LABELS.get(model, model)} ×{int(scale)}.")
         for i, ep in enumerate(picked, 1):
-            out = restored_dir / f"{ep.stem}_x{int(scale)}.mp4"
-            if out.exists() and out.stat().st_size > 1024 * 1024:
-                push(f"⏭️ [{i}/{total}] {ep.name} مترممة مسبقاً — تخطي ({out.name})")
-                done_n += 1
+            if not ep.is_file():
+                failed.append(ep.name)
+                push(f"❌ [{i}/{total}] الملف الأصلي لم يعد موجوداً: {ep.name} — اضغط «تحميل / فحص الحلقات» لتحديث القائمة.")
                 continue
+            out = restored_dir / f"{ep.stem}_{model}_x{int(scale)}.mp4"
+            if out.exists() and not force:
+                complete = out.stat().st_size > 1024 * 1024
+                if complete:
+                    try:
+                        _, _, _, src_dur = probe_video_info(str(ep))
+                        _, _, _, out_dur = probe_video_info(str(out))
+                        if src_dur > 0 and out_dur < 0.8 * src_dur:
+                            complete = False
+                    except Exception:
+                        pass
+                if complete:
+                    push(f"⏭️ [{i}/{total}] {ep.name} مترممة مسبقاً بنفس الموديل والمقياس — تخطي ({out.name}). لإعادة الترميم فعّل خيار «إعادة ترميم الموجود».")
+                    done_n += 1
+                    last_done = str(out)
+                    continue
+                push(f"♻️ [{i}/{total}] نسخة سابقة ناقصة ({out.name}) — يعيد الترميم من الأول.")
+                out.unlink(missing_ok=True)
+            elif out.exists() and force:
+                out.unlink(missing_ok=True)
             push(f"━━━━━━ [{i}/{total}] {ep.name} ━━━━━━")
             try:
                 yield from _live_gen(
@@ -2492,11 +2511,15 @@ def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
 def _rtab_master_for(restored_dir: Path, stem: str) -> Optional[Path]:
     """يجد الملف المرمَّم لحلقة بأي مقياس (x2/x3/x4) مع تجاهل النسخ المضغوطة."""
     import glob as _glob
-    pat = str(restored_dir / _glob.escape(f"{stem}_x")) + "*.mp4"
-    for p in sorted(_glob.glob(pat)):
-        if not p.endswith("_comp.mp4"):
-            return Path(p)
-    return None
+    seen: List[str] = []
+    for pat in (
+        str(restored_dir / _glob.escape(f"{stem}_")) + "*_x*.mp4",
+        str(restored_dir / _glob.escape(f"{stem}_x")) + "*.mp4",
+    ):
+        for p in sorted(_glob.glob(pat)):
+            if not p.endswith("_comp.mp4") and p not in seen:
+                seen.append(p)
+    return Path(seen[0]) if seen else None
 
 
 def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
@@ -2908,6 +2931,7 @@ def build_ui() -> gr.Blocks:
                         value="2",
                         label="المقياس",
                     )
+                    rtab_force = gr.Checkbox(value=False, label="🔁 إعادة ترميم الموجود")
                     rtab_load_btn = gr.Button("⬇️ تحميل / فحص الحلقات", variant="primary", scale=1)
                 rtab_eps = gr.Dropdown(choices=[], multiselect=True, label="الحلقات — اختر أي عدد (الكل محدد افتراضياً)", interactive=True)
                 rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ من منتصف أول حلقة مختارة", size="sm")
@@ -2943,7 +2967,7 @@ def build_ui() -> gr.Blocks:
         )
         rtab_run_btn.click(
             fn=rtab_run,
-            inputs=[rtab_model, rtab_scale, rtab_eps, rtab_state],
+            inputs=[rtab_model, rtab_scale, rtab_force, rtab_eps, rtab_state],
             outputs=[rtab_hud, rtab_log, saved_raw_1080, rtab_preview_video],
         )
         rtab_compress_btn.click(
