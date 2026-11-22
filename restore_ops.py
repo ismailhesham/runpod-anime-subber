@@ -34,8 +34,8 @@ def _cugan_weight_name(scale: int) -> str:
     return f"up{scale}x-latest-denoise3x.pth"
 
 MODEL_LABELS = {
-    "cugan": "Real-CUGAN denoise3x ×4",
-    "v3": "realesr-animevideov3 ×4",
+    "cugan": "Real-CUGAN denoise3x",
+    "v3": "Real-ESRGAN animevideo v3",
 }
 
 
@@ -108,6 +108,8 @@ def _load_model(model_key: str, weights: Path, device, dtype, log_cb, scale: int
         model = cls(in_channels=3, out_channels=3)
         model.load_state_dict(torch.load(str(weights), map_location="cpu"), strict=True)
     model = model.to(device).to(dtype).eval()
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     name = MODEL_LABELS[model_key] if model_key == "v3" else f"Real-CUGAN denoise3x ×{scale}"
     log_cb(f"✓ موديل {name} اتحمل على الجهاز ({device.type}, {str(dtype).split('.')[-1]}).")
     return model
@@ -117,15 +119,15 @@ def _pick_cugan_tuning(px: int, vram_gb: float) -> Tuple[int, int]:
     """(tile_mode, batch_size) لـ CUGAN حسب حجم الفريم وذاكرة الكرت.
     tile_mode=0 يعني الفريم كاملاً دفعة واحدة (أسرع بكتير) لو الذاكرة تكفي."""
     if px <= 640 * 480:
-        return 0, 4
+        return 0, 12
     if px <= 1280 * 720:
         if vram_gb >= 14:
-            return 0, 2
+            return 0, 8
         if vram_gb >= 8:
-            return 1, 2
-        return 2, 1
+            return 1, 4
+        return 2, 2
     if vram_gb >= 16:
-        return 0, 1
+        return 0, 2
     if vram_gb >= 10:
         return 1, 1
     if vram_gb >= 6:
@@ -136,9 +138,9 @@ def _pick_cugan_tuning(px: int, vram_gb: float) -> Tuple[int, int]:
 def _pick_v3_batch(px: int, vram_gb: float) -> int:
     """حجم الدفعة لموديل v3 الخفيف حسب الذاكرة."""
     if px <= 640 * 480:
-        return 4
+        return 8
     if px <= 1280 * 720:
-        return 4 if vram_gb >= 10 else 2
+        return 8 if vram_gb >= 10 else 4
     return 4 if vram_gb >= 12 else (2 if vram_gb >= 8 else 1)
 
 
@@ -146,7 +148,12 @@ def _sr_batch(model, model_key: str, frames: np.ndarray, device, dtype, tile_mod
     """Run a batch of RGB uint8 frames (n,h,w,3) -> x4 RGB uint8 (n,4h,4w,3)."""
     import torch
 
-    x = torch.from_numpy(frames).to(device).permute(0, 3, 1, 2).contiguous()
+    x = torch.from_numpy(frames)
+    if device.type == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        x = x.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last)
+    else:
+        x = x.to(device).permute(0, 3, 1, 2).contiguous()
     x = x.to(dtype).div_(255.0)
     with torch.no_grad():
         if model_key == "v3":
@@ -234,9 +241,7 @@ def restore_video(
 
     if scale not in (2, 3, 4):
         scale = 4
-    if model_key == "v3" and scale != 4:
-        log("ℹ️ موديل v3 ثابت على ×4 — المقياس المختار يُتجاهل معه.")
-        scale = 4
+    model_scale = 4 if model_key == "v3" else scale
     label = f"Real-CUGAN denoise3x ×{scale}" if model_key == "cugan" else MODEL_LABELS.get(model_key, model_key)
     w, h, fps, dur = probe_video_info(video_path)
     if dur <= 0:
@@ -257,7 +262,9 @@ def restore_video(
             log(f"🎞️ المصدر متشابك/مسحوق تليسين (DVD قديم) — IVTC تلقائي: إزالة التشابك واسترجاع {out_fps:.3f}fps قبل الترميم (ده كان سبب الحركة المهزوزة).")
     est_frames = int((eff_seconds or dur or 0) * out_fps)
     log(
-        f"🧪 بدء الترميم بـ {label}: {w}x{h} → {w * scale}x{h * scale} · {out_fps:.3f}fps"
+        f"🧪 بدء الترميم بـ {label}: {w}x{h} → {w * scale}x{h * scale}"
+        + (f" (v3 ×{model_scale} ثم تصغير lanczos)" if model_scale != scale else "")
+        + f" · {out_fps:.3f}fps"
         + ((f" · معاينة {eff_seconds:g} ثانية" + (f" من منتصف الحلقة (تبدأ ~{int(start_at // 60)}:{int(start_at % 60):02d})" if start_at > 0 else " من البداية")) if eff_seconds else f" · {est_frames} فريم تقريباً")
     )
 
@@ -297,13 +304,15 @@ def restore_video(
     def _build_enc_cmd(nv: bool) -> List[str]:
         cmd = [
             "ffmpeg", "-y", "-v", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", f"{out_fps:.6f}", "-i", "pipe:0",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w * model_scale}x{h * model_scale}", "-r", f"{out_fps:.6f}", "-i", "pipe:0",
         ]
         if start_at > 0:
             cmd += ["-ss", f"{start_at:.3f}"]
         if eff_seconds:
             cmd += ["-t", f"{eff_seconds:.3f}"]
         cmd += ["-i", video_path, "-map", "0:v", "-map", "1:a?"]
+        if model_scale != scale:
+            cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
         if nv:
             cmd += [
                 "-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr",
