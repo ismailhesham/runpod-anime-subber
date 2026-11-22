@@ -130,7 +130,7 @@ def _pick_cugan_tuning(px: int, vram_gb: float) -> Tuple[int, int]:
     """(tile_mode, batch_size) لـ CUGAN حسب حجم الفريم وذاكرة الكرت.
     tile_mode=0 يعني الفريم كاملاً دفعة واحدة (أسرع بكتير) لو الذاكرة تكفي."""
     if px <= 640 * 480:
-        return 0, 12
+        return 0, 16
     if px <= 1280 * 720:
         if vram_gb >= 14:
             return 0, 8
@@ -149,9 +149,9 @@ def _pick_cugan_tuning(px: int, vram_gb: float) -> Tuple[int, int]:
 def _pick_v3_batch(px: int, vram_gb: float) -> int:
     """حجم الدفعة لموديل v3 الخفيف حسب الذاكرة."""
     if px <= 640 * 480:
-        return 8
+        return 24
     if px <= 1280 * 720:
-        return 8 if vram_gb >= 10 else 4
+        return 16 if vram_gb >= 14 else (8 if vram_gb >= 10 else 4)
     return 4 if vram_gb >= 12 else (2 if vram_gb >= 8 else 1)
 
 
@@ -414,6 +414,10 @@ def restore_video(
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+            if done_frames == 0 and model_key == "cugan" and batch_size > 8:
+                batch_size = max(8, batch_size // 2)
+                log(f"⚠️ ذاكرة الكرت امتلأت — تقليل الدفعة إلى {batch_size} وإعادة المحاولة.")
+                continue
             if done_frames == 0 and model_key == "cugan" and tile_mode < 4:
                 tile_mode += 1
                 batch_size = 1
