@@ -832,8 +832,95 @@ def translate_detected_signs(
     return signs
 
 
-def _enforce_celestial_punctuation(text: str, style_name: str, source_text: str = "") -> str:
-    """Deterministic post-processor enforcing Celestial-Dragons non-RLE libass punctuation & grammar."""
+_MAX_LINE_CHARS = 38  # عرف الفانسب: ~40 حرفاً عربياً للسطر المرئي الواحد (خط Bahij Nassim عريض)
+
+
+def _split_long_arabic_line(t: str, max_len: int = _MAX_LINE_CHARS) -> List[str]:
+    """Balanced 2-3 visual-line wrap for long Arabic dialogue (\\N inserted by the caller).
+    Breaks at word boundaries, preferring punctuation edges and balanced halves."""
+    t = t.strip()
+    if len(t) <= max_len or " " not in t:
+        return [t]
+    words = t.split(" ")
+
+    def _cost(a: str, b: str) -> float:
+        over = max(0, len(a) - (max_len + 4)) + max(0, len(b) - (max_len + 4))
+        balance = abs(len(a) - len(b))
+        punct_bonus = 6.0 if re.search(r"(?:\.{2,}|[،؟?!.:؛…-])$", a) else 0.0
+        orphan = 100.0 if len(a.strip(".!،؟ ")) < 3 or len(b.strip(".!،؟ ")) < 3 else 0.0
+        return balance + over * 20.0 + orphan - punct_bonus
+
+    best_i, best_c = 1, None
+    for i in range(1, len(words)):
+        c = _cost(" ".join(words[:i]), " ".join(words[i:]))
+        if best_c is None or c < best_c:
+            best_c, best_i = c, i
+    first = " ".join(words[:best_i])
+    rest = " ".join(words[best_i:])
+    segs = [first]
+    # سطر ثالث فقط عند طول مبالغ فيه (أكثر من سطرين كاملين تقريباً)
+    if len(rest) > max_len + 4:
+        segs.extend(_split_long_arabic_line(rest, max_len))
+    else:
+        segs.append(rest)
+    return segs
+
+
+def _fix_segment_punctuation(seg: str, lead_hint: Optional[bool], trail_hint: Optional[bool]) -> str:
+    """Celestial punctuation for ONE visual line: trailing !/، to the logical start, ؟ stays at
+    the end, and edge-ellipsis placement. Verified libass behavior (line treated as LTR-base):
+      "...نص" بدون علامات  ← النقاط تظهر يساراً (نهاية السطر)   [أسلوب Celestial للكلام المبتور]
+      "نص..." بدون علامات  ← النقاط تظهر يميناً (بداية السطر)
+      RLM + "...نص"        ← يميناً   |   "نص..." + RLM ← يساراً
+    نقاط البداية (تكملة من سطر سابق) تُثبَّت يميناً بـ RLM، ونقاط النهاية تُكتب "..." في
+    البداية المنطقية بدون علامات فتظهر يساراً. موضع النقاط في المصدر الإنجليزي هو الفيصل؛
+    lead_hint/trail_hint: هل يبدأ/ينتهي المصدر بـ '...' — None تعني لا معلومات."""
+    t = seg.strip()
+    if not t:
+        return t
+    t = t.replace("?", "؟")
+    if re.search(r"(?:!\s*؟|؟\s*!)$", t):
+        t = re.sub(r"(?:!\s*؟|؟\s*!)$", "؟", t).strip()
+        if not t.startswith("!"):
+            t = f"!{t}"
+    elif t.endswith("!") and not t.startswith("!"):
+        t = f"!{t.rstrip('! ').strip()}"
+    elif t.endswith("،") and not t.startswith("،"):
+        t = f"،{t.rstrip('، ').strip()}"
+
+    RLM = "\u200f"
+    t = re.sub(r"^\s*\.{2,}\s*", "...", t)
+    t = re.sub(r"\s*\.{2,}\s*$", "...", t)
+    has_lead = t.startswith("...")
+    has_trail = t.endswith("...")
+    if not (has_lead or has_trail):
+        return t
+    core = t[3:] if has_lead else t
+    if has_trail and core.endswith("..."):
+        core = core[:-3]
+    core = core.strip()
+    if not core:
+        return t
+    lead_sem = has_lead if lead_hint is None else lead_hint
+    trail_sem = has_trail if trail_hint is None else trail_hint
+    if lead_sem and trail_sem:
+        return f"{RLM}...{core}...{RLM}"
+    if lead_sem:
+        return f"{RLM}...{core}"
+    if trail_sem:
+        return f"...{core}"
+    # لا معلومات حاسمة: ثبّت كل طرف في موضعه المرئي المقصود
+    pre = f"{RLM}..." if has_lead else ""
+    post = f"...{RLM}" if has_trail else ""
+    return f"{pre}{core}{post}"
+
+
+def _enforce_celestial_punctuation(
+    text: str, style_name: str, source_text: str = "", wrap: bool = True, as_segments: bool = False
+):
+    """Deterministic post-processor enforcing Celestial-Dragons non-RLE libass punctuation & grammar.
+    wrap=True يلف الأسطر الطويلة إلى سطرين مرئيين؛ as_segments=True يرجع قائمة المقاطع بدل نص واحد
+    (لوضع التقسيم التتابعي الذي يحوّل المقاطع إلى أحداث Dialogue متتالية زمنياً)."""
     prof = ensure_style_profile()
     t = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", (text or "")).strip()
     if style_name in ("Main", "Top", "Narrator", "Narrator - Top"):
@@ -847,54 +934,31 @@ def _enforce_celestial_punctuation(text: str, style_name: str, source_text: str 
         t = t.replace(wrong, right)
 
     if not re.search(r"[\u0600-\u06FF]", t) or style_name == "Signs":
-        return t
+        return [t] if as_segments else t
 
-    t = t.replace("?", "؟")
-    if re.search(r"(?:!\s*؟|؟\s*!)$", t):
-        t = re.sub(r"(?:!\s*؟|؟\s*!)$", "؟", t).strip()
-        if not t.startswith("!"):
-            t = f"!{t}"
-    elif t.endswith("!") and not t.startswith("!"):
-        core = t.rstrip("! ").strip()
-        t = f"!{core}"
-    elif t.endswith("،") and not t.startswith("،"):
-        core = t.rstrip("، ").strip()
-        t = f"،{core}"
-
-    # ضبط النقاط (...) عند طرفي السطر: libass يعامل السطر كأن اتجاهه الأساسي LTR،
-    # فيضع النقاط الطرفية في الجهة المعاكسة منطقياً. التحقق التجريبي:
-    #   "...نص" (بدون علامات)  ← تظهر النقاط يساراً (نهاية السطر)
-    #   "نص..." (بدون علامات)  ← تظهر النقاط يميناً (بداية السطر)
-    #   RLM + "...نص"          ← يميناً | "نص..." + RLM ← يساراً
-    # القاعدة: نقاط البداية (تكملة من سطر سابق) تُثبَّت يميناً بـ RLM + "..." في البداية المنطقية،
-    # ونقاط النهاية (كلام مبتور) تُكتب "..." في البداية المنطقية بدون علامات (أسلوب Celestial) فتظهر يساراً.
-    # موضع النقاط في سطر المصدر الإنجليزي هو الفيصل؛ بدونه نثبّت موضعها في الترجمة نفسها.
-    RLM = "\u200f"
-    t = re.sub(r"^\s*\.{2,}\s*", "...", t)
-    t = re.sub(r"\s*\.{2,}\s*$", "...", t)
+    # لفّ السطر الطويل أولاً ثم طبّق قواعد التنقيط على كل سطر مرئي على حدة،
+    # حتى لا تهاجر علامة (! أو ، أو ...) المنقولة للبداية المنطقية إلى سطر مرئي غير سطرها.
     src = (source_text or "").replace("…", "...")
     src_lead = bool(re.match(r"^\s*(?:\.\s*){2,}", src))
     src_trail = bool(re.search(r"(?:\.\s*){2,}\s*[\"'»)\]]*$", src))
-    has_lead = t.startswith("...")
-    has_trail = t.endswith("...")
-    if has_lead or has_trail:
-        core = t[3:] if has_lead else t
-        if has_trail and core.endswith("..."):
-            core = core[:-3]
-        core = core.strip()
-        if core:
-            if src_lead or src_trail:
-                lead_sem, trail_sem = src_lead, src_trail
-            else:
-                lead_sem, trail_sem = has_lead, has_trail
-            if lead_sem and trail_sem:
-                t = f"{RLM}...{core}...{RLM}"
-            elif lead_sem:
-                t = f"{RLM}...{core}"
-            elif trail_sem:
-                t = f"...{core}"
 
-    return t
+    segs = _split_long_arabic_line(t) if wrap else [t]
+    if len(segs) > 1 and src_trail and not src_lead:
+        m = re.match(r"^\s*\.{2,}\s*", segs[0])
+        if m:
+            # نقاط النهاية المكتوبة بالأسلوب الكنسي في بداية السطر المنطقي تنتقل بعد اللفّ
+            # إلى السطر المرئي الأخير حيث موضعها الصحيح
+            segs[0] = segs[0][m.end():]
+            segs[-1] = segs[-1].rstrip() + "..."
+
+    any_hints = src_lead or src_trail
+    out: List[str] = []
+    last_i = len(segs) - 1
+    for i, seg in enumerate(segs):
+        lead_hint: Optional[bool] = (src_lead if i == 0 else False) if any_hints else None
+        trail_hint: Optional[bool] = (src_trail if i == last_i else False) if any_hints else None
+        out.append(_fix_segment_punctuation(seg, lead_hint, trail_hint))
+    return out if as_segments else "\\N".join(out)
 
 
 def translate_entries(
@@ -1097,6 +1161,7 @@ def write_responsive_ass(
     style_preset: str = "bleach_style",
     approved_visual_signs: Optional[List[Dict]] = None,
     credits: Optional[Dict[str, str]] = None,
+    wrap_mode: str = "sequential",
 ) -> str:
     prof = ensure_style_profile()
     geom = prof["responsive_geometry"]
@@ -1136,7 +1201,26 @@ def write_responsive_ass(
                 continue
 
         raw_final = entry.plain_text if entry.keep_untranslated else translations.get(entry.index, entry.plain_text)
-        final_text = _enforce_celestial_punctuation(raw_final, entry.target_style, source_text=entry.plain_text)
+        # التقسيم التتابعي (أسلوب Celestial): السطر الطويل يصبح حدثين متتاليين زمنياً بدل سطر مكدس
+        seq_segs: Optional[List[str]] = None
+        if (
+            wrap_mode == "sequential"
+            and not entry.keep_untranslated
+            and entry.target_style in ("Main", "Top", "Narrator", "Narrator - Top")
+            and (entry.end_ms - entry.start_ms) >= 1700
+        ):
+            _cand = _enforce_celestial_punctuation(
+                raw_final, entry.target_style, source_text=entry.plain_text, as_segments=True
+            )
+            if len(_cand) >= 2:
+                seq_segs = _cand
+        if seq_segs is None:
+            final_text = _enforce_celestial_punctuation(
+                raw_final, entry.target_style, source_text=entry.plain_text,
+                wrap=(wrap_mode == "stacked"),
+            )
+        else:
+            final_text = ""
 
         eff_style = entry.target_style
         inline_an8 = ""
@@ -1182,10 +1266,33 @@ def write_responsive_ass(
             formatted = final_text
 
         layer = 2 if eff_style in ("Main", "Top", "Narrator", "Narrator - Top") else 0
-        lines.append(
-            f"Dialogue: {layer},{_ms_to_ass_time(entry.start_ms)},{_ms_to_ass_time(entry.end_ms)},"
-            f"{eff_style},{entry.actor},0,0,{ev_mv},,{formatted}"
-        )
+        if seq_segs is not None:
+            seg_prefix = f"{{{inline_an8}\\be{be_val}}}"
+            dur_ms = entry.end_ms - entry.start_ms
+            total_chars = sum(max(1, len(s)) for s in seq_segs)
+            bounds = [entry.start_ms]
+            acc = 0
+            for s in seq_segs[:-1]:
+                acc += max(1, len(s))
+                bounds.append(entry.start_ms + round(dur_ms * acc / total_chars))
+            bounds.append(entry.end_ms)
+            min_cue = 700
+            for k in range(1, len(bounds) - 1):
+                lo = entry.start_ms + min_cue * k
+                hi = entry.end_ms - min_cue * (len(seq_segs) - k)
+                bounds[k] = max(lo, min(hi, bounds[k]))
+            for k, seg_text in enumerate(seq_segs):
+                if bounds[k + 1] - bounds[k] < 350:
+                    continue
+                lines.append(
+                    f"Dialogue: {layer},{_ms_to_ass_time(bounds[k])},{_ms_to_ass_time(bounds[k + 1])},"
+                    f"{eff_style},{entry.actor},0,0,{ev_mv},,{seg_prefix}{seg_text}"
+                )
+        else:
+            lines.append(
+                f"Dialogue: {layer},{_ms_to_ass_time(entry.start_ms)},{_ms_to_ass_time(entry.end_ms)},"
+                f"{eff_style},{entry.actor},0,0,{ev_mv},,{formatted}"
+            )
 
     for vs in visual_signs:
         ar_sign = str(vs["ar_text"]).strip()
