@@ -127,6 +127,7 @@ def restore_video(
     log_cb: Callable[[str], None] = print,
     progress_cb: Optional[Callable[[float, str, str], None]] = None,
     max_seconds: Optional[float] = None,
+    start_seconds: Optional[float] = None,
     crf: int = 14,
 ) -> str:
     """Restore a video x4 with the chosen model. Fails loudly without a CUDA GPU."""
@@ -168,10 +169,13 @@ def restore_video(
     if dur <= 0:
         dur = 0.0
     eff_seconds = min(dur, max_seconds) if (max_seconds and dur > 0) else max_seconds
+    start_at = 0.0
+    if start_seconds and dur > 0:
+        start_at = max(0.0, min(float(start_seconds), max(0.0, dur - (eff_seconds or 0.0))))
     est_frames = int((eff_seconds or dur or 0) * fps)
     log(
         f"🧪 بدء الترميم بـ {label}: {w}x{h} → {w * 4}x{h * 4} · {fps:.3f}fps"
-        + (f" · أول {eff_seconds:g} ثانية فقط (معاينة)" if eff_seconds else f" · {est_frames} فريم تقريباً")
+        + ((f" · معاينة {eff_seconds:g} ثانية" + (f" من منتصف الحلقة (تبدأ ~{int(start_at // 60)}:{int(start_at % 60):02d})" if start_at > 0 else " من البداية")) if eff_seconds else f" · {est_frames} فريم تقريباً")
     )
 
     weights = ensure_restore_model(model_key, log)
@@ -187,6 +191,8 @@ def restore_video(
 
     ow, oh = w * 4, h * 4
     dec_cmd = ["ffmpeg", "-v", "error"]
+    if start_at > 0:
+        dec_cmd += ["-ss", f"{start_at:.3f}"]
     if eff_seconds:
         dec_cmd += ["-t", f"{eff_seconds:.3f}"]
     dec_cmd += ["-i", video_path, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
@@ -195,6 +201,8 @@ def restore_video(
         "ffmpeg", "-y", "-v", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", f"{fps:.6f}", "-i", "pipe:0",
     ]
+    if start_at > 0:
+        enc_cmd += ["-ss", f"{start_at:.3f}"]
     if eff_seconds:
         enc_cmd += ["-t", f"{eff_seconds:.3f}"]
     enc_cmd += [
