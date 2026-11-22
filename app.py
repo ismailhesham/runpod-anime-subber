@@ -2244,11 +2244,17 @@ def rtab_load(links_txt: str):
 
     try:
         lines = [ln.strip() for ln in (links_txt or "").splitlines() if ln.strip()]
-        if not lines:
-            push("⚠️ أدخل رابط تورنت أو مسار ملف/مجلد محلي أولاً (واحد في كل سطر).")
-            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد مصادر", "أدخل رابطاً أو مساراً محلياً أولاً", "—", "—", mode="error"))
-            return
         eps: List[Path] = []
+        if not lines:
+            eps = [
+                Path(p) for p in list_cached_raw_videos()
+                if "restored" not in Path(p).parts and "compressed" not in Path(p).parts
+            ]
+            if not eps:
+                push("⚠️ المربع فاضي ولا توجد حلقات محمّلة في الكاش — الصق رابط تورنت أو مساراً محلياً، أو حمّل حلقات من التبويب الرئيسي أولاً.")
+                yield pack(render_progress_hud(0.0, "تنبيه · لا توجد مصادر", "الصق رابطاً أو حمّل من التبويب الرئيسي أولاً", "—", "—", mode="error"))
+                return
+            push(f"🗂️ المربع فاضي — عرضت كل الحلقات المحمّلة مسبقاً في الكاش: {len(eps)} حلقة (المحمَّلة من أي تبويب؛ المرمَّمة والمضغوطة مستثناة).")
         for i, lnk in enumerate(lines, 1):
             if os.path.isdir(lnk):
                 vids = collect_episode_videos(lnk)
@@ -2839,10 +2845,10 @@ def build_ui() -> gr.Blocks:
                             out_ass_file = gr.File(label="📝 تحميل ملف الترجمة المنسّق (.ass)")
 
             with gr.TabItem("🧪 الترميم ×4"):
-                gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">🧪 ترميم ×4: حمّل المصادر → اختر أي عدد حلقات → معاينة 10 ثوانٍ → ترميم → ضغط → احكم: قبول يمسح المرمَّم ويبقي المضغوط، رفض يمسح المضغوط ويبقي المرمَّم لإعادة الضغط</div>')
+                gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">🧪 ترميم ×4: اترك مربع المصادر فاضياً واضغط تحميل لعرض المحمّل مسبقاً (أو الصق روابط/مسارات) → اختر أي عدد حلقات → معاينة 10 ثوانٍ → ترميم → ضغط → احكم: قبول يمسح المرمَّم ويبقي المضغوط، رفض يمسح المضغوط ويبقي المرمَّم لإعادة الضغط</div>')
                 rtab_links = gr.Textbox(
                     label="روابط التورنت / الماجنت أو مسارات ملفات/مجلدات محلية — واحد في كل سطر",
-                    placeholder="magnet:?xt=urn:btih:...\n/workspace/my_old_anime/",
+                    placeholder="اتركه فاضياً لعرض كل الحلقات المحمّلة مسبقاً — أو الصق: magnet:?xt=urn:btih:... / مسار مجلد محلي",
                     lines=3,
                 )
                 with gr.Row():
