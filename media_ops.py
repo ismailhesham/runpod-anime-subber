@@ -880,8 +880,10 @@ def qc_burned_episode(
                 n_dlg = sum(1 for ln in fh if ln.startswith("Dialogue:"))
             report["ass_lines"] = n_dlg
             report["expected_lines"] = expected_lines
-            if abs(n_dlg - expected_lines) > max(2, int(expected_lines * 0.02)):
-                issue(f"أسطر الحوار في ASS ({n_dlg}) مختلفة عن الأسطر المترجمة ({expected_lines})")
+            # أحداث Dialogue أكثر من الترجمات أمر طبيعي مع التقسيم التتابعي للأسطر الطويلة؛
+            # العيب الحقيقي هو أسطر ناقصة فقط
+            if n_dlg < expected_lines - max(2, int(expected_lines * 0.02)):
+                issue(f"أسطر الحوار في ASS ({n_dlg}) أقل من الأسطر المترجمة ({expected_lines}) — في أسطر ناقصة")
         except Exception as exc:
             log(f"⚠️ QC: تعذر عد أسطر ASS ({exc})")
 
