@@ -1996,7 +1996,7 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             codec = gr.Dropdown(
                                 choices=[
-                                    ("HEVC كرت الشاشة (hevc_nvenc · الأفضل توازناً)", "hevc_nvenc"),
+                                    ("HEVC كرت الشاشة (hevc_nvenc · نفس سرعة الكرت وحجم أصغر · موصى به)", "hevc_nvenc"),
                                     ("H.264 كرت الشاشة (h264_nvenc · توافق أوسع)", "h264_nvenc"),
                                     ("AV1 كرت الشاشة (av1_nvenc)", "av1_nvenc"),
                                     ("HEVC معالج x265 · أصغر حجم ممكن (أبطأ بكثير)", "libx265"),
