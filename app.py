@@ -724,6 +724,7 @@ def load_settings() -> Dict:
         "api_key": os.environ.get("DEEPSEEK_API_KEY", os.environ.get("GEMINI_API_KEY", "")),
         "base_url": "https://api.deepseek.com",
         "style_preset": "bleach_style",
+        "wrap_mode": "sequential",
         "dood_api_key": os.environ.get("DOODSTREAM_API_KEY", ""),
         "gdrive_remote": "gdrive",
         "gdrive_folder": "Runpod_Anime",
@@ -751,7 +752,7 @@ _drive_restore_glossaries()
 
 
 def save_settings(
-    provider, llm_model, api_key, base_url, style_preset, dood_api_key,
+    provider, llm_model, api_key, base_url, style_preset, wrap_mode, dood_api_key,
     gdrive_remote, gdrive_folder,
     codec, preset, cq, audio_bitrate,
     credit_translator, credit_typesetter, credit_encoder,
@@ -763,6 +764,7 @@ def save_settings(
         "api_key": api_key,
         "base_url": base_url,
         "style_preset": style_preset,
+        "wrap_mode": wrap_mode,
         "dood_api_key": dood_api_key,
         "gdrive_remote": gdrive_remote,
         "gdrive_folder": gdrive_folder,
@@ -883,6 +885,7 @@ def step1_process_for_preview(
     series_name: str,
     series_pick: str,
     style_preset: str,
+    wrap_mode: str,
     saved_raw_1080: str,
     link_1080: str, file_1080: Optional[str],
     link_720: str, file_720: Optional[str],
@@ -1147,6 +1150,7 @@ def step1_process_for_preview(
                 target_h=vh,
                 style_preset=style_preset,
                 credits=credits_dict if has_credits else None,
+                wrap_mode=wrap_mode,
             )
             if ass_out is None:
                 ass_out = q_ass
@@ -1276,6 +1280,7 @@ def step_batch_process(
     series_name: str,
     series_pick: str,
     style_preset: str,
+    wrap_mode: str,
     sub_mode: str,
     whisper_model: str,
     provider: str,
@@ -1613,6 +1618,7 @@ def step_batch_process(
                     target_h=vh,
                     style_preset=style_preset,
                     credits=credits_dict if has_credits else None,
+                    wrap_mode=wrap_mode,
                 )
                 last_ass = str(ep_ass)
 
@@ -1978,6 +1984,15 @@ def build_ui() -> gr.Blocks:
                                 label="مصدر الترجمة",
                             )
                             whisper_model = gr.Dropdown(choices=["large-v3", "medium", "small"], value="large-v3", label="موديل Whisper")
+                            wrap_mode = gr.Dropdown(
+                                choices=[
+                                    ("تتابعي: السطر الطويل يصبح حدثين متتاليين زمنياً (أسلوب Celestial)", "sequential"),
+                                    ("مكدس: سطران فوق بعض في نفس التوقيت", "stacked"),
+                                    ("بدون تقسيم", "off"),
+                                ],
+                                value=cfg.get("wrap_mode", "sequential"),
+                                label="تقسيم الأسطر العربية الطويلة",
+                            )
                         with gr.Row():
                             codec = gr.Dropdown(
                                 choices=[
@@ -2056,7 +2071,7 @@ def build_ui() -> gr.Blocks:
         save_btn.click(
             fn=save_settings,
             inputs=[
-                provider, llm_model, api_key, base_url, style_preset, dood_api_key,
+                provider, llm_model, api_key, base_url, style_preset, wrap_mode, dood_api_key,
                 gdrive_remote, gdrive_folder,
                 codec, preset, cq, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
@@ -2072,7 +2087,7 @@ def build_ui() -> gr.Blocks:
         step1_btn.click(
             fn=step1_process_for_preview,
             inputs=[
-                episode_name, series_name, series_picker, style_preset,
+                episode_name, series_name, series_picker, style_preset, wrap_mode,
                 saved_raw_1080,
                 link_1080, file_1080,
                 link_720, file_720,
@@ -2094,7 +2109,7 @@ def build_ui() -> gr.Blocks:
         batch_btn.click(
             fn=step_batch_process,
             inputs=[
-                batch_links, series_name, series_picker, style_preset,
+                batch_links, series_name, series_picker, style_preset, wrap_mode,
                 sub_mode, whisper_model,
                 provider, api_key, llm_model, base_url,
                 codec, cq, preset, audio_bitrate,
