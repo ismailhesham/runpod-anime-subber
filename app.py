@@ -44,6 +44,7 @@ from subtitles_ai import (
     translate_entries,
     write_responsive_ass,
 )
+from restore_ops import MODEL_LABELS, restore_video
 
 BASE_DIR = Path(__file__).resolve().parent
 FONTS_DIR = BASE_DIR / "fonts"
@@ -913,6 +914,7 @@ def step1_process_for_preview(
     logo_position: str,
     logo_opacity: float,
     logo_scale: float,
+    restore_model: str = "off",
 ):
     logs: List[str] = []
     rendered_map: Dict[str, str] = {}
@@ -1043,6 +1045,9 @@ def step1_process_for_preview(
         )
         return
 
+    restore_on = bool(restore_model) and restore_model != "off"
+    stage_total = 5 if restore_on else 4
+
     yield pack(
         render_progress_hud(0.0, "INIT · PREPARING", "تم تجهيز مساحة العمل — بدء التحميل...", "—", "—"),
         g1=gr.update(visible=False),
@@ -1058,7 +1063,7 @@ def step1_process_for_preview(
             vid_path = yield from run_live(
                 download_torrent_or_url,
                 lnk, fl, str(cdir),
-                badge=f"STAGE 1/4 · DOWNLOAD [{q_label}]",
+                badge=f"STAGE 1/{stage_total} · DOWNLOAD [{q_label}]",
                 title=f"تحميل / فحص الحلقة الخام بجودة {q_label}",
                 accepts_progress_cb=True,
             )
@@ -1066,6 +1071,22 @@ def step1_process_for_preview(
 
         updated_raw_list = [""] + list_cached_raw_videos()
         primary_vid = downloaded[quality_inputs[0][0]]
+
+        # ترميم اختياري ×4 بالذكاء الاصطناعي — الفيديو المرمَّم يدخل خط الحرق والضغط بدل الخام،
+        # بينما تظل الترجمة (سحب/Whisper) من الملف الأصلي لأن الصوت والترجمة المدمجة لا يتغيران
+        restored_videos: Dict[str, Path] = {}
+        if restore_on:
+            for q_label, vid_path in list(downloaded.items()):
+                r_out = work_dir / f"restored_{q_label}_{vid_path.stem}.mp4"
+                yield from run_live(
+                    restore_video,
+                    str(vid_path), str(r_out),
+                    model_key=restore_model,
+                    badge=f"STAGE 2/{stage_total} · AI RESTORE ×4 [{q_label}]",
+                    title=f"ترميم الحلقة {q_label} ×4 بموديل {MODEL_LABELS.get(restore_model, restore_model)}...",
+                    accepts_progress_cb=True,
+                )
+                restored_videos[q_label] = Path(r_out)
 
         # مصدر الترجمة: سحب الترجمة الإنجليزية المدمجة، وإلا تفريغ صوتي بـ Whisper
         source_sub = None
@@ -1082,7 +1103,7 @@ def step1_process_for_preview(
                 str(primary_vid),
                 str(work_dir / "whisper.srt"),
                 model_size=whisper_model,
-                badge=f"STAGE 2/4 · WHISPER [{whisper_model}]",
+                badge=f"STAGE {3 if stage_total == 5 else 2}/{stage_total} · WHISPER [{whisper_model}]",
                 title="حلقة خام بدون ترجمة — تفريغ الصوت بـ Faster-Whisper مع طوابع الكلمات...",
                 accepts_progress_cb=False,
             )
@@ -1100,7 +1121,7 @@ def step1_process_for_preview(
                 api_key=api_key,
                 model_name=llm_model,
                 base_url=base_url,
-                badge="STAGE 2/4 · SERIES GLOSSARY",
+                badge=f"STAGE {3 if stage_total == 5 else 2}/{stage_total} · SERIES GLOSSARY",
                 title="تجهيز قاموس أسماء ومصطلحات الأنمي...",
                 accepts_progress_cb=False,
             )
@@ -1116,7 +1137,7 @@ def step1_process_for_preview(
             series_name=series_name,
             glossary=glossary,
             checkpoint_path=cp_file,
-            badge="STAGE 3/4 · CELESTIAL TRANSLATION",
+            badge=f"STAGE {4 if stage_total == 5 else 3}/{stage_total} · CELESTIAL TRANSLATION",
             title=f"ترجمة {len(entries)} سطر بأسلوب Celestial-Dragons عبر {llm_model}...",
             accepts_progress_cb=False,
         )
@@ -1131,7 +1152,7 @@ def step1_process_for_preview(
             api_key=api_key,
             model_name=llm_model,
             base_url=base_url,
-            badge="STAGE 3/4 · GLOSSARY LEARN",
+            badge=f"STAGE {4 if stage_total == 5 else 3}/{stage_total} · GLOSSARY LEARN",
             title="حفظ أسماء ومصطلحات الحلقة في قاموس الأنمي...",
             accepts_progress_cb=False,
         )
@@ -1146,7 +1167,8 @@ def step1_process_for_preview(
         has_credits = any(v.strip() for v in credits_dict.values())
 
         for q_label, vid_path in downloaded.items():
-            vw, vh, _, _ = probe_video_info(str(vid_path))
+            burn_vid = str(restored_videos.get(q_label, vid_path))
+            vw, vh, _, _ = probe_video_info(burn_vid)
             q_ass = str(ep_out_dir / f"{ep_folder_name}_{q_label}_AR.ass")
             write_responsive_ass(
                 entries=entries,
@@ -1166,7 +1188,7 @@ def step1_process_for_preview(
             out_mp4 = str(ep_out_dir / f"{ep_folder_name}_{q_label}_AR.mp4")
             yield from run_live(
                 burn_and_compress_native,
-                video_path=str(vid_path),
+                video_path=burn_vid,
                 ass_path=q_ass,
                 output_path=out_mp4,
                 fonts_dir=str(FONTS_DIR),
@@ -1179,13 +1201,13 @@ def step1_process_for_preview(
                 logo_position=logo_position,
                 logo_opacity=float(logo_opacity),
                 logo_scale=float(logo_scale),
-                badge=f"STAGE 4/4 · NVENC ENCODE [{q_label}]",
+                badge=f"STAGE {stage_total}/{stage_total} · NVENC ENCODE [{q_label}]",
                 title=f"حرق الترجمة وضغط جودة {q_label} بأعلى جودة وأقل حجم ({codec})...",
                 accepts_progress_cb=True,
             )
             yield from run_live(
                 qc_burned_episode,
-                str(vid_path), out_mp4,
+                burn_vid, out_mp4,
                 ass_path=q_ass,
                 expected_lines=len(translations),
                 qc_dir=str(ep_out_dir / "_qc" / q_label),
@@ -1986,6 +2008,126 @@ def step2_approve_and_upload(
         raise
 
 
+def step_restore_preview(
+    restore_model: str,
+    episode_name: str,
+    saved_raw_1080: str,
+    link_1080: str, file_1080: Optional[str],
+    link_720: str, file_720: Optional[str],
+    link_480: str, file_480: Optional[str],
+):
+    """معاينة الترميم: تحميل الحلقة (أو استخدام المحفوظ) ثم ترميم أول 10 ثوانٍ فقط وعرضها."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    def pack(hud_html: str, vid_val=gr.update()):
+        return (hud_html, "\n".join(logs[-150:]), vid_val)
+
+    def run_live(fn: Callable, *args, badge: str, title: str, mode: str = "cyan", **kwargs):
+        ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+        res_box: Dict[str, object] = {}
+        kwargs["log_cb"] = lambda m: ev_q.put(("log", m))
+        kwargs["progress_cb"] = lambda p, met, det: ev_q.put(("prog", (p, met, det)))
+
+        def _worker():
+            try:
+                res_box["val"] = fn(*args, **kwargs)
+            except BaseException as e:
+                res_box["err"] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        cur_pct, cur_met, cur_det = 0.0, "جاري البدء...", ""
+        dirty = True
+        last_yield = 0.0
+        while t.is_alive() or not ev_q.empty():
+            try:
+                items = [ev_q.get(timeout=0.25)]
+            except queue.Empty:
+                items = []
+            while not ev_q.empty():
+                try:
+                    items.append(ev_q.get_nowait())
+                except queue.Empty:
+                    break
+            for k, p in items:
+                dirty = True
+                if k == "prog":
+                    cur_pct, cur_met, cur_det = p  # type: ignore[misc]
+                else:
+                    push(str(p))
+            now_m = time.monotonic()
+            if dirty and (now_m - last_yield >= 0.35 or not t.is_alive()):
+                last_yield = now_m
+                dirty = False
+                yield pack(render_progress_hud(cur_pct, badge, title, cur_met, cur_det, mode=mode))
+        if "err" in res_box:
+            raise res_box["err"]  # type: ignore[misc]
+        return res_box.get("val")
+
+    try:
+        if not restore_model or restore_model == "off":
+            push("⚠️ اختر موديل ترميم من القائمة أولاً (Real-CUGAN أو v3) ثم اضغط معاينة.")
+            yield pack(
+                render_progress_hud(0.0, "تنبيه · الترميم مغلق", "اختر موديل الترميم أولاً ثم اضغط زر المعاينة", "—", "—", mode="error")
+            )
+            return
+        eff_1080 = saved_raw_1080 if (saved_raw_1080 and os.path.isfile(saved_raw_1080)) else file_1080
+        src = None
+        for lbl, lnk, fl in [("1080p", link_1080, eff_1080), ("720p", link_720, file_720), ("480p", link_480, file_480)]:
+            if (lnk and str(lnk).strip()) or fl:
+                src = (lbl, lnk, fl)
+                break
+        if src is None:
+            push("⚠️ أدخل رابط الحلقة أو اختر حلقة محفوظة على السيرفر قبل معاينة الترميم.")
+            yield pack(
+                render_progress_hud(0.0, "تنبيه · لا يوجد مصدر", "أدخل رابط أو اختر حلقة محفوظة", "—", "—", mode="error")
+            )
+            return
+        lbl, lnk, fl = src
+        auto_base = episode_name.strip() or (Path(fl).stem if fl else "episode")
+        ep_folder_name = _safe_name(auto_base)
+        cdir = _raw_cache_dir_for_source(lbl, lnk, fl, ep_folder_name)
+        vid_path = yield from run_live(
+            download_torrent_or_url,
+            lnk, fl, str(cdir),
+            badge=f"PREVIEW · DOWNLOAD [{lbl}]",
+            title=f"تحميل / فحص الحلقة الخام بجودة {lbl} لمعاينة الترميم",
+        )
+        out_prev = str(STORAGE_ROOT / f"restore_preview_{restore_model}_{ep_folder_name or 'episode'}.mp4")
+        yield from run_live(
+            restore_video,
+            str(vid_path), out_prev,
+            model_key=restore_model,
+            max_seconds=10.0,
+            crf=18,
+            badge="PREVIEW · AI RESTORE ×4",
+            title=f"معاينة الترميم: أول 10 ثوانٍ بموديل {MODEL_LABELS.get(restore_model, restore_model)}",
+        )
+        push("✅ معاينة الترميم جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم الحلقة كاملة.")
+        yield pack(
+            render_progress_hud(
+                100.0,
+                "PREVIEW READY",
+                "معاينة الترميم جاهزة (10 ثوانٍ)",
+                MODEL_LABELS.get(restore_model, restore_model),
+                out_prev,
+                mode="done",
+            ),
+            vid_val=out_prev,
+        )
+    except Exception as exc:
+        push(f"❌ خطأ أثناء معاينة الترميم: {exc}\n{traceback.format_exc()[-1000:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
+        yield pack(
+            render_progress_hud(0.0, "ERROR · RESTORE PREVIEW", f"توقف: {str(exc)[:110]}", "راجع سجل العمليات", "—", mode="error")
+        )
+
+
 def _build_blocks_kwargs() -> Dict:
     sig = inspect.signature(gr.Blocks.__init__).parameters
     kwargs: Dict = {"title": "سَبّر الأنمي | Anime Subber"}
@@ -2051,6 +2193,23 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
                             file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
+
+                    with gr.Accordion("🧪 ترميم ×4 بالذكاء الاصطناعي (اختياري — للأنمي القديم منخفض الجودة)", open=True, elem_classes=["sb-accordion"]):
+                        restore_model = gr.Dropdown(
+                            choices=[
+                                ("بدون ترميم — الحلقة تكمل عادي", "off"),
+                                ("Real-CUGAN ×4 — أعلى جودة (موصى به للأنمي القديم)", "cugan"),
+                                ("realesr-animevideov3 ×4 — الخيار السريع", "v3"),
+                            ],
+                            value="off",
+                            label="موديل الترميم — يُحمَّل تلقائياً أول مرة فقط ويُحفظ في /workspace/models",
+                        )
+                        restore_preview_btn = gr.Button(
+                            "👁️ معاينة الترميم — أول 10 ثوانٍ فقط من الحلقة",
+                            size="sm",
+                            elem_id="sb-restore-preview-btn",
+                        )
+                        restore_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ — احكم على الجودة والثبات قبل الترميم الكامل)")
 
                     with gr.Accordion("📚 وضع المواسم الكاملة — روابط دفعات (الرابط الواحد ممكن يحتوي موسماً أو أكثر)", open=False, elem_classes=["sb-accordion"]):
                         batch_links = gr.Textbox(
@@ -2222,12 +2381,24 @@ def build_ui() -> gr.Blocks:
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
                 logo_position, logo_opacity, logo_scale,
+                restore_model,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
                 out_video_files, out_ass_file, job_state,
                 step1_group, step2_group, downloads_group, links_box,
             ],
+        )
+
+        restore_preview_btn.click(
+            fn=step_restore_preview,
+            inputs=[
+                restore_model, episode_name, saved_raw_1080,
+                link_1080, file_1080,
+                link_720, file_720,
+                link_480, file_480,
+            ],
+            outputs=[progress_hud, log_box, restore_preview_video],
         )
 
         batch_btn.click(
