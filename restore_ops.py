@@ -298,6 +298,8 @@ def restore_video(
         + ((f" · معاينة {eff_seconds:g} ثانية" + (f" من منتصف الحلقة (تبدأ ~{int(start_at // 60)}:{int(start_at % 60):02d})" if start_at > 0 else " من البداية")) if eff_seconds else f" · {est_frames} فريم تقريباً")
     )
 
+    if w >= 1920 or h >= 1080:
+        log("💡 تنبيه: المصدر 1080p أو أعلى (غالباً نسخة BD نظيفة) — الترميم بيكلف وقت كبير جداً هنا ومكسبه على الصورة محدود. لو هدفك ترجمة + حرق + ضغط فقط، الأوفر ليك إلغاء الترميم لهذا المصدر.")
     weights = ensure_restore_model(model_key, log, scale)
     model = _load_model(model_key, weights, device, dtype, log, scale)
 
