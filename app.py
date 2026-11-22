@@ -6,6 +6,8 @@ import os
 import queue
 import re
 import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -16,6 +18,7 @@ import gradio as gr
 
 from media_ops import (
     VIDEO_EXTENSIONS,
+    _has_nvenc,
     burn_and_compress_native,
     qc_burned_episode,
     collect_episode_videos,
@@ -2254,13 +2257,13 @@ def rtab_load(links_txt: str):
         eps = sorted(uniq.values(), key=episode_sort_key)
         if not eps:
             raise FileNotFoundError("لم يتم العثور على أي حلقة في المصادر المدخلة.")
-        push(f"📚 إجمالي الحلقات الجاهزة للترميم: {len(eps)} حلقة — اختر أي حلقة للمعاينة أو اضغط ترميم الكل.")
+        push(f"📚 إجمالي الحلقات الجاهزة: {len(eps)} حلقة — الكل محدد افتراضياً، عدّل الاختيار كما تريد.")
         for pos, vp in enumerate(eps, 1):
             push(f"   {pos:03d}. {vp.name}")
         names = [p.name for p in eps]
         yield pack(
-            render_progress_hud(100.0, "READY", f"{len(eps)} حلقة جاهزة للترميم", "اختر حلقة للمعاينة أو ابدأ ترميم الكل", "", mode="done"),
-            dd=gr.update(choices=names, value=names[0]),
+            render_progress_hud(100.0, "READY", f"{len(eps)} حلقة جاهزة للترميم", "اختر الحلقات (الكل محدد) ثم معاينة أو ترميم", "", mode="done"),
+            dd=gr.update(choices=names, value=names),
             st=[str(p) for p in eps],
         )
     except Exception as exc:
@@ -2268,8 +2271,85 @@ def rtab_load(links_txt: str):
         yield pack(render_progress_hud(0.0, "ERROR · LOAD", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
 
 
-def rtab_preview(model: str, ep_name: str, eps_state: List[str]):
-    """تبويب الترميم: معاينة 10 ثوانٍ للحلقة المختارة."""
+def _rtab_selected(sel_names, eps_state: List[str]) -> List[Path]:
+    """يحوّل أسماء الحلقات المختارة في القائمة إلى مسارات من الحالة المحفوظة."""
+    names = sel_names or []
+    if isinstance(names, str):
+        names = [names]
+    picked = [Path(p) for p in (eps_state or []) if Path(p).name in set(names)]
+    return sorted(picked, key=episode_sort_key)
+
+
+def _compress_video_file(src_path: str, dst_path: str, codec: str, cq: int,
+                         log_cb: Optional[Callable[[str], None]] = None,
+                         progress_cb: Optional[Callable] = None) -> str:
+    """ضغط ملف مرمَّم ×4 إلى نسخة نهائية صغيرة مع تقدم لحظي؛ الصوت يُنسخ كما هو.
+    لو محرك كرت الشاشة فشل أثناء التشغيل (كرت غير موجود/مشغّل ناقص) يكمل تلقائياً على x265."""
+    def log(m: str) -> None:
+        if log_cb:
+            log_cb(m)
+
+    _, _, _, total_dur = probe_video_info(src_path)
+    os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
+    chain = [codec]
+    if codec == "hevc_nvenc":
+        chain.append("libx265")
+    attempts: List[str] = []
+    last_err = ""
+    for eng in chain:
+        if eng == "hevc_nvenc" and not _has_nvenc("hevc_nvenc"):
+            log("⚠️ نسخة ffmpeg بلا hevc_nvenc — تخطيه والتحويل إلى x265 على المعالج.")
+            continue
+        if eng == "libx265":
+            v_args = ["-c:v", "libx265", "-preset", "medium", "-crf", str(cq), "-pix_fmt", "yuv420p",
+                      "-x265-params", "aq-mode=3", "-tag:v", "hvc1"]
+        else:
+            v_args = ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(cq), "-b:v", "0",
+                      "-spatial-aq", "1", "-temporal-aq", "1", "-pix_fmt", "yuv420p",
+                      "-multipass", "fullres", "-bf", "3", "-tag:v", "hvc1"]
+        attempts.append(eng)
+        err_path = os.path.join(tempfile.gettempdir(), f"rtab_compress_{os.getpid()}.log")
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-i", src_path, *v_args, "-c:a", "copy",
+               "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", dst_path]
+        log(f"⚙️ بدء الضغط بمحرك {eng} بجودة CQ {cq}: {os.path.basename(src_path)}")
+        with open(err_path, "w", encoding="utf-8", errors="replace") as err_f:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f, text=True, bufsize=1)
+            assert proc.stdout is not None
+            cur_sec, cur_speed = 0.0, ""
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if line.startswith(("out_time_us=", "out_time_ms=")) and total_dur > 0:
+                    try:
+                        cur_sec = int(line.split("=", 1)[1]) / 1_000_000.0
+                    except ValueError:
+                        continue
+                    if progress_cb:
+                        pct = min(99.0, cur_sec / total_dur * 100.0)
+                        progress_cb(pct, f"{pct:.1f}% · {cur_speed}".strip(" ·"), f"{cur_sec:.0f}s / {total_dur:.0f}s")
+                elif line.startswith("speed="):
+                    cur_speed = line.split("=", 1)[1].strip()
+            rc = proc.wait()
+        if rc == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 100 * 1024:
+            if progress_cb:
+                progress_cb(100.0, "100% · اكتمل", "")
+            return dst_path
+        try:
+            last_err = open(err_path, encoding="utf-8", errors="replace").read()[-400:]
+        except OSError:
+            last_err = ""
+        log(f"⚠️ فشل محرك {eng} (rc={rc}).")
+        if os.path.exists(dst_path):
+            try:
+                os.unlink(dst_path)
+            except OSError:
+                pass
+        if eng != chain[-1]:
+            log("↩️ تجربة المحرك البديل تلقائياً...")
+    raise RuntimeError(f"فشل ضغط {os.path.basename(src_path)} بعد {' ← '.join(attempts or ['لا محرك'])}: {last_err[-200:]}")
+
+
+def rtab_preview(model: str, ep_names, eps_state: List[str]):
+    """تبويب الترميم: معاينة 10 ثوانٍ لأول حلقة مختارة."""
     logs: List[str] = []
 
     def push(msg: str) -> None:
@@ -2282,12 +2362,14 @@ def rtab_preview(model: str, ep_name: str, eps_state: List[str]):
         return (hud_html, "\n".join(logs[-150:]), vid_val)
 
     try:
-        match = next((p for p in (eps_state or []) if Path(p).name == ep_name), "")
-        if not match:
-            push("⚠️ اختر حلقة من القائمة أولاً (حمّل المصادر بزر التحميل لو القائمة فاضية).")
-            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد حلقة", "حمّل المصادر واختر حلقة أولاً", "—", "—", mode="error"))
+        picked = _rtab_selected(ep_names, eps_state)
+        if not picked:
+            push("⚠️ اختر حلقة واحدة على الأقل من القائمة أولاً (المعاينة تعمل على أول حلقة مختارة).")
+            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد حلقة", "اختر حلقة من القائمة أولاً", "—", "—", mode="error"))
             return
-        ep = Path(match)
+        ep = picked[0]
+        if len(picked) > 1:
+            push(f"ℹ️ المختار {len(picked)} حلقة — المعاينة على الأولى فقط: {ep.name}")
         out_prev = str(STORAGE_ROOT / f"restore_preview_{model}_{_safe_name(ep.stem)}.mp4")
         yield from _live_gen(
             restore_video, push, pack,
@@ -2296,7 +2378,7 @@ def rtab_preview(model: str, ep_name: str, eps_state: List[str]):
             badge="PREVIEW · AI RESTORE ×4",
             title=f"معاينة الترميم: أول 10 ثوانٍ من {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)}",
         )
-        push("✅ المعاينة جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم الكل.")
+        push("✅ المعاينة جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم المجموعة.")
         yield pack(
             render_progress_hud(100.0, "PREVIEW READY", "معاينة الترميم جاهزة (10 ثوانٍ)", MODEL_LABELS.get(model, model), out_prev, mode="done"),
             vid_val=out_prev,
@@ -2306,9 +2388,8 @@ def rtab_preview(model: str, ep_name: str, eps_state: List[str]):
         yield pack(render_progress_hud(0.0, "ERROR · PREVIEW", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
 
 
-def rtab_run(model: str, eps_state: List[str]):
-    """تبويب الترميم: ترميم كل الحلقات؛ الأصلية تُمسح بعد نجاح كل حلقة (كاش الأداة فقط)،
-    والمرمَّمة تظهر تلقائياً في قائمة «اختر حلقة خام محفوظة» في تبويب الترجمة."""
+def rtab_run(model: str, sel_names, eps_state: List[str]):
+    """تبويب الترميم: ترميم الحلقات المختارة فقط؛ الأصلية تُمسح بعد نجاح كل حلقة (كاش الأداة فقط)."""
     logs: List[str] = []
 
     def push(msg: str) -> None:
@@ -2321,17 +2402,18 @@ def rtab_run(model: str, eps_state: List[str]):
         return (hud_html, "\n".join(logs[-150:]), raw_dd)
 
     try:
-        if not eps_state:
-            push("⚠️ حمّل المصادر أولاً بزر «تحميل / فحص الحلقات».")
-            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد حلقات", "حمّل المصادر أولاً", "—", "—", mode="error"))
+        picked = _rtab_selected(sel_names, eps_state)
+        if not picked:
+            push("⚠️ حمّل المصادر واختر حلقة واحدة على الأقل أولاً.")
+            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد حلقات", "اختر الحلقات أولاً", "—", "—", mode="error"))
             return
         restored_dir = RAW_CACHE_ROOT / "restored"
         restored_dir.mkdir(parents=True, exist_ok=True)
-        total = len(eps_state)
+        total = len(picked)
         done_n = 0
         failed: List[str] = []
-        for i, ep_str in enumerate(eps_state, 1):
-            ep = Path(ep_str)
+        push(f"🚀 بدء ترميم {total} حلقة مختارة بموديل {MODEL_LABELS.get(model, model)}.")
+        for i, ep in enumerate(picked, 1):
             out = restored_dir / f"{ep.stem}_x4.mp4"
             if out.exists() and out.stat().st_size > 1024 * 1024:
                 push(f"⏭️ [{i}/{total}] {ep.name} مترممة مسبقاً — تخطي ({out.name})")
@@ -2360,7 +2442,7 @@ def rtab_run(model: str, eps_state: List[str]):
                 push(f"❌ فشل ترميم {ep.name}: {exc} — الأصلي محفوظ كما هو، والحلقة اللي بعدها هتكمل عادي.")
         if failed:
             push(f"⚠️ خلص الترميم مع {len(failed)} حلقة فاشلة: {'، '.join(failed[:5])}")
-        push(f"✅ اكتمل الترميم: {done_n} من {total} حلقة. المرمَّمة ظاهرة الآن في قائمة «اختر حلقة خام محفوظة» في تبويب الترجمة.")
+        push(f"✅ اكتمل الترميم: {done_n} من {total} حلقة. الخطوة التالية: اضغط المرمَّمة بزر الضغط ثم احكم قبول/رفض.")
         yield pack(
             render_progress_hud(
                 100.0,
@@ -2374,7 +2456,157 @@ def rtab_run(model: str, eps_state: List[str]):
         )
     except Exception as exc:
         push(f"❌ خطأ أثناء ترميم الدفعة: {exc}\n{traceback.format_exc()[-1000:]}")
-        yield pack(render_progress_hud(0.0, "ERROR · RESTORE ALL", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
+        yield pack(render_progress_hud(0.0, "ERROR · RESTORE", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
+
+
+def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
+    """تبويب الترميم: ضغط مرمَّمات الحلقات المختارة إلى ملفات نهائية صغيرة في كاش compressed."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    def pack(hud_html: str, raw_dd=gr.update()):
+        return (hud_html, "\n".join(logs[-150:]), raw_dd)
+
+    try:
+        picked = _rtab_selected(sel_names, eps_state)
+        if not picked:
+            push("⚠️ اختر حلقة واحدة على الأقل أولاً.")
+            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد حلقات", "اختر الحلقات أولاً", "—", "—", mode="error"))
+            return
+        restored_dir = RAW_CACHE_ROOT / "restored"
+        comp_dir = RAW_CACHE_ROOT / "compressed"
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        total = len(picked)
+        done_n = 0
+        skipped: List[str] = []
+        failed: List[str] = []
+        for i, ep in enumerate(picked, 1):
+            master = restored_dir / f"{ep.stem}_x4.mp4"
+            out = comp_dir / f"{ep.stem}_x4_comp.mp4"
+            if not master.exists() or master.stat().st_size < 1024 * 1024:
+                skipped.append(ep.name)
+                push(f"⏭️ [{i}/{total}] {ep.name} لا توجد لها نسخة مرمَّمة بعد — رمّمها أولاً.")
+                continue
+            if out.exists() and out.stat().st_size > 100 * 1024:
+                push(f"⏭️ [{i}/{total}] {ep.name} مضغوطة مسبقاً — تخطي ({out.name}). لو عايز تعيد الضغط بإعدادات مختلفة اضغط «مش عاجبني» الأول.")
+                done_n += 1
+                continue
+            push(f"━━━━━━ ضغط [{i}/{total}] {ep.name} ━━━━━━")
+            try:
+                yield from _live_gen(
+                    _compress_video_file, push, pack,
+                    str(master), str(out), codec, int(cq),
+                    badge=f"COMPRESS [{i}/{total}]",
+                    title=f"ضغط حلقة {i} من {total} ({'كرت الشاشة HEVC' if codec == 'hevc_nvenc' else 'x265 معالج'} · CQ {int(cq)})",
+                )
+                done_n += 1
+                src_mb = master.stat().st_size / 1e6
+                out_mb = out.stat().st_size / 1e6
+                push(f"📦 {out.name}: {src_mb:.0f}MB → {out_mb:.0f}MB")
+            except Exception as exc:
+                failed.append(ep.name)
+                push(f"❌ فشل ضغط {ep.name}: {exc}")
+        if skipped:
+            push(f"ℹ️ تخطّينا {len(skipped)} حلقة غير مترممة: {'، '.join(skipped[:5])}")
+        if failed:
+            push(f"⚠️ فشل ضغط {len(failed)} حلقة: {'، '.join(failed[:5])}")
+        push(f"✅ اكتمل الضغط: {done_n} من {total} حلقة. شاهد المضغوطة واحكم: «عاجبني» يمسح المرمَّمة ويبقي المضغوطة، «مش عاجبني» يمسح المضغوطة ويبقي المرمَّمة لإعادة الضغط بإعدادات أخرى.")
+        yield pack(
+            render_progress_hud(
+                100.0,
+                "COMPRESS COMPLETE · 100%" if not failed else "COMPRESS DONE · مع فاشلات",
+                f"اكتمل الضغط: {done_n}/{total} حلقة" + (f" · فشل {len(failed)}" if failed else ""),
+                f"{'hevc_nvenc' if codec == 'hevc_nvenc' else 'libx265'} · CQ {int(cq)}",
+                str(comp_dir),
+                mode="done" if not failed else "error",
+            ),
+            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+        )
+    except Exception as exc:
+        push(f"❌ خطأ أثناء الضغط: {exc}\n{traceback.format_exc()[-1000:]}")
+        yield pack(render_progress_hud(0.0, "ERROR · COMPRESS", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
+
+
+def rtab_accept(sel_names, eps_state: List[str]):
+    """قبول النتيجة: إبقاء المضغوطة ومسح المرمَّمة ×4 الضخمة لتفريغ المساحة."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    picked = _rtab_selected(sel_names, eps_state)
+    if not picked:
+        push("⚠️ اختر الحلقات المقبولة أولاً.")
+        return (render_progress_hud(0.0, "تنبيه", "اختر الحلقات أولاً", "—", "—", mode="error"), "\n".join(logs[-150:]), gr.update())
+    restored_dir = RAW_CACHE_ROOT / "restored"
+    comp_dir = RAW_CACHE_ROOT / "compressed"
+    freed = 0.0
+    kept = 0
+    for ep in picked:
+        master = restored_dir / f"{ep.stem}_x4.mp4"
+        comp = comp_dir / f"{ep.stem}_x4_comp.mp4"
+        if not master.exists():
+            push(f"⏭️ {ep.name}: لا توجد نسخة مرمَّمة أصلاً — لا شيء للمسح.")
+            continue
+        if not comp.exists() or comp.stat().st_size < 100 * 1024:
+            push(f"🛑 {ep.name}: لا توجد نسخة مضغوطة — رفضت مسح المرمَّم حمايةً له. اضغطها أولاً.")
+            continue
+        try:
+            freed += master.stat().st_size / 1e6
+            master.unlink()
+            kept += 1
+            push(f"✅ {ep.name}: المضغوطة محفوظة ({comp.name}) ومسحنا المرمَّم الضخم.")
+        except Exception as de:
+            push(f"⚠️ تعذر مسح المرمَّم {master.name}: {de}")
+    push(f"🏁 القبول اكتمل: {kept} حلقة مضغوطة محفوظة، مساحة مفرَّغة ≈ {freed:.0f}MB. المضغوطة ظاهرة الآن في قائمة «اختر حلقة خام محفوظة» في تبويب الترجمة.")
+    return (
+        render_progress_hud(100.0, "ACCEPTED", f"{kept} حلقة مقبولة — المضغوطة محفوظة والمرمَّمة ممسوحة", f"{freed:.0f}MB مفرَّغة", str(comp_dir), mode="done"),
+        "\n".join(logs[-150:]),
+        gr.update(choices=[""] + list_cached_raw_videos()),
+    )
+
+
+def rtab_reject(sel_names, eps_state: List[str]):
+    """رفض النتيجة: مسح المضغوطة فقط وإبقاء المرمَّمة ×4 لإعادة الضغط بإعدادات مختلفة."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    picked = _rtab_selected(sel_names, eps_state)
+    if not picked:
+        push("⚠️ اختر الحلقات المرفوضة أولاً.")
+        return (render_progress_hud(0.0, "تنبيه", "اختر الحلقات أولاً", "—", "—", mode="error"), "\n".join(logs[-150:]), gr.update())
+    comp_dir = RAW_CACHE_ROOT / "compressed"
+    removed = 0
+    for ep in picked:
+        comp = comp_dir / f"{ep.stem}_x4_comp.mp4"
+        if not comp.exists():
+            push(f"⏭️ {ep.name}: لا توجد نسخة مضغوطة — المرمَّم محفوظ كما هو.")
+            continue
+        try:
+            comp.unlink()
+            removed += 1
+            push(f"🗑️ {ep.name}: مسحنا المضغوطة، والمرمَّم ×4 محفوظ — غيّر الكوديك أو CQ واضغط تاني.")
+        except Exception as de:
+            push(f"⚠️ تعذر مسح {comp.name}: {de}")
+    push(f"🏁 الرفض اكتمل: {removed} ملف مضغوط ممسوح. المرمَّمة كلها محفوظة وجاهزة لضغط جديد.")
+    return (
+        render_progress_hud(100.0, "REJECTED", f"{removed} ملف مضغوط ممسوح — المرمَّمة محفوظة", "غيّر الإعدادات واضغط تاني", "", mode="done"),
+        "\n".join(logs[-150:]),
+        gr.update(choices=[""] + list_cached_raw_videos()),
+    )
 
 
 def _build_blocks_kwargs() -> Dict:
@@ -2595,7 +2827,7 @@ def build_ui() -> gr.Blocks:
                             out_ass_file = gr.File(label="📝 تحميل ملف الترجمة المنسّق (.ass)")
 
             with gr.TabItem("🧪 الترميم ×4"):
-                gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">🧪 ترميم ×4: حمّل موسم أو مجلد محلي، جرّب معاينة 10 ثوانٍ على أي حلقة، ثم ترميم الكل — الأصلية تُمسح تلقائياً بعد نجاح كل حلقة والمرمَّمة تظهر في تبويب الترجمة</div>')
+                gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">🧪 ترميم ×4: حمّل المصادر → اختر أي عدد حلقات → معاينة 10 ثوانٍ → ترميم → ضغط → احكم: قبول يمسح المرمَّم ويبقي المضغوط، رفض يمسح المضغوط ويبقي المرمَّم لإعادة الضغط</div>')
                 rtab_links = gr.Textbox(
                     label="روابط التورنت / الماجنت أو مسارات ملفات/مجلدات محلية — واحد في كل سطر",
                     placeholder="magnet:?xt=urn:btih:...\n/workspace/my_old_anime/",
@@ -2611,10 +2843,24 @@ def build_ui() -> gr.Blocks:
                         label="موديل الترميم",
                     )
                     rtab_load_btn = gr.Button("⬇️ تحميل / فحص الحلقات", variant="primary", scale=1)
-                rtab_eps = gr.Dropdown(choices=[], label="الحلقات الجاهزة — اختر حلقة للمعاينة", interactive=True)
-                rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ للحلقة المختارة", size="sm")
+                rtab_eps = gr.Dropdown(choices=[], multiselect=True, label="الحلقات — اختر أي عدد (الكل محدد افتراضياً)", interactive=True)
+                rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ لأول حلقة مختارة", size="sm")
                 rtab_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ)")
-                rtab_run_btn = gr.Button("🚀 ترميم كل الحلقات ×4 — الأصلية تُمسح بعد نجاح كل حلقة [RESTORE ALL]", variant="primary", size="lg")
+                rtab_run_btn = gr.Button("🚀 ترميم الحلقات المختارة ×4 — الأصلية تُمسح بعد نجاح كل حلقة [RESTORE]", variant="primary", size="lg")
+                with gr.Row():
+                    rtab_codec = gr.Dropdown(
+                        choices=[
+                            ("HEVC كرت الشاشة (hevc_nvenc · سريع · موصى به)", "hevc_nvenc"),
+                            ("x265 معالج · أصغر حجم (أبطأ)", "libx265"),
+                        ],
+                        value="hevc_nvenc",
+                        label="كوديك الضغط النهائي",
+                    )
+                    rtab_cq = gr.Slider(minimum=18, maximum=30, step=1, value=24, label="الجودة CQ")
+                rtab_compress_btn = gr.Button("🗜️ ضغط المرمَّمة المختارة إلى ملفات نهائية صغيرة [COMPRESS]", variant="primary")
+                with gr.Row():
+                    rtab_accept_btn = gr.Button("✅ عاجبني — إبقاء المضغوطة ومسح المرمَّمة", variant="primary")
+                    rtab_reject_btn = gr.Button("↩️ مش عاجبني — مسح المضغوطة وإبقاء المرمَّمة", variant="stop")
                 rtab_hud = gr.HTML(value=render_progress_hud())
                 rtab_log = gr.Textbox(label="📋 سجل الترميم [RESTORE LOG]", lines=12, max_lines=18, interactive=False)
                 rtab_state = gr.State([])
@@ -2631,7 +2877,22 @@ def build_ui() -> gr.Blocks:
         )
         rtab_run_btn.click(
             fn=rtab_run,
-            inputs=[rtab_model, rtab_state],
+            inputs=[rtab_model, rtab_eps, rtab_state],
+            outputs=[rtab_hud, rtab_log, saved_raw_1080],
+        )
+        rtab_compress_btn.click(
+            fn=rtab_compress,
+            inputs=[rtab_codec, rtab_cq, rtab_eps, rtab_state],
+            outputs=[rtab_hud, rtab_log, saved_raw_1080],
+        )
+        rtab_accept_btn.click(
+            fn=rtab_accept,
+            inputs=[rtab_eps, rtab_state],
+            outputs=[rtab_hud, rtab_log, saved_raw_1080],
+        )
+        rtab_reject_btn.click(
+            fn=rtab_reject,
+            inputs=[rtab_eps, rtab_state],
             outputs=[rtab_hud, rtab_log, saved_raw_1080],
         )
 
