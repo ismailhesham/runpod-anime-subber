@@ -866,7 +866,8 @@ def _split_long_arabic_line(t: str, max_len: int = _MAX_LINE_CHARS) -> List[str]
     return segs
 
 
-def _fix_segment_punctuation(seg: str, lead_hint: Optional[bool], trail_hint: Optional[bool]) -> str:
+def _fix_segment_punctuation(seg: str, lead_hint: Optional[bool], trail_hint: Optional[bool],
+                             src_shout: bool = False, soften: bool = True) -> str:
     """Celestial punctuation for ONE visual line: trailing !/، to the logical start, ؟ stays at
     the end, and edge-ellipsis placement. Verified libass behavior (line treated as LTR-base):
       "...نص" بدون علامات  ← النقاط تظهر يساراً (نهاية السطر)   [أسلوب Celestial للكلام المبتور]
@@ -879,14 +880,32 @@ def _fix_segment_punctuation(seg: str, lead_hint: Optional[bool], trail_hint: Op
     if not t:
         return t
     t = t.replace("?", "؟")
+    t = re.sub(r"([؟!])\.+$", r"\1", t)  # "؟." / "!." الزائدة → "؟" / "!"
+    if soften:
+        # حذف "!" بعد التعجبات اللفظية الخالصة في بداية المقطع (أوه/آه) — طلبه بالاسم
+        t = re.sub(r"^(\s*(?:أوه+|اوه+|آ+ه+|أ+ه+))!(?=\s|$)", r"\1", t)
     if re.search(r"(?:!\s*؟|؟\s*!)$", t):
         t = re.sub(r"(?:!\s*؟|؟\s*!)$", "؟", t).strip()
         if not t.startswith("!"):
             t = f"!{t}"
-    elif t.endswith("!") and not t.startswith("!"):
-        t = f"!{t.rstrip('! ').strip()}"
-    elif t.endswith("،") and not t.startswith("،"):
-        t = f"،{t.rstrip('، ').strip()}"
+    else:
+        m_bang = re.search(r"!+$", t)
+        if m_bang and not t.startswith("!"):
+            run = m_bang.group(0)
+            core_b = t[: m_bang.start()].rstrip()
+            if soften and len(run) == 1 and not src_shout:
+                t = f"{core_b}."  # تعجب خبري → نقطة (تُنقل للبداية المنطقية في قاعدة النقطة بالأسفل)
+            else:
+                t = f"{run}{core_b}"  # صياح حقيقي (!! أو مصدر ALL-CAPS) يحتفظ بالعلامة
+        elif t.endswith("،") and not t.startswith("،"):
+            t = f"،{t.rstrip('، ').strip()}"
+
+    # نقطة/فاصلة نهاية السطر: علامات ضعيفة في سطر LTR-Base فتظهر يميناً (بداية الجملة) —
+    # تُنقل للبداية المنطقية فتظهر يساراً في نهايتها الصحيحة (مثبت برندر libass على سطره بالظبط)
+    if re.search(r"(?<!\.)\.$", t) and not t.startswith("."):
+        t = "." + t[:-1].rstrip()
+    elif t.endswith(",") and not t.startswith("،"):
+        t = f"،{t.rstrip(', ').strip()}"
 
     RLM = "\u200f"
     t = re.sub(r"^\s*\.{2,}\s*", "...", t)
@@ -916,7 +935,8 @@ def _fix_segment_punctuation(seg: str, lead_hint: Optional[bool], trail_hint: Op
 
 
 def _enforce_celestial_punctuation(
-    text: str, style_name: str, source_text: str = "", wrap: bool = True, as_segments: bool = False
+    text: str, style_name: str, source_text: str = "", wrap: bool = True, as_segments: bool = False,
+    soften: bool = True,
 ):
     """Deterministic post-processor enforcing Celestial-Dragons non-RLE libass punctuation & grammar.
     wrap=True يلف الأسطر الطويلة إلى سطرين مرئيين؛ as_segments=True يرجع قائمة المقاطع بدل نص واحد
@@ -951,13 +971,19 @@ def _enforce_celestial_punctuation(
             segs[0] = segs[0][m.end():]
             segs[-1] = segs[-1].rstrip() + "..."
 
+    # دليل الصياح من المصدر: تعجب مكرر أو كلمة ALL-CAPS — يخص المقطع الأخير فقط
+    src_shout = bool(re.search(r"!{2,}\s*$", src)) or bool(
+        re.search(r"(?:^|\s)[A-Z]{3,}(?=[!?.,\s]|$)", src)
+    )
     any_hints = src_lead or src_trail
     out: List[str] = []
     last_i = len(segs) - 1
     for i, seg in enumerate(segs):
         lead_hint: Optional[bool] = (src_lead if i == 0 else False) if any_hints else None
         trail_hint: Optional[bool] = (src_trail if i == last_i else False) if any_hints else None
-        out.append(_fix_segment_punctuation(seg, lead_hint, trail_hint))
+        out.append(_fix_segment_punctuation(
+            seg, lead_hint, trail_hint, src_shout=(src_shout and i == last_i), soften=soften
+        ))
     return out if as_segments else "\\N".join(out)
 
 
@@ -1162,6 +1188,7 @@ def write_responsive_ass(
     approved_visual_signs: Optional[List[Dict]] = None,
     credits: Optional[Dict[str, str]] = None,
     wrap_mode: str = "sequential",
+    soften_exclaim: bool = True,
 ) -> str:
     prof = ensure_style_profile()
     geom = prof["responsive_geometry"]
@@ -1210,14 +1237,15 @@ def write_responsive_ass(
             and (entry.end_ms - entry.start_ms) >= 1700
         ):
             _cand = _enforce_celestial_punctuation(
-                raw_final, entry.target_style, source_text=entry.plain_text, as_segments=True
+                raw_final, entry.target_style, source_text=entry.plain_text, as_segments=True,
+                soften=soften_exclaim,
             )
             if len(_cand) >= 2:
                 seq_segs = _cand
         if seq_segs is None:
             final_text = _enforce_celestial_punctuation(
                 raw_final, entry.target_style, source_text=entry.plain_text,
-                wrap=(wrap_mode == "stacked"),
+                wrap=(wrap_mode == "stacked"), soften=soften_exclaim,
             )
         else:
             final_text = ""
