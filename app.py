@@ -1457,14 +1457,21 @@ def step_batch_process(
         # ═══ المرحلة 1: تحميل كل الروابط وجمع كل الحلقات ═══
         all_eps: List[Path] = []
         for idx, lnk in enumerate(links, 1):
-            cdir = _raw_cache_dir_for_source("season", lnk, None, f"{series_safe}_{idx}")
-            vids = yield from run_live(
-                download_season_batch,
-                lnk, None, str(cdir),
-                badge=f"SEASON DOWNLOAD [{idx}/{len(links)}]",
-                title=f"تحميل / فحص الدفعة رقم {idx} من {len(links)} (ممكن تحتوي موسماً كاملاً)",
-                accepts_progress_cb=True,
-            )
+            if os.path.isdir(lnk):
+                vids = collect_episode_videos(lnk)
+                push(f"📂 مجلد محلي [{idx}]: {lnk} — {len(vids)} ملف فيديو.")
+            elif os.path.isfile(lnk) and Path(lnk).suffix.lower() in VIDEO_EXTENSIONS:
+                vids = [Path(lnk)]
+                push(f"📄 ملف محلي [{idx}]: {Path(lnk).name}")
+            else:
+                cdir = _raw_cache_dir_for_source("season", lnk, None, f"{series_safe}_{idx}")
+                vids = yield from run_live(
+                    download_season_batch,
+                    lnk, None, str(cdir),
+                    badge=f"SEASON DOWNLOAD [{idx}/{len(links)}]",
+                    title=f"تحميل / فحص الدفعة رقم {idx} من {len(links)} (ممكن تحتوي موسماً كاملاً)",
+                    accepts_progress_cb=True,
+                )
             all_eps.extend(vids)
 
         unique = {str(p.resolve()): p for p in all_eps}
@@ -2163,6 +2170,213 @@ def step_restore_preview(
         )
 
 
+def _live_gen(fn: Callable, push: Callable[[str], None], pack: Callable, *args, badge: str, title: str, mode: str = "cyan", **kwargs):
+    """تشغيل دالة ثقيلة في خيط مع تقدم لحظي — يولّد pack(hud) ويعيد ناتج الدالة."""
+    ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+    res_box: Dict[str, object] = {}
+    kwargs["log_cb"] = lambda m: ev_q.put(("log", m))
+    kwargs["progress_cb"] = lambda p, met, det: ev_q.put(("prog", (p, met, det)))
+
+    def _worker():
+        try:
+            res_box["val"] = fn(*args, **kwargs)
+        except BaseException as e:
+            res_box["err"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    cur_pct, cur_met, cur_det = 0.0, "جاري البدء...", ""
+    dirty = True
+    last_yield = 0.0
+    while t.is_alive() or not ev_q.empty():
+        try:
+            items = [ev_q.get(timeout=0.25)]
+        except queue.Empty:
+            items = []
+        while not ev_q.empty():
+            try:
+                items.append(ev_q.get_nowait())
+            except queue.Empty:
+                break
+        for k, p in items:
+            dirty = True
+            if k == "prog":
+                cur_pct, cur_met, cur_det = p  # type: ignore[misc]
+            else:
+                push(str(p))
+        now_m = time.monotonic()
+        if dirty and (now_m - last_yield >= 0.35 or not t.is_alive()):
+            last_yield = now_m
+            dirty = False
+            yield pack(render_progress_hud(cur_pct, badge, title, cur_met, cur_det, mode=mode))
+    if "err" in res_box:
+        raise res_box["err"]  # type: ignore[misc]
+    return res_box.get("val")
+
+
+def rtab_load(links_txt: str):
+    """تبويب الترميم: تحميل/فحص المصادر (تورنت أو ملفات/مجلدات محلية) وسرد الحلقات."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    def pack(hud_html: str, dd=gr.update(), st=gr.update()):
+        return (hud_html, "\n".join(logs[-150:]), dd, st)
+
+    try:
+        lines = [ln.strip() for ln in (links_txt or "").splitlines() if ln.strip()]
+        if not lines:
+            push("⚠️ أدخل رابط تورنت أو مسار ملف/مجلد محلي أولاً (واحد في كل سطر).")
+            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد مصادر", "أدخل رابطاً أو مساراً محلياً أولاً", "—", "—", mode="error"))
+            return
+        eps: List[Path] = []
+        for i, lnk in enumerate(lines, 1):
+            if os.path.isdir(lnk):
+                vids = collect_episode_videos(lnk)
+                push(f"📂 مجلد محلي [{i}]: {lnk} — {len(vids)} ملف فيديو.")
+            elif os.path.isfile(lnk) and Path(lnk).suffix.lower() in VIDEO_EXTENSIONS:
+                vids = [Path(lnk)]
+                push(f"📄 ملف محلي [{i}]: {Path(lnk).name}")
+            else:
+                cdir = _raw_cache_dir_for_source("season", lnk, None, f"restore_tab_{i}")
+                vids = yield from _live_gen(
+                    download_season_batch, push, pack,
+                    lnk, None, str(cdir),
+                    badge=f"DOWNLOAD [{i}/{len(lines)}]",
+                    title=f"تحميل / فحص الدفعة {i} من {len(lines)}",
+                )
+            eps.extend(vids)
+        uniq = {str(p.resolve()): p for p in eps}
+        eps = sorted(uniq.values(), key=episode_sort_key)
+        if not eps:
+            raise FileNotFoundError("لم يتم العثور على أي حلقة في المصادر المدخلة.")
+        push(f"📚 إجمالي الحلقات الجاهزة للترميم: {len(eps)} حلقة — اختر أي حلقة للمعاينة أو اضغط ترميم الكل.")
+        for pos, vp in enumerate(eps, 1):
+            push(f"   {pos:03d}. {vp.name}")
+        names = [p.name for p in eps]
+        yield pack(
+            render_progress_hud(100.0, "READY", f"{len(eps)} حلقة جاهزة للترميم", "اختر حلقة للمعاينة أو ابدأ ترميم الكل", "", mode="done"),
+            dd=gr.update(choices=names, value=names[0]),
+            st=[str(p) for p in eps],
+        )
+    except Exception as exc:
+        push(f"❌ خطأ أثناء التحميل/الفحص: {exc}\n{traceback.format_exc()[-1000:]}")
+        yield pack(render_progress_hud(0.0, "ERROR · LOAD", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
+
+
+def rtab_preview(model: str, ep_name: str, eps_state: List[str]):
+    """تبويب الترميم: معاينة 10 ثوانٍ للحلقة المختارة."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    def pack(hud_html: str, vid_val=gr.update()):
+        return (hud_html, "\n".join(logs[-150:]), vid_val)
+
+    try:
+        match = next((p for p in (eps_state or []) if Path(p).name == ep_name), "")
+        if not match:
+            push("⚠️ اختر حلقة من القائمة أولاً (حمّل المصادر بزر التحميل لو القائمة فاضية).")
+            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد حلقة", "حمّل المصادر واختر حلقة أولاً", "—", "—", mode="error"))
+            return
+        ep = Path(match)
+        out_prev = str(STORAGE_ROOT / f"restore_preview_{model}_{_safe_name(ep.stem)}.mp4")
+        yield from _live_gen(
+            restore_video, push, pack,
+            str(ep), out_prev,
+            model_key=model, max_seconds=10.0, crf=18,
+            badge="PREVIEW · AI RESTORE ×4",
+            title=f"معاينة الترميم: أول 10 ثوانٍ من {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)}",
+        )
+        push("✅ المعاينة جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم الكل.")
+        yield pack(
+            render_progress_hud(100.0, "PREVIEW READY", "معاينة الترميم جاهزة (10 ثوانٍ)", MODEL_LABELS.get(model, model), out_prev, mode="done"),
+            vid_val=out_prev,
+        )
+    except Exception as exc:
+        push(f"❌ خطأ أثناء المعاينة: {exc}\n{traceback.format_exc()[-1000:]}")
+        yield pack(render_progress_hud(0.0, "ERROR · PREVIEW", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
+
+
+def rtab_run(model: str, eps_state: List[str]):
+    """تبويب الترميم: ترميم كل الحلقات؛ الأصلية تُمسح بعد نجاح كل حلقة (كاش الأداة فقط)،
+    والمرمَّمة تظهر تلقائياً في قائمة «اختر حلقة خام محفوظة» في تبويب الترجمة."""
+    logs: List[str] = []
+
+    def push(msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    def pack(hud_html: str, raw_dd=gr.update()):
+        return (hud_html, "\n".join(logs[-150:]), raw_dd)
+
+    try:
+        if not eps_state:
+            push("⚠️ حمّل المصادر أولاً بزر «تحميل / فحص الحلقات».")
+            yield pack(render_progress_hud(0.0, "تنبيه · لا توجد حلقات", "حمّل المصادر أولاً", "—", "—", mode="error"))
+            return
+        restored_dir = RAW_CACHE_ROOT / "restored"
+        restored_dir.mkdir(parents=True, exist_ok=True)
+        total = len(eps_state)
+        done_n = 0
+        failed: List[str] = []
+        for i, ep_str in enumerate(eps_state, 1):
+            ep = Path(ep_str)
+            out = restored_dir / f"{ep.stem}_x4.mp4"
+            if out.exists() and out.stat().st_size > 1024 * 1024:
+                push(f"⏭️ [{i}/{total}] {ep.name} مترممة مسبقاً — تخطي ({out.name})")
+                done_n += 1
+                continue
+            push(f"━━━━━━ [{i}/{total}] {ep.name} ━━━━━━")
+            try:
+                yield from _live_gen(
+                    restore_video, push, pack,
+                    str(ep), str(out),
+                    model_key=model,
+                    badge=f"RESTORE ×4 [{i}/{total}]",
+                    title=f"ترميم حلقة {i} من {total} بموديل {MODEL_LABELS.get(model, model)}...",
+                )
+                done_n += 1
+                try:
+                    if ep.is_file() and ep.resolve() != out.resolve() and str(ep.resolve()).startswith(str(RAW_CACHE_ROOT.resolve())):
+                        ep.unlink()
+                        push(f"🗑️ تم مسح الملف الأصلي: {ep.name} — المرمَّم محفوظ: {out.name}")
+                    elif ep.is_file():
+                        push(f"📌 الأصلي خارج كاش الأداة فاتركته كما هو: {ep.name}")
+                except Exception as de:
+                    push(f"⚠️ تعذر مسح الأصلي {ep.name}: {de}")
+            except Exception as exc:
+                failed.append(ep.name)
+                push(f"❌ فشل ترميم {ep.name}: {exc} — الأصلي محفوظ كما هو، والحلقة اللي بعدها هتكمل عادي.")
+        if failed:
+            push(f"⚠️ خلص الترميم مع {len(failed)} حلقة فاشلة: {'، '.join(failed[:5])}")
+        push(f"✅ اكتمل الترميم: {done_n} من {total} حلقة. المرمَّمة ظاهرة الآن في قائمة «اختر حلقة خام محفوظة» في تبويب الترجمة.")
+        yield pack(
+            render_progress_hud(
+                100.0,
+                "RESTORE COMPLETE · 100%" if not failed else "RESTORE DONE · مع فاشلات",
+                f"اكتمل الترميم: {done_n}/{total} حلقة" + (f" · فشل {len(failed)}" if failed else ""),
+                MODEL_LABELS.get(model, model),
+                str(restored_dir),
+                mode="done" if not failed else "error",
+            ),
+            raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+        )
+    except Exception as exc:
+        push(f"❌ خطأ أثناء ترميم الدفعة: {exc}\n{traceback.format_exc()[-1000:]}")
+        yield pack(render_progress_hud(0.0, "ERROR · RESTORE ALL", f"توقف: {str(exc)[:110]}", "راجع سجل الترميم", "—", mode="error"))
+
+
 def _build_blocks_kwargs() -> Dict:
     sig = inspect.signature(gr.Blocks.__init__).parameters
     kwargs: Dict = {"title": "سَبّر الأنمي | Anime Subber"}
@@ -2184,199 +2398,242 @@ def build_ui() -> gr.Blocks:
 
         job_state = gr.State({})
 
-        with gr.Row():
-            with gr.Column(scale=2):
-                with gr.Column(visible=True, elem_classes=["sb-wiz-step"]) as step1_group:
-                    gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">⚔️ الخطوة 1 · جهّز الحلقة: اختر المصدر أو حلقة محفوظة ثم اضغط ARISE</div>')
-                    with gr.Row():
-                        episode_name = gr.Textbox(
-                            label="📌 اسم الحلقة / مجلد الإخراج",
-                            placeholder="مثال: Bleach_EP366 (أو اتركه فارغاً ليأخذ اسم الملف)",
-                            scale=2,
-                        )
-                        with gr.Column(scale=2):
-                            series_picker = gr.Dropdown(
-                                choices=[(SERIES_NEW_OPT, SERIES_NEW_OPT)] + list_saved_series(),
-                                value=_default_series_pick(),
-                                label="🎌 الأنمي الشغال عليه — القاموس بيتحفظ وبيترجع لوحده",
-                                elem_id="series_picker",
-                            )
-                            series_name = gr.Textbox(
-                                label="✍️ اسم الأنمي الجديد (لتوحيد وحفظ قاموس الأسماء والمصطلحات تلقائياً)",
-                                placeholder="مثال: Bleach أو Black Clover أو Jujutsu Kaisen",
-                                visible=(_default_series_pick() == SERIES_NEW_OPT),
-                            )
-                        style_preset = gr.State("bleach_style")  # fixed: Bleach geometry, no UI control
-
-                    with gr.Accordion("🔗 الحلقات المحفوظة على السيرفر أو روابط التورنت (حفظ دائم بدون إعادة تحميل)", open=True, elem_classes=["sb-accordion"]):
-                        with gr.Row():
-                            saved_raw_1080 = gr.Dropdown(
-                                choices=[""] + list_cached_raw_videos(),
-                                value="",
-                                label="📦 اختر حلقة خام محمّلة مسبقاً على السيرفر (/workspace/raw_episodes)",
-                                interactive=True,
-                                scale=4,
-                            )
-                            refresh_raw_btn = gr.Button("🔄 تحديث المحفوظ", size="sm", scale=1)
-
-                        with gr.Row():
-                            link_1080 = gr.Textbox(label="رابط 1080p (Magnet / URL)", placeholder="magnet:?xt=...")
-                            file_1080 = gr.File(label="أو ملف .torrent / فيديو 1080p", type="filepath")
-                        with gr.Row():
-                            link_720 = gr.Textbox(label="رابط 720p (Magnet / URL)", placeholder="magnet:?xt=...")
-                            file_720 = gr.File(label="أو ملف .torrent / فيديو 720p", type="filepath")
-                        with gr.Row():
-                            link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
-                            file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
-
-                    with gr.Accordion("🧪 ترميم ×4 بالذكاء الاصطناعي (اختياري — للأنمي القديم منخفض الجودة)", open=True, elem_classes=["sb-accordion"]):
-                        restore_model = gr.Dropdown(
-                            choices=[
-                                ("بدون ترميم — الحلقة تكمل عادي", "off"),
-                                ("Real-CUGAN ×4 — أعلى جودة (موصى به للأنمي القديم)", "cugan"),
-                                ("realesr-animevideov3 ×4 — الخيار السريع", "v3"),
-                            ],
-                            value="off",
-                            label="موديل الترميم — يُحمَّل تلقائياً أول مرة فقط ويُحفظ في /workspace/models",
-                        )
-                        restore_preview_btn = gr.Button(
-                            "👁️ معاينة الترميم — أول 10 ثوانٍ فقط من الحلقة",
-                            size="sm",
-                            elem_id="sb-restore-preview-btn",
-                        )
-                        restore_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ — احكم على الجودة والثبات قبل الترميم الكامل)")
-
-                    with gr.Accordion("📚 وضع المواسم الكاملة — روابط دفعات (الرابط الواحد ممكن يحتوي موسماً أو أكثر)", open=False, elem_classes=["sb-accordion"]):
-                        batch_links = gr.Textbox(
-                            label="روابط التورنت / الماجنت — رابط واحد في كل سطر",
-                            placeholder="magnet:?xt=urn:btih:...\nhttps://example.com/Season2.torrent",
-                            lines=4,
-                        )
-                        batch_btn = gr.Button(
-                            "🚀 شغّل الموسم كاملاً: تحميل كل الحلقات ← ترجمة بأسلوب المترجم ← حرق ← ضغط ← فولدرات 35 حلقة [SEASON STRIKE]",
-                            variant="primary",
-                            size="lg",
-                            elem_id="sb-batch-btn",
-                        )
-
-                    with gr.Accordion("🔑 مفاتيح DeepSeek / Gemini والإعدادات الدائمة", open=False, elem_classes=["sb-accordion"]):
-                        with gr.Row():
-                            provider = gr.Dropdown(
-                                choices=["DeepSeek API (موصى به)", "Gemini API", "OpenAI-Compatible / Local"],
-                                value=cfg["provider"],
-                                label="محرك الترجمة الذكي (مع تفعيل البديل التلقائي deepseek-v4-pro)",
-                            )
-                            llm_model = gr.Textbox(value=cfg["llm_model"], label="اسم الموديل الأساسي")
-                        with gr.Row():
-                            api_key = gr.Textbox(value=cfg["api_key"], label="DeepSeek / Gemini API Key", type="password")
-                            base_url = gr.Textbox(value=cfg["base_url"], label="Base URL")
-                        with gr.Row():
-                            dood_api_key = gr.Textbox(value=cfg["dood_api_key"], label="DoodStream API Key", type="password")
-                            gdrive_remote = gr.Textbox(value=cfg["gdrive_remote"], label="Google Drive Remote")
-                            gdrive_folder = gr.Textbox(value=cfg["gdrive_folder"], label="فولدر Drive")
-
-                        save_btn = gr.Button("💾 حفظ جميع المفاتيح والإعدادات في النظام", variant="secondary")
-                        save_status = gr.Markdown("")
-
-                    with gr.Accordion("⚙️ التفريغ الصوتي (Whisper) والضغط (NVENC) وحقوق الفريق", open=False, elem_classes=["sb-accordion"]):
-                        with gr.Row():
-                            sub_mode = gr.Radio(
-                                choices=[
-                                    "Auto (سحب ترجمة MKV إن وجدت، وإلا Whisper)",
-                                    "Force Whisper (تفريغ صوتي دائماً)",
-                                ],
-                                value="Auto (سحب ترجمة MKV إن وجدت، وإلا Whisper)",
-                                label="مصدر الترجمة",
-                            )
-                            whisper_model = gr.Dropdown(choices=["large-v3", "medium", "small"], value="large-v3", label="موديل Whisper")
-                            wrap_mode = gr.Dropdown(
-                                choices=[
-                                    ("تتابعي: السطر الطويل يصبح حدثين متتاليين زمنياً (أسلوب Celestial)", "sequential"),
-                                    ("مكدس: سطران فوق بعض في نفس التوقيت", "stacked"),
-                                    ("بدون تقسيم", "off"),
-                                ],
-                                value=cfg.get("wrap_mode", "sequential"),
-                                label="تقسيم الأسطر العربية الطويلة",
-                            )
-                            soften_exclaim = gr.Checkbox(
-                                value=bool(cfg.get("soften_exclaim", True)),
-                                label="تخفيف علامات التعجب (تحويل ! الخبرية إلى نقطة وحذفها بعد أوه/آه، مع الإبقاء على الصياح)",
-                            )
-                        with gr.Row():
-                            codec = gr.Dropdown(
-                                choices=[
-                                    ("HEVC كرت الشاشة (hevc_nvenc · نفس سرعة الكرت وحجم أصغر · موصى به)", "hevc_nvenc"),
-                                    ("H.264 كرت الشاشة (h264_nvenc · توافق أوسع)", "h264_nvenc"),
-                                    ("AV1 كرت الشاشة (av1_nvenc)", "av1_nvenc"),
-                                    ("HEVC معالج x265 · أصغر حجم ممكن (أبطأ بكثير)", "libx265"),
-                                ],
-                                value=cfg["codec"],
-                                label="الكوديك",
-                            )
-                            preset = gr.Dropdown(choices=["p7", "p6", "p5", "p4"], value=cfg["preset"], label="دقة الضغط (كرت الشاشة)")
-                            x265_preset = gr.Dropdown(
-                                choices=[
-                                    ("slow · أصغر حجم (الافتراضي)", "slow"),
-                                    ("medium · أسرع ~2.5x وحجم شبه مماثل", "medium"),
-                                    ("fast · أقصى سرعة", "fast"),
-                                ],
-                                value=cfg.get("x265_preset", "slow"),
-                                label="سرعة x265 (المعالج)",
-                            )
-                            cq = gr.Slider(minimum=18, maximum=30, step=1, value=cfg["cq"], label="الجودة CQ")
-                            audio_bitrate = gr.Dropdown(choices=["128k", "160k", "192k"], value=cfg["audio_bitrate"], label="صوت AAC")
-                        with gr.Row():
-                            logo_position = gr.Dropdown(
-                                choices=[("أعلى اليمين", "top-right"), ("أعلى الشمال", "top-left"), ("أسفل اليمين", "bottom-right"), ("أسفل الشمال", "bottom-left")],
-                                value=cfg.get("logo_position", "top-right"),
-                                label="🛡️ مكان اللوجو المحروق",
-                            )
-                            logo_opacity = gr.Slider(minimum=0.2, maximum=1.0, step=0.05, value=cfg.get("logo_opacity", 0.30), label="شفافية اللوجو")
-                            logo_scale = gr.Slider(minimum=0.06, maximum=0.25, step=0.01, value=cfg.get("logo_scale", 0.12), label="حجم اللوجو (نسبة من عرض الفيديو)")
-                        gr.Markdown("📎 حط ملف اللوجو في `assets/logo.png` جنب الكود — لو الملف مش موجود، الفيديو يطلع بدون لوجو عادي.")
-                        with gr.Row():
-                            credit_translator = gr.Textbox(value=cfg["credit_translator"], label="الترجمة")
-                            credit_typesetter = gr.Textbox(value=cfg["credit_typesetter"], label="المحاكاة")
-                            credit_encoder = gr.Textbox(value=cfg["credit_encoder"], label="الدمج والرفع")
-
-                        cleanup_temp = gr.Checkbox(value=False, label="مسح الحلقة الخام بعد انتهاء الدمج (اتركه مغلقاً للاحتفاظ بالحلقات المحمّلة دائماً)")
-
-                    step1_btn = gr.Button(
-                        "⚔️ ARISE · ابدأ الطحن — ترجمة وحرق وضغط MP4 [STRIKE]",
-                        variant="primary",
-                        size="lg",
-                        elem_id="sb-step1-btn",
-                    )
-
-                progress_hud = gr.HTML(value=render_progress_hud())
-
-                with gr.Column(visible=False, elem_classes=["sb-wiz-step"]) as step2_group:
-                    gr.HTML('<div style="font-weight:700;color:#ffb27f;border:1px solid rgba(255,178,127,.35);background:rgba(70,40,20,.55);padding:8px 14px;border-radius:10px;margin:10px 0;letter-spacing:.5px;font-size:15px;">🌀 الخطوة 2 · الحلقة جاهزة: اعتمد وارفع</div>')
-                    with gr.Row():
-                        enable_dood = gr.Checkbox(value=True, label="رفع على DoodStream")
-                        enable_gdrive = gr.Checkbox(value=True, label="رفع على Google Drive")
-
-                    step2_btn = gr.Button(
-                        "🌀 الخطوة 2: عبور البوابة — اعتماد ورفع جميع الجودات [S-PORTAL]",
-                        variant="stop",
-                        size="lg",
-                        elem_id="sb-step2-btn",
-                    )
-
-                    back_btn = gr.Button("↩️ رجوع — تجهيز حلقة جديدة", size="sm")
-
-            with gr.Column(scale=1):
-                preview_player = gr.Video(label="📺 مشغّل معاينة الحلقة بعد المحو والحرق")
-
+        with gr.Tabs():
+            with gr.TabItem("⚔️ الترجمة والحرق والضغط"):
                 with gr.Row():
-                    local_dropdown = gr.Dropdown(choices=list_local_outputs(), label="📂 تصفّح الحلقات المحروقة الجاهزة (/workspace/outputs)", interactive=True)
-                    refresh_local_btn = gr.Button("🔄 تحديث", size="sm")
+                    with gr.Column(scale=2):
+                        with gr.Column(visible=True, elem_classes=["sb-wiz-step"]) as step1_group:
+                            gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">⚔️ الخطوة 1 · جهّز الحلقة: اختر المصدر أو حلقة محفوظة ثم اضغط ARISE</div>')
+                            with gr.Row():
+                                episode_name = gr.Textbox(
+                                    label="📌 اسم الحلقة / مجلد الإخراج",
+                                    placeholder="مثال: Bleach_EP366 (أو اتركه فارغاً ليأخذ اسم الملف)",
+                                    scale=2,
+                                )
+                                with gr.Column(scale=2):
+                                    series_picker = gr.Dropdown(
+                                        choices=[(SERIES_NEW_OPT, SERIES_NEW_OPT)] + list_saved_series(),
+                                        value=_default_series_pick(),
+                                        label="🎌 الأنمي الشغال عليه — القاموس بيتحفظ وبيترجع لوحده",
+                                        elem_id="series_picker",
+                                    )
+                                    series_name = gr.Textbox(
+                                        label="✍️ اسم الأنمي الجديد (لتوحيد وحفظ قاموس الأسماء والمصطلحات تلقائياً)",
+                                        placeholder="مثال: Bleach أو Black Clover أو Jujutsu Kaisen",
+                                        visible=(_default_series_pick() == SERIES_NEW_OPT),
+                                    )
+                                style_preset = gr.State("bleach_style")  # fixed: Bleach geometry, no UI control
 
-                links_box = gr.Textbox(label="🔗 روابط الرفع الجاهزة للنشر", lines=8, interactive=False, visible=False)
-                log_box = gr.Textbox(label="📋 سجل عمليات النظام المباشر [HUNTER LOG]", lines=16, max_lines=22, interactive=False)
-                with gr.Group(visible=False) as downloads_group:
-                    out_video_files = gr.Files(label="🎥 تحميل الفيديوهات النهائية لجهازك")
-                    out_ass_file = gr.File(label="📝 تحميل ملف الترجمة المنسّق (.ass)")
+                            with gr.Accordion("🔗 الحلقات المحفوظة على السيرفر أو روابط التورنت (حفظ دائم بدون إعادة تحميل)", open=True, elem_classes=["sb-accordion"]):
+                                with gr.Row():
+                                    saved_raw_1080 = gr.Dropdown(
+                                        choices=[""] + list_cached_raw_videos(),
+                                        value="",
+                                        label="📦 اختر حلقة خام محمّلة مسبقاً على السيرفر (/workspace/raw_episodes)",
+                                        interactive=True,
+                                        scale=4,
+                                    )
+                                    refresh_raw_btn = gr.Button("🔄 تحديث المحفوظ", size="sm", scale=1)
+
+                                with gr.Row():
+                                    link_1080 = gr.Textbox(label="رابط 1080p (Magnet / URL)", placeholder="magnet:?xt=...")
+                                    file_1080 = gr.File(label="أو ملف .torrent / فيديو 1080p", type="filepath")
+                                with gr.Row():
+                                    link_720 = gr.Textbox(label="رابط 720p (Magnet / URL)", placeholder="magnet:?xt=...")
+                                    file_720 = gr.File(label="أو ملف .torrent / فيديو 720p", type="filepath")
+                                with gr.Row():
+                                    link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
+                                    file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
+
+                            with gr.Accordion("🧪 ترميم ×4 بالذكاء الاصطناعي (اختياري — للأنمي القديم منخفض الجودة)", open=True, elem_classes=["sb-accordion"]):
+                                restore_model = gr.Dropdown(
+                                    choices=[
+                                        ("بدون ترميم — الحلقة تكمل عادي", "off"),
+                                        ("Real-CUGAN ×4 — أعلى جودة (موصى به للأنمي القديم)", "cugan"),
+                                        ("realesr-animevideov3 ×4 — الخيار السريع", "v3"),
+                                    ],
+                                    value="off",
+                                    label="موديل الترميم — يُحمَّل تلقائياً أول مرة فقط ويُحفظ في /workspace/models",
+                                )
+                                restore_preview_btn = gr.Button(
+                                    "👁️ معاينة الترميم — أول 10 ثوانٍ فقط من الحلقة",
+                                    size="sm",
+                                    elem_id="sb-restore-preview-btn",
+                                )
+                                restore_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ — احكم على الجودة والثبات قبل الترميم الكامل)")
+
+                            with gr.Accordion("📚 وضع المواسم الكاملة — روابط دفعات (الرابط الواحد ممكن يحتوي موسماً أو أكثر)", open=False, elem_classes=["sb-accordion"]):
+                                batch_links = gr.Textbox(
+                                    label="روابط التورنت / الماجنت أو مسارات ملفات/مجلدات محلية — واحد في كل سطر",
+                                    placeholder="magnet:?xt=urn:btih:...\nhttps://example.com/Season2.torrent",
+                                    lines=4,
+                                )
+                                batch_btn = gr.Button(
+                                    "🚀 شغّل الموسم كاملاً: تحميل كل الحلقات ← ترجمة بأسلوب المترجم ← حرق ← ضغط ← فولدرات 35 حلقة [SEASON STRIKE]",
+                                    variant="primary",
+                                    size="lg",
+                                    elem_id="sb-batch-btn",
+                                )
+
+                            with gr.Accordion("🔑 مفاتيح DeepSeek / Gemini والإعدادات الدائمة", open=False, elem_classes=["sb-accordion"]):
+                                with gr.Row():
+                                    provider = gr.Dropdown(
+                                        choices=["DeepSeek API (موصى به)", "Gemini API", "OpenAI-Compatible / Local"],
+                                        value=cfg["provider"],
+                                        label="محرك الترجمة الذكي (مع تفعيل البديل التلقائي deepseek-v4-pro)",
+                                    )
+                                    llm_model = gr.Textbox(value=cfg["llm_model"], label="اسم الموديل الأساسي")
+                                with gr.Row():
+                                    api_key = gr.Textbox(value=cfg["api_key"], label="DeepSeek / Gemini API Key", type="password")
+                                    base_url = gr.Textbox(value=cfg["base_url"], label="Base URL")
+                                with gr.Row():
+                                    dood_api_key = gr.Textbox(value=cfg["dood_api_key"], label="DoodStream API Key", type="password")
+                                    gdrive_remote = gr.Textbox(value=cfg["gdrive_remote"], label="Google Drive Remote")
+                                    gdrive_folder = gr.Textbox(value=cfg["gdrive_folder"], label="فولدر Drive")
+
+                                save_btn = gr.Button("💾 حفظ جميع المفاتيح والإعدادات في النظام", variant="secondary")
+                                save_status = gr.Markdown("")
+
+                            with gr.Accordion("⚙️ التفريغ الصوتي (Whisper) والضغط (NVENC) وحقوق الفريق", open=False, elem_classes=["sb-accordion"]):
+                                with gr.Row():
+                                    sub_mode = gr.Radio(
+                                        choices=[
+                                            "Auto (سحب ترجمة MKV إن وجدت، وإلا Whisper)",
+                                            "Force Whisper (تفريغ صوتي دائماً)",
+                                        ],
+                                        value="Auto (سحب ترجمة MKV إن وجدت، وإلا Whisper)",
+                                        label="مصدر الترجمة",
+                                    )
+                                    whisper_model = gr.Dropdown(choices=["large-v3", "medium", "small"], value="large-v3", label="موديل Whisper")
+                                    wrap_mode = gr.Dropdown(
+                                        choices=[
+                                            ("تتابعي: السطر الطويل يصبح حدثين متتاليين زمنياً (أسلوب Celestial)", "sequential"),
+                                            ("مكدس: سطران فوق بعض في نفس التوقيت", "stacked"),
+                                            ("بدون تقسيم", "off"),
+                                        ],
+                                        value=cfg.get("wrap_mode", "sequential"),
+                                        label="تقسيم الأسطر العربية الطويلة",
+                                    )
+                                    soften_exclaim = gr.Checkbox(
+                                        value=bool(cfg.get("soften_exclaim", True)),
+                                        label="تخفيف علامات التعجب (تحويل ! الخبرية إلى نقطة وحذفها بعد أوه/آه، مع الإبقاء على الصياح)",
+                                    )
+                                with gr.Row():
+                                    codec = gr.Dropdown(
+                                        choices=[
+                                            ("HEVC كرت الشاشة (hevc_nvenc · نفس سرعة الكرت وحجم أصغر · موصى به)", "hevc_nvenc"),
+                                            ("H.264 كرت الشاشة (h264_nvenc · توافق أوسع)", "h264_nvenc"),
+                                            ("AV1 كرت الشاشة (av1_nvenc)", "av1_nvenc"),
+                                            ("HEVC معالج x265 · أصغر حجم ممكن (أبطأ بكثير)", "libx265"),
+                                        ],
+                                        value=cfg["codec"],
+                                        label="الكوديك",
+                                    )
+                                    preset = gr.Dropdown(choices=["p7", "p6", "p5", "p4"], value=cfg["preset"], label="دقة الضغط (كرت الشاشة)")
+                                    x265_preset = gr.Dropdown(
+                                        choices=[
+                                            ("slow · أصغر حجم (الافتراضي)", "slow"),
+                                            ("medium · أسرع ~2.5x وحجم شبه مماثل", "medium"),
+                                            ("fast · أقصى سرعة", "fast"),
+                                        ],
+                                        value=cfg.get("x265_preset", "slow"),
+                                        label="سرعة x265 (المعالج)",
+                                    )
+                                    cq = gr.Slider(minimum=18, maximum=30, step=1, value=cfg["cq"], label="الجودة CQ")
+                                    audio_bitrate = gr.Dropdown(choices=["128k", "160k", "192k"], value=cfg["audio_bitrate"], label="صوت AAC")
+                                with gr.Row():
+                                    logo_position = gr.Dropdown(
+                                        choices=[("أعلى اليمين", "top-right"), ("أعلى الشمال", "top-left"), ("أسفل اليمين", "bottom-right"), ("أسفل الشمال", "bottom-left")],
+                                        value=cfg.get("logo_position", "top-right"),
+                                        label="🛡️ مكان اللوجو المحروق",
+                                    )
+                                    logo_opacity = gr.Slider(minimum=0.2, maximum=1.0, step=0.05, value=cfg.get("logo_opacity", 0.30), label="شفافية اللوجو")
+                                    logo_scale = gr.Slider(minimum=0.06, maximum=0.25, step=0.01, value=cfg.get("logo_scale", 0.12), label="حجم اللوجو (نسبة من عرض الفيديو)")
+                                gr.Markdown("📎 حط ملف اللوجو في `assets/logo.png` جنب الكود — لو الملف مش موجود، الفيديو يطلع بدون لوجو عادي.")
+                                with gr.Row():
+                                    credit_translator = gr.Textbox(value=cfg["credit_translator"], label="الترجمة")
+                                    credit_typesetter = gr.Textbox(value=cfg["credit_typesetter"], label="المحاكاة")
+                                    credit_encoder = gr.Textbox(value=cfg["credit_encoder"], label="الدمج والرفع")
+
+                                cleanup_temp = gr.Checkbox(value=False, label="مسح الحلقة الخام بعد انتهاء الدمج (اتركه مغلقاً للاحتفاظ بالحلقات المحمّلة دائماً)")
+
+                            step1_btn = gr.Button(
+                                "⚔️ ARISE · ابدأ الطحن — ترجمة وحرق وضغط MP4 [STRIKE]",
+                                variant="primary",
+                                size="lg",
+                                elem_id="sb-step1-btn",
+                            )
+
+                        progress_hud = gr.HTML(value=render_progress_hud())
+
+                        with gr.Column(visible=False, elem_classes=["sb-wiz-step"]) as step2_group:
+                            gr.HTML('<div style="font-weight:700;color:#ffb27f;border:1px solid rgba(255,178,127,.35);background:rgba(70,40,20,.55);padding:8px 14px;border-radius:10px;margin:10px 0;letter-spacing:.5px;font-size:15px;">🌀 الخطوة 2 · الحلقة جاهزة: اعتمد وارفع</div>')
+                            with gr.Row():
+                                enable_dood = gr.Checkbox(value=True, label="رفع على DoodStream")
+                                enable_gdrive = gr.Checkbox(value=True, label="رفع على Google Drive")
+
+                            step2_btn = gr.Button(
+                                "🌀 الخطوة 2: عبور البوابة — اعتماد ورفع جميع الجودات [S-PORTAL]",
+                                variant="stop",
+                                size="lg",
+                                elem_id="sb-step2-btn",
+                            )
+
+                            back_btn = gr.Button("↩️ رجوع — تجهيز حلقة جديدة", size="sm")
+
+                    with gr.Column(scale=1):
+                        preview_player = gr.Video(label="📺 مشغّل معاينة الحلقة بعد المحو والحرق")
+
+                        with gr.Row():
+                            local_dropdown = gr.Dropdown(choices=list_local_outputs(), label="📂 تصفّح الحلقات المحروقة الجاهزة (/workspace/outputs)", interactive=True)
+                            refresh_local_btn = gr.Button("🔄 تحديث", size="sm")
+
+                        links_box = gr.Textbox(label="🔗 روابط الرفع الجاهزة للنشر", lines=8, interactive=False, visible=False)
+                        log_box = gr.Textbox(label="📋 سجل عمليات النظام المباشر [HUNTER LOG]", lines=16, max_lines=22, interactive=False)
+                        with gr.Group(visible=False) as downloads_group:
+                            out_video_files = gr.Files(label="🎥 تحميل الفيديوهات النهائية لجهازك")
+                            out_ass_file = gr.File(label="📝 تحميل ملف الترجمة المنسّق (.ass)")
+
+            with gr.TabItem("🧪 الترميم ×4"):
+                gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">🧪 ترميم ×4: حمّل موسم أو مجلد محلي، جرّب معاينة 10 ثوانٍ على أي حلقة، ثم ترميم الكل — الأصلية تُمسح تلقائياً بعد نجاح كل حلقة والمرمَّمة تظهر في تبويب الترجمة</div>')
+                rtab_links = gr.Textbox(
+                    label="روابط التورنت / الماجنت أو مسارات ملفات/مجلدات محلية — واحد في كل سطر",
+                    placeholder="magnet:?xt=urn:btih:...\n/workspace/my_old_anime/",
+                    lines=3,
+                )
+                with gr.Row():
+                    rtab_model = gr.Dropdown(
+                        choices=[
+                            ("Real-CUGAN ×4 — أعلى جودة (موصى به للأنمي القديم)", "cugan"),
+                            ("realesr-animevideov3 ×4 — الخيار السريع", "v3"),
+                        ],
+                        value="cugan",
+                        label="موديل الترميم",
+                    )
+                    rtab_load_btn = gr.Button("⬇️ تحميل / فحص الحلقات", variant="primary", scale=1)
+                rtab_eps = gr.Dropdown(choices=[], label="الحلقات الجاهزة — اختر حلقة للمعاينة", interactive=True)
+                rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ للحلقة المختارة", size="sm")
+                rtab_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ)")
+                rtab_run_btn = gr.Button("🚀 ترميم كل الحلقات ×4 — الأصلية تُمسح بعد نجاح كل حلقة [RESTORE ALL]", variant="primary", size="lg")
+                rtab_hud = gr.HTML(value=render_progress_hud())
+                rtab_log = gr.Textbox(label="📋 سجل الترميم [RESTORE LOG]", lines=12, max_lines=18, interactive=False)
+                rtab_state = gr.State([])
+
+        rtab_load_btn.click(
+            fn=rtab_load,
+            inputs=[rtab_links],
+            outputs=[rtab_hud, rtab_log, rtab_eps, rtab_state],
+        )
+        rtab_preview_btn.click(
+            fn=rtab_preview,
+            inputs=[rtab_model, rtab_eps, rtab_state],
+            outputs=[rtab_hud, rtab_log, rtab_preview_video],
+        )
+        rtab_run_btn.click(
+            fn=rtab_run,
+            inputs=[rtab_model, rtab_state],
+            outputs=[rtab_hud, rtab_log, saved_raw_1080],
+        )
 
         provider.change(fn=_on_provider_change, inputs=[provider], outputs=[llm_model, base_url])
 
