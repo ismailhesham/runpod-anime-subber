@@ -2042,7 +2042,7 @@ def step_restore_preview(
     link_480: str, file_480: Optional[str],
     batch_links: str = "",
 ):
-    """معاينة الترميم: تحميل الحلقة (أو استخدام المحفوظ) ثم ترميم أول 10 ثوانٍ فقط وعرضها.
+    """معاينة الترميم: تحميل الحلقة (أو استخدام المحفوظ) ثم ترميم 10 ثوانٍ من منتصفها وعرضها.
     لو مفيش مصدر حلقة مفردة، تستخدم أول رابط من خانة المواسم (وضع الدفعة)."""
     logs: List[str] = []
 
@@ -2150,9 +2150,10 @@ def step_restore_preview(
             str(vid_path), out_prev,
             model_key=restore_model,
             max_seconds=10.0,
+            start_seconds=_mid_preview_start(str(vid_path)),
             crf=18,
             badge="PREVIEW · AI RESTORE ×4",
-            title=f"معاينة الترميم: أول 10 ثوانٍ بموديل {MODEL_LABELS.get(restore_model, restore_model)}",
+            title=f"معاينة الترميم: 10 ثوانٍ من منتصف الحلقة بموديل {MODEL_LABELS.get(restore_model, restore_model)}",
         )
         push("✅ معاينة الترميم جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم الحلقة كاملة.")
         yield pack(
@@ -2171,6 +2172,17 @@ def step_restore_preview(
         yield pack(
             render_progress_hud(0.0, "ERROR · RESTORE PREVIEW", f"توقف: {str(exc)[:110]}", "راجع سجل العمليات", "—", mode="error")
         )
+
+
+def _mid_preview_start(video_path: str, secs: float = 10.0) -> float:
+    """نقطة بداية المعاينة من منتصف الحلقة — المقدمات غالباً ثابتة/سوداء فلا يظهر فيها الترميم."""
+    try:
+        _, _, _, dur = probe_video_info(video_path)
+        if dur and dur > secs * 3:
+            return max(0.0, dur / 2.0 - secs / 2.0)
+    except Exception:
+        pass
+    return 0.0
 
 
 def _live_gen(fn: Callable, push: Callable[[str], None], pack: Callable, *args, badge: str, title: str, mode: str = "cyan", **kwargs):
@@ -2374,9 +2386,9 @@ def rtab_preview(model: str, ep_names, eps_state: List[str]):
         yield from _live_gen(
             restore_video, push, pack,
             str(ep), out_prev,
-            model_key=model, max_seconds=10.0, crf=18,
+            model_key=model, max_seconds=10.0, start_seconds=_mid_preview_start(str(ep)), crf=18,
             badge="PREVIEW · AI RESTORE ×4",
-            title=f"معاينة الترميم: أول 10 ثوانٍ من {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)}",
+            title=f"معاينة الترميم: 10 ثوانٍ من منتصف {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)}",
         )
         push("✅ المعاينة جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم المجموعة.")
         yield pack(
@@ -2688,7 +2700,7 @@ def build_ui() -> gr.Blocks:
                                     label="موديل الترميم — يُحمَّل تلقائياً أول مرة فقط ويُحفظ في /workspace/models",
                                 )
                                 restore_preview_btn = gr.Button(
-                                    "👁️ معاينة الترميم — أول 10 ثوانٍ فقط من الحلقة",
+                                    "👁️ معاينة الترميم — 10 ثوانٍ من منتصف الحلقة",
                                     size="sm",
                                     elem_id="sb-restore-preview-btn",
                                 )
@@ -2844,7 +2856,7 @@ def build_ui() -> gr.Blocks:
                     )
                     rtab_load_btn = gr.Button("⬇️ تحميل / فحص الحلقات", variant="primary", scale=1)
                 rtab_eps = gr.Dropdown(choices=[], multiselect=True, label="الحلقات — اختر أي عدد (الكل محدد افتراضياً)", interactive=True)
-                rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ لأول حلقة مختارة", size="sm")
+                rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ من منتصف أول حلقة مختارة", size="sm")
                 rtab_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ)")
                 rtab_run_btn = gr.Button("🚀 ترميم الحلقات المختارة ×4 — الأصلية تُمسح بعد نجاح كل حلقة [RESTORE]", variant="primary", size="lg")
                 with gr.Row():
