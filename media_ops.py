@@ -408,40 +408,57 @@ def burn_and_compress_native(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     ass_filter = f"ass='{_escape_ffmpeg_path(os.path.abspath(ass_path))}':fontsdir='{_escape_ffmpeg_path(os.path.abspath(fonts_dir))}'"
 
-    if codec.endswith("_nvenc") and _has_nvenc(codec):
-        v_args = [
-            "-c:v", codec, "-preset", preset, "-rc", "vbr",
-            "-cq", str(cq), "-b:v", "0",
-            "-spatial-aq", "1", "-temporal-aq", "1", "-pix_fmt", "yuv420p",
-        ]
-        caps = _nvenc_opts(codec)
-        if "-multipass" in caps:
-            v_args += ["-multipass", "fullres"]  # better quality at the same size
-        if "-bf" in caps:
-            v_args += ["-bf", "3"]  # B-frames shrink anime encodes noticeably
-        if "-rc-lookahead" in caps:
-            v_args += ["-rc-lookahead", "20"]  # lookahead = noticeably better quality-per-bit
-        if "-tune" in caps:
-            v_args += ["-tune", "hq"]
-        if codec == "hevc_nvenc":
-            v_args += ["-tag:v", "hvc1"]
-    elif codec == "libx265":
-        # اختيار صريح من الواجهة: وضع «أصغر حجم» — x265 على المعالج بأبطأ إعداد عملي.
-        v_args = ["-c:v", "libx265", "-preset", "slow", "-crf", str(cq), "-pix_fmt", "yuv420p",
-                  "-x265-params", "aq-mode=3", "-tag:v", "hvc1"]
-        if log_cb:
-            log_cb("وضع أصغر حجم: x265 على المعالج (preset slow) — أبطأ بكثير من كرت الشاشة.")
+    requested = codec
+    if requested == "libx265" and log_cb:
+        log_cb("وضع أصغر حجم: x265 على المعالج (preset slow) — أبطأ بكثير من كرت الشاشة.")
+
+    def _build_v_args(eng: str) -> List[str]:
+        if eng.endswith("_nvenc"):
+            v = [
+                "-c:v", eng, "-preset", preset, "-rc", "vbr",
+                "-cq", str(cq), "-b:v", "0",
+                "-spatial-aq", "1", "-temporal-aq", "1", "-pix_fmt", "yuv420p",
+            ]
+            caps = _nvenc_opts(eng)
+            if "-multipass" in caps:
+                v += ["-multipass", "fullres"]  # better quality at the same size
+            if "-bf" in caps:
+                v += ["-bf", "3"]  # B-frames shrink anime encodes noticeably
+            if "-rc-lookahead" in caps:
+                v += ["-rc-lookahead", "20"]  # lookahead = noticeably better quality-per-bit
+            if "-tune" in caps:
+                v += ["-tune", "hq"]
+            if eng == "hevc_nvenc":
+                v += ["-tag:v", "hvc1"]
+            return v
+        if eng == "libx265":
+            return ["-c:v", "libx265", "-preset", "slow", "-crf", str(cq), "-pix_fmt", "yuv420p",
+                    "-x265-params", "aq-mode=3", "-tag:v", "hvc1"]
+        return ["-c:v", "libx264", "-preset", "medium", "-crf", str(cq), "-pix_fmt", "yuv420p"]
+
+    # سلسلة البدائل: المحرك المطلوب أولاً، ثم h264 على الكرت، ثم المعالج.
+    # كرت بدون hevc_nvenc (أو محاولة GPU فشلت أثناء التشغيل) يكمل تلقائياً، وكل خطوة بتتسجل في اللوج.
+    if requested.endswith("_nvenc"):
+        chain = [requested]
+        if requested != "h264_nvenc":
+            chain.append("h264_nvenc")
+        chain.append("libx265" if ("hevc" in requested or "x265" in requested) else "libx264")
     else:
-        cpu_codec = "libx265" if ("hevc" in codec or "x265" in codec) else "libx264"
-        if log_cb:
-            log_cb(f"NVENC unavailable; falling back to {cpu_codec}.")
-        v_args = ["-c:v", cpu_codec, "-preset", "medium", "-crf", str(cq), "-pix_fmt", "yuv420p"]
-        if cpu_codec == "libx265":
-            v_args += ["-tag:v", "hvc1"]
+        chain = [requested]
+    attempts: List[str] = []
+    for eng in chain:
+        if eng.endswith("_nvenc") and not _has_nvenc(eng):
+            if log_cb:
+                log_cb(f"⚠️ نسخة ffmpeg على الجهاز ده من غير {eng} — هتخطاه وأجرب البديل.")
+            continue
+        attempts.append(eng)
+    if not attempts:
+        attempts = ["libx264"]
 
     vw_, vh_, _, total_dur = probe_video_info(video_path)
 
-    if logo_path and os.path.isfile(logo_path):
+    use_logo = bool(logo_path and os.path.isfile(logo_path))
+    if use_logo:
         op = min(1.0, max(0.05, float(logo_opacity)))
         sc = min(0.5, max(0.03, float(logo_scale)))
         logo_w = max(16, round(vw_ * sc)) if vw_ > 0 else 160
@@ -454,87 +471,109 @@ def burn_and_compress_native(
             f"[0:v][logo]overlay={x_expr}:{y_expr}[vt];"
             f"[vt]{ass_filter}[vout]"
         )
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
-            "-filter_complex", fc,
-            "-map", "[vout]", "-map", "0:a?", *v_args,
-            "-c:a", "aac", "-b:a", audio_bitrate,
-            "-movflags", "+faststart",
-            "-progress", "pipe:1",
-            output_path,
-        ]
         if log_cb:
             log_cb(
                 f"[logo] حرق اللوجو ({Path(logo_path).name}): الركن {pos}"
                 f" · شفافية {int(op * 100)}% · عرض {logo_w}px"
             )
-    else:
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vf", ass_filter, *v_args,
-            "-c:a", "aac", "-b:a", audio_bitrate,
-            "-movflags", "+faststart",
-            "-progress", "pipe:1",
-            output_path,
-        ]
-
-    if log_cb:
-        log_cb(f"[ffmpeg] بدء الحرق والضغط لـ {Path(output_path).name} ({v_args[1]})...")
-    if progress_cb:
-        progress_cb(0.5, f"تشغيل محرك {v_args[1]}...", Path(output_path).name)
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    assert proc.stdout is not None
 
     PROGRESS_KEYS = (
         "frame=", "fps=", "stream_", "bitrate=", "total_size=",
         "out_time", "dup_frames=", "drop_frames=", "speed=", "progress=",
     )
-    tail: List[str] = []
-    pstate: Dict[str, str] = {}
-    last_log_t = 0.0
-
-    for line in proc.stdout:
-        clean = line.strip()
-        if not clean:
-            continue
-        if clean.startswith(PROGRESS_KEYS) and "=" in clean:
-            k, v = clean.split("=", 1)
-            pstate[k.strip()] = v.strip()
-            if k.strip() == "progress":
-                cur_sec = _parse_hms(pstate.get("out_time", "00:00:00"))
-                fps_v = pstate.get("fps", "0")
-                spd_v = pstate.get("speed", "—")
-                sz_mb = int(pstate.get("total_size", "0") or "0") / (1024 * 1024)
-                pct = min(99.8, (cur_sec / total_dur) * 100.0) if total_dur > 0 else 50.0
-                spd_num = 0.0
-                try:
-                    spd_num = float(spd_v.replace("x", "").strip())
-                except Exception:
-                    pass
-                eta_txt = "—"
-                if total_dur > 0 and spd_num > 0.05:
-                    rem = max(0, int((total_dur - cur_sec) / spd_num))
-                    eta_txt = f"{rem // 60:02d}:{rem % 60:02d}"
-                cm, cs = divmod(int(cur_sec), 60)
-                tm, ts = divmod(int(total_dur), 60)
-                if progress_cb:
-                    progress_cb(
-                        pct,
-                        f"السرعة: {spd_v} · {fps_v} fps · المتبقي: {eta_txt}",
-                        f"{cm:02d}:{cs:02d} / {tm:02d}:{ts:02d} · {sz_mb:.1f} MB",
-                    )
-                now_t = time.monotonic()
-                if log_cb and (now_t - last_log_t >= 8.0):
-                    last_log_t = now_t
-                    log_cb(f"[ffmpeg] {pct:.1f}% | السرعة: {spd_v} | الحجم: {sz_mb:.1f} MB | المتبقي: {eta_txt}")
+    last_tail: List[str] = []
+    ok = False
+    for attempt_i, eng in enumerate(attempts):
+        v_args = _build_v_args(eng)
+        if (eng != requested or attempt_i > 0) and log_cb:
+            log_cb(f"🔄 المحرك المطلوب ({requested}) مش متاح أو فشل — هكمل بـ {eng}.")
+        if use_logo:
+            cmd = [
+                "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
+                "-filter_complex", fc,
+                "-map", "[vout]", "-map", "0:a?", *v_args,
+                "-c:a", "aac", "-b:a", audio_bitrate,
+                "-movflags", "+faststart",
+                "-progress", "pipe:1",
+                output_path,
+            ]
         else:
-            tail.append(clean)
-            if len(tail) > 25:
-                tail.pop(0)
+            cmd = [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", ass_filter, *v_args,
+                "-c:a", "aac", "-b:a", audio_bitrate,
+                "-movflags", "+faststart",
+                "-progress", "pipe:1",
+                output_path,
+            ]
 
-    if proc.wait() != 0:
-        raise RuntimeError("FFmpeg failed:\n" + "\n".join(tail[-10:]))
+        if log_cb:
+            log_cb(f"[ffmpeg] بدء الحرق والضغط لـ {Path(output_path).name} ({v_args[1]})...")
+        if progress_cb:
+            progress_cb(0.5, f"تشغيل محرك {v_args[1]}...", Path(output_path).name)
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert proc.stdout is not None
+
+        tail: List[str] = []
+        pstate: Dict[str, str] = {}
+        last_log_t = 0.0
+
+        for line in proc.stdout:
+            clean = line.strip()
+            if not clean:
+                continue
+            if clean.startswith(PROGRESS_KEYS) and "=" in clean:
+                k, v = clean.split("=", 1)
+                pstate[k.strip()] = v.strip()
+                if k.strip() == "progress":
+                    cur_sec = _parse_hms(pstate.get("out_time", "00:00:00"))
+                    fps_v = pstate.get("fps", "0")
+                    spd_v = pstate.get("speed", "—")
+                    sz_mb = int(pstate.get("total_size", "0") or "0") / (1024 * 1024)
+                    pct = min(99.8, (cur_sec / total_dur) * 100.0) if total_dur > 0 else 50.0
+                    spd_num = 0.0
+                    try:
+                        spd_num = float(spd_v.replace("x", "").strip())
+                    except Exception:
+                        pass
+                    eta_txt = "—"
+                    if total_dur > 0 and spd_num > 0.05:
+                        rem = max(0, int((total_dur - cur_sec) / spd_num))
+                        eta_txt = f"{rem // 60:02d}:{rem % 60:02d}"
+                    cm, cs = divmod(int(cur_sec), 60)
+                    tm, ts = divmod(int(total_dur), 60)
+                    if progress_cb:
+                        progress_cb(
+                            pct,
+                            f"السرعة: {spd_v} · {fps_v} fps · المتبقي: {eta_txt}",
+                            f"{cm:02d}:{cs:02d} / {tm:02d}:{ts:02d} · {sz_mb:.1f} MB",
+                        )
+                    now_t = time.monotonic()
+                    if log_cb and (now_t - last_log_t >= 8.0):
+                        last_log_t = now_t
+                        log_cb(f"[ffmpeg] {pct:.1f}% | السرعة: {spd_v} | الحجم: {sz_mb:.1f} MB | المتبقي: {eta_txt}")
+            else:
+                tail.append(clean)
+                if len(tail) > 25:
+                    tail.pop(0)
+
+        if proc.wait() == 0:
+            ok = True
+            break
+        last_tail = tail
+        if log_cb:
+            log_cb(f"⚠️ محاولة {eng} فشلت (كود {proc.returncode}). آخر سطور ffmpeg:")
+            for tl in tail[-6:]:
+                log_cb(f"    {tl}")
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+    if not ok:
+        raise RuntimeError("FFmpeg failed:\n" + "\n".join(last_tail[-10:]))
 
     orig_mb = os.path.getsize(video_path) / (1024 * 1024)
     new_mb = os.path.getsize(output_path) / (1024 * 1024)
