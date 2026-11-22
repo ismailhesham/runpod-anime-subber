@@ -1330,12 +1330,14 @@ def step_batch_process(
     logo_position: str,
     logo_opacity: float,
     logo_scale: float,
+    restore_model: str = "off",
 ):
     """Season batch mode: one or more torrent links (each may hold a whole season or more),
     download all episodes, translate + burn + compress each, and collect them into one
     folder split into sub-folders of 35 episodes for long anime. Resume-safe."""
     logs: List[str] = []
     grind_ctx = {"gi": 0, "total": 0}  # سياق شريط تقدم الموسم — كان غير معرّف في هذه الدالة (إصلاح عطل)
+    restore_on = bool(restore_model) and restore_model != "off"
 
     def push(msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -1646,6 +1648,8 @@ def step_batch_process(
             )
 
             vw_p, vh_p, _, _ = probe_video_info(str(vid_p))
+            if restore_on:
+                vw_p, vh_p = vw_p * 4, vh_p * 4  # ملف الترجمة يُبنى على أبعاد الفيديو المرمَّم ×4
             ep_ass_p = ass_root / f"{series_safe}_{ep_label_p}_AR.ass"
             write_responsive_ass(
                 entries=entries_p,
@@ -1754,9 +1758,20 @@ def step_batch_process(
                 # ابدأ تجهيز الحلقة اللي بعدها في الخلفية قبل ما الحرق يبدأ
                 _start_bg_prep(_next_pending(gi + 1))
 
+                burn_vid = str(vid)
+                if restore_on:
+                    burn_vid = yield from run_live(
+                        restore_video,
+                        str(vid), str(Path(prep["work_dir"]) / f"restored_{vid.stem}.mp4"),
+                        model_key=restore_model,
+                        badge=f"RESTORE ×4 [{ep_label} {gi}/{total}]",
+                        title=f"ترميم حلقة {gi} من {total} ×4 بموديل {MODEL_LABELS.get(restore_model, restore_model)}...",
+                        accepts_progress_cb=True,
+                    )
+
                 yield from run_live(
                     burn_and_compress_native,
-                    video_path=str(vid),
+                    video_path=burn_vid,
                     ass_path=str(prep["ep_ass"]),
                     output_path=str(out_mp4),
                     fonts_dir=str(FONTS_DIR),
@@ -1775,7 +1790,7 @@ def step_batch_process(
                 )
                 yield from run_live(
                     qc_burned_episode,
-                    str(vid), str(out_mp4),
+                    burn_vid, str(out_mp4),
                     ass_path=str(prep["ep_ass"]),
                     expected_lines=len(prep["entries"]),
                     qc_dir=str(series_root / "_qc" / ep_label),
@@ -2015,8 +2030,10 @@ def step_restore_preview(
     link_1080: str, file_1080: Optional[str],
     link_720: str, file_720: Optional[str],
     link_480: str, file_480: Optional[str],
+    batch_links: str = "",
 ):
-    """معاينة الترميم: تحميل الحلقة (أو استخدام المحفوظ) ثم ترميم أول 10 ثوانٍ فقط وعرضها."""
+    """معاينة الترميم: تحميل الحلقة (أو استخدام المحفوظ) ثم ترميم أول 10 ثوانٍ فقط وعرضها.
+    لو مفيش مصدر حلقة مفردة، تستخدم أول رابط من خانة المواسم (وضع الدفعة)."""
     logs: List[str] = []
 
     def push(msg: str) -> None:
@@ -2084,21 +2101,39 @@ def step_restore_preview(
                 src = (lbl, lnk, fl)
                 break
         if src is None:
-            push("⚠️ أدخل رابط الحلقة أو اختر حلقة محفوظة على السيرفر قبل معاينة الترميم.")
-            yield pack(
-                render_progress_hud(0.0, "تنبيه · لا يوجد مصدر", "أدخل رابط أو اختر حلقة محفوظة", "—", "—", mode="error")
+            first_batch = next((ln.strip() for ln in (batch_links or "").splitlines() if ln.strip()), "")
+            if not first_batch:
+                push("⚠️ أدخل رابط الحلقة (أو رابط دفعة في خانة المواسم) أو اختر حلقة محفوظة قبل معاينة الترميم.")
+                yield pack(
+                    render_progress_hud(0.0, "تنبيه · لا يوجد مصدر", "أدخل رابط حلقة أو دفعة أو اختر حلقة محفوظة", "—", "—", mode="error")
+                )
+                return
+            push("📚 معاينة من وضع الدفعة: أول رابط في خانة المواسم — الدفعة تُحمَّل كاملة أول مرة وتفضل محفوظة لطحن الموسم بعدها.")
+            ep_folder_name = "season_preview"
+            cdir = _raw_cache_dir_for_source("season", first_batch, None, "restore_preview")
+            vids = yield from run_live(
+                download_season_batch,
+                first_batch, None, str(cdir),
+                badge="PREVIEW · SEASON DOWNLOAD",
+                title="تحميل الدفعة لمعاينة الترميم (ستبقى محفوظة لطحن الموسم)...",
             )
-            return
-        lbl, lnk, fl = src
-        auto_base = episode_name.strip() or (Path(fl).stem if fl else "episode")
-        ep_folder_name = _safe_name(auto_base)
-        cdir = _raw_cache_dir_for_source(lbl, lnk, fl, ep_folder_name)
-        vid_path = yield from run_live(
-            download_torrent_or_url,
-            lnk, fl, str(cdir),
-            badge=f"PREVIEW · DOWNLOAD [{lbl}]",
-            title=f"تحميل / فحص الحلقة الخام بجودة {lbl} لمعاينة الترميم",
-        )
+            uniq = {str(p.resolve()): p for p in vids}
+            vids = sorted(uniq.values(), key=episode_sort_key)
+            if not vids:
+                raise RuntimeError("لم يتم العثور على أي حلقة في رابط الدفعة.")
+            vid_path = vids[0]
+            push(f"✓ المعاينة من أول حلقة في الدفعة: {vid_path.name}")
+        else:
+            lbl, lnk, fl = src
+            auto_base = episode_name.strip() or (Path(fl).stem if fl else "episode")
+            ep_folder_name = _safe_name(auto_base)
+            cdir = _raw_cache_dir_for_source(lbl, lnk, fl, ep_folder_name)
+            vid_path = yield from run_live(
+                download_torrent_or_url,
+                lnk, fl, str(cdir),
+                badge=f"PREVIEW · DOWNLOAD [{lbl}]",
+                title=f"تحميل / فحص الحلقة الخام بجودة {lbl} لمعاينة الترميم",
+            )
         out_prev = str(STORAGE_ROOT / f"restore_preview_{restore_model}_{ep_folder_name or 'episode'}.mp4")
         yield from run_live(
             restore_video,
@@ -2397,6 +2432,7 @@ def build_ui() -> gr.Blocks:
                 link_1080, file_1080,
                 link_720, file_720,
                 link_480, file_480,
+                batch_links,
             ],
             outputs=[progress_hud, log_box, restore_preview_video],
         )
@@ -2411,6 +2447,7 @@ def build_ui() -> gr.Blocks:
                 credit_translator, credit_typesetter, credit_encoder,
                 cleanup_temp,
                 logo_position, logo_opacity, logo_scale,
+                restore_model,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
