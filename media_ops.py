@@ -393,6 +393,7 @@ def burn_and_compress_native(
     codec: str = "h264_nvenc",
     cq: int = 23,
     preset: str = "p6",
+    x265_preset: str = "slow",
     audio_bitrate: str = "160k",
     logo_path: str = "",
     logo_position: str = "top-right",
@@ -432,7 +433,8 @@ def burn_and_compress_native(
                 v += ["-tag:v", "hvc1"]
             return v
         if eng == "libx265":
-            return ["-c:v", "libx265", "-preset", "slow", "-crf", str(cq), "-pix_fmt", "yuv420p",
+            # بلا أي كاب على الأنظمة: x265 بيبني pool بكل أنوية المعالج تلقائياً
+            return ["-c:v", "libx265", "-preset", x265_preset, "-crf", str(cq), "-pix_fmt", "yuv420p",
                     "-x265-params", "aq-mode=3", "-tag:v", "hvc1"]
         return ["-c:v", "libx264", "-preset", "medium", "-crf", str(cq), "-pix_fmt", "yuv420p"]
 
