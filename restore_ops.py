@@ -14,11 +14,11 @@ import time
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
-from media_ops import probe_video_info
+from media_ops import probe_video_info, _has_nvenc
 
 MODELS_DIR = Path(os.environ.get("RUNPOD_MODELS_ROOT", "/workspace/models"))
 
@@ -105,6 +105,35 @@ def _load_model(model_key: str, weights: Path, device, dtype, log_cb):
     return model
 
 
+def _pick_cugan_tuning(px: int, vram_gb: float) -> Tuple[int, int]:
+    """(tile_mode, batch_size) لـ CUGAN حسب حجم الفريم وذاكرة الكرت.
+    tile_mode=0 يعني الفريم كاملاً دفعة واحدة (أسرع بكتير) لو الذاكرة تكفي."""
+    if px <= 640 * 480:
+        return 0, 4
+    if px <= 1280 * 720:
+        if vram_gb >= 14:
+            return 0, 2
+        if vram_gb >= 8:
+            return 1, 2
+        return 2, 1
+    if vram_gb >= 16:
+        return 0, 1
+    if vram_gb >= 10:
+        return 1, 1
+    if vram_gb >= 6:
+        return 2, 1
+    return 3, 1
+
+
+def _pick_v3_batch(px: int, vram_gb: float) -> int:
+    """حجم الدفعة لموديل v3 الخفيف حسب الذاكرة."""
+    if px <= 640 * 480:
+        return 4
+    if px <= 1280 * 720:
+        return 4 if vram_gb >= 10 else 2
+    return 4 if vram_gb >= 12 else (2 if vram_gb >= 8 else 1)
+
+
 def _sr_batch(model, model_key: str, frames: np.ndarray, device, dtype, tile_mode: int) -> np.ndarray:
     """Run a batch of RGB uint8 frames (n,h,w,3) -> x4 RGB uint8 (n,4h,4w,3)."""
     import torch
@@ -182,12 +211,17 @@ def restore_video(
     model = _load_model(model_key, weights, device, dtype, log)
 
     px = w * h
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if device.type == "cuda" else 0.0
     if model_key == "cugan":
-        tile_mode = 0 if px <= 640 * 480 else (2 if px <= 1280 * 720 else 3)
+        tile_mode, batch_size = _pick_cugan_tuning(px, vram_gb)
     else:
-        tile_mode = 0  # SRVGG: مقاسات حتى 1080p تُعالج ككتلة واحدة على كروت 20GB+
-    batch_size = 4 if px <= 640 * 480 else (2 if px <= 1280 * 720 else 1)
-    log(f"⚙️ إعدادات المعالجة: batch={batch_size}" + (f" · tile_mode={tile_mode}" if model_key == "cugan" else ""))
+        tile_mode = 0
+        batch_size = _pick_v3_batch(px, vram_gb)
+    log(
+        f"⚙️ إعدادات المعالجة: batch={batch_size}"
+        + (f" · tile_mode={tile_mode}" if model_key == "cugan" else "")
+        + (f" · VRAM={vram_gb:.0f}GB" if vram_gb else "")
+    )
 
     ow, oh = w * 4, h * 4
     dec_cmd = ["ffmpeg", "-v", "error"]
@@ -197,77 +231,135 @@ def restore_video(
         dec_cmd += ["-t", f"{eff_seconds:.3f}"]
     dec_cmd += ["-i", video_path, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
 
-    enc_cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", f"{fps:.6f}", "-i", "pipe:0",
-    ]
-    if start_at > 0:
-        enc_cmd += ["-ss", f"{start_at:.3f}"]
-    if eff_seconds:
-        enc_cmd += ["-t", f"{eff_seconds:.3f}"]
-    enc_cmd += [
-        "-i", video_path,
-        "-map", "0:v", "-map", "1:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "160k",
-        "-shortest", out_path,
-    ]
+    use_nv = _has_nvenc("hevc_nvenc") and device.type == "cuda"
+    if use_nv:
+        log("⚡ ترميز الناتج على كرت الشاشة (hevc_nvenc) — أسرع بكتير من المعالج خصوصاً مع دقة ×4.")
+    else:
+        log("⚠️ ترميز الناتج على المعالج (libx264) — hevc_nvenc غير متاح.")
 
-    dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    def _build_enc_cmd(nv: bool) -> List[str]:
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", f"{fps:.6f}", "-i", "pipe:0",
+        ]
+        if start_at > 0:
+            cmd += ["-ss", f"{start_at:.3f}"]
+        if eff_seconds:
+            cmd += ["-t", f"{eff_seconds:.3f}"]
+        cmd += ["-i", video_path, "-map", "0:v", "-map", "1:a?"]
+        if nv:
+            cmd += [
+                "-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr",
+                "-cq", str(min(24, max(14, crf + 2))), "-b:v", "0",
+                "-spatial-aq", "1", "-temporal-aq", "1", "-pix_fmt", "yuv420p",
+                "-bf", "3", "-tag:v", "hvc1",
+            ]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        cmd += ["-c:a", "aac", "-b:a", "160k", "-shortest", out_path]
+        return cmd
 
     frame_bytes = w * h * 3
-    done_frames = 0
-    batch: list = []
-    fps_win_t = time.time()
-    fps_win_n = 0
-
-    def _flush_batch() -> None:
-        nonlocal done_frames, fps_win_t, fps_win_n
-        if not batch:
-            return
-        arr = np.stack(batch, axis=0)
-        out = _sr_batch(model, model_key, arr, device, dtype, tile_mode)
-        enc.stdin.write(out.tobytes())
-        done_frames += len(batch)
-        fps_win_n += len(batch)
-        batch.clear()
-        now = time.time()
-        if now - fps_win_t >= 2.0:
-            cur_fps = fps_win_n / max(0.001, now - fps_win_t)
-            fps_win_t, fps_win_n = now, 0
-            pct = (done_frames / est_frames * 100.0) if est_frames else 0.0
-            remaining = est_frames - done_frames
-            eta_s = (remaining / cur_fps) if (remaining > 0 and cur_fps > 0) else 0
-            eta_txt = f" · متبقٍ ~{int(eta_s // 60)}:{int(eta_s % 60):02d}" if (eta_s > 0 and pct < 99.0) else ""
-            prog(
-                min(99.0, pct),
-                f"ترميم: {done_frames}/{est_frames or '؟'} فريم",
-                f"{cur_fps:.1f} فريم/ث" + eta_txt,
-            )
 
     while True:
-        buf = dec.stdout.read(frame_bytes)
-        if not buf or len(buf) < frame_bytes:
-            break
-        frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-        batch.append(frame)
-        if len(batch) >= batch_size:
-            _flush_batch()
-    _flush_batch()
+        done_frames = 0
+        batch: list = []
+        fps_win_t = time.time()
+        fps_win_n = 0
+        enc_died_early = False
 
-    try:
-        enc.stdin.close()
-    except Exception:
-        pass
-    dec_rc = dec.wait()
-    enc_rc = enc.wait()
-    if dec_rc != 0:
-        err = dec.stderr.read().decode("utf-8", "replace")[-500:]
-        raise RuntimeError(f"❌ فشل فك ترميز الفيديو أثناء الترميم: {err}")
-    if enc_rc != 0:
-        err = enc.stderr.read().decode("utf-8", "replace")[-500:]
-        raise RuntimeError(f"❌ فشل ضغط الفيديو المرمَّم: {err}")
+        dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        enc = subprocess.Popen(_build_enc_cmd(use_nv), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        def _flush_batch() -> None:
+            nonlocal done_frames, fps_win_t, fps_win_n
+            if not batch:
+                return
+            arr = np.stack(batch, axis=0)
+            out = _sr_batch(model, model_key, arr, device, dtype, tile_mode)
+            enc.stdin.write(out.tobytes())
+            done_frames += len(batch)
+            fps_win_n += len(batch)
+            batch.clear()
+            now = time.time()
+            if now - fps_win_t >= 2.0:
+                cur_fps = fps_win_n / max(0.001, now - fps_win_t)
+                fps_win_t, fps_win_n = now, 0
+                pct = (done_frames / est_frames * 100.0) if est_frames else 0.0
+                remaining = est_frames - done_frames
+                eta_s = (remaining / cur_fps) if (remaining > 0 and cur_fps > 0) else 0
+                eta_txt = f" · متبقٍ ~{int(eta_s // 60)}:{int(eta_s % 60):02d}" if (eta_s > 0 and pct < 99.0) else ""
+                prog(
+                    min(99.0, pct),
+                    f"ترميم: {done_frames}/{est_frames or '؟'} فريم",
+                    f"{cur_fps:.1f} فريم/ث" + eta_txt,
+                )
+
+        try:
+            while True:
+                buf = dec.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+                batch.append(frame)
+                if len(batch) >= batch_size:
+                    _flush_batch()
+                    if enc.poll() is not None:
+                        enc_died_early = True
+                        break
+            if not enc_died_early:
+                _flush_batch()
+        except torch.cuda.OutOfMemoryError:
+            for p in (dec, enc):
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            if done_frames == 0 and model_key == "cugan" and tile_mode < 4:
+                tile_mode += 1
+                batch_size = 1
+                log(f"⚠️ ذاكرة الكرت امتلأت — تقليل حجم القطعة تلقائياً (tile_mode={tile_mode}) وإعادة المحاولة.")
+                continue
+            if done_frames == 0 and model_key != "cugan" and batch_size > 1:
+                batch_size = max(1, batch_size // 2)
+                log(f"⚠️ ذاكرة الكرت امتلأت — تقليل الدفعة إلى {batch_size} وإعادة المحاولة.")
+                continue
+            try:
+                Path(out_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+        if enc_died_early:
+            try:
+                dec.kill()
+            except Exception:
+                pass
+        try:
+            enc.stdin.close()
+        except Exception:
+            pass
+        dec_rc = dec.wait()
+        enc_rc = enc.wait()
+        if (enc_died_early or enc_rc != 0) and done_frames == 0 and use_nv:
+            log("⚠️ ترميز الكرت فشل من البداية — الرجوع إلى ترميز المعالج (libx264) وإعادة المحاولة.")
+            use_nv = False
+            try:
+                Path(out_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+        if enc_died_early or enc_rc != 0:
+            err = enc.stderr.read().decode("utf-8", "replace")[-500:]
+            raise RuntimeError(f"❌ فشل ترميز الفيديو المرمَّم: {err}")
+        if dec_rc != 0:
+            err = dec.stderr.read().decode("utf-8", "replace")[-500:]
+            raise RuntimeError(f"❌ فشل فك ترميز الفيديو أثناء الترميم: {err}")
+        break
 
     elapsed = time.time() - t_start
     out_mb = Path(out_path).stat().st_size / 1e6 if Path(out_path).is_file() else 0.0
