@@ -1313,6 +1313,7 @@ def step_batch_process(
     download all episodes, translate + burn + compress each, and collect them into one
     folder split into sub-folders of 35 episodes for long anime. Resume-safe."""
     logs: List[str] = []
+    grind_ctx = {"gi": 0, "total": 0}  # سياق شريط تقدم الموسم — كان غير معرّف في هذه الدالة (إصلاح عطل)
 
     def push(msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -1480,7 +1481,7 @@ def step_batch_process(
 
         rendered: Dict[str, str] = {}
         failed: List[str] = []
-        glossary: Dict = {}
+        glossary_box: Dict[str, Any] = {"val": {}}  # صندوق مشترك: التجهيز المبكر بيحدثه في الخلفية
         last_ass: Optional[str] = None
 
         # ☁️ نسخ احتياطي على Google Drive: البود مؤقت وكل حاجة بتتمسح لما يتقفل
@@ -1510,133 +1511,231 @@ def step_batch_process(
         def _tkey(txt: str) -> str:
             return " ".join((txt or "").split())
 
-        # ═══ المرحلة 2: معالجة كل حلقة (ترجمة ← حرق ← ضغط) ═══
+        # ═══ المرحلة 2: معالجة كل حلقة مع تجهيز مبكر (Pipelining) ═══
+        # الفكرة: أثناء حرق/ضغط/رفع الحلقة الحالية، خيط خلفية واحد يجهّز الحلقة
+        # اللي بعدها (سحب ترجمة/تفريغ + ترجمة + ملف ASS). التجهيز نفسه ما بيشتغلش
+        # أبداً في خيطين في نفس اللحظة، فمفيش تزاحم على ذاكرة الترجمة أو القاموس،
+        # والحرق والرفع بيفضلوا بالترتيب زي ما هما بالظبط.
+
+        # الحلقات الجاهزة مسبقاً تتخطى من الأول من غير أي إعادة تجهيز (استكمال بعد ريستارت)
+        skip_set: set = set()
+        for gi0 in range(1, total + 1):
+            out0 = part_dir_for(gi0) / f"{series_safe}_EP{gi0:03d}_AR.mp4"
+            if out0.exists() and out0.stat().st_size > 1024 * 1024:
+                skip_set.add(gi0)
+                rendered[f"EP{gi0:03d}"] = str(out0)
+        if skip_set:
+            push(f"⏭️ {len(skip_set)} حلقة جاهزة مسبقاً — هتتخطى من غير تجهيز.")
+
+        def _next_pending(start_gi: int) -> int:
+            for gj in range(start_gi, total + 1):
+                if gj not in skip_set:
+                    return gj
+            return 0
+
+        def _prep_episode(gi_p: int, vid_p: Path, log_cb=None) -> Dict[str, Any]:
+            """تجهيز حلقة كاملة قبل الحرق: سحب ترجمة/تفريغ ← ترجمة ← قاموس ← ملف ASS.
+            بتشتغل إما في الخيط الرئيسي (خطة بديلة) أو في خيط الخلفية الواحد."""
+            cb = log_cb if callable(log_cb) else push
+            ep_label_p = f"EP{gi_p:03d}"
+            work_dir_p = RAW_CACHE_ROOT / "_work" / series_safe / ep_label_p
+            work_dir_p.mkdir(parents=True, exist_ok=True)
+
+            source_sub_p = None
+            is_raw_whisper_p = False
+            if sub_mode.startswith("Auto"):
+                probe = probe_embedded_subtitles(str(vid_p))
+                if probe is not None:
+                    source_sub_p = extract_embedded_subtitle(str(vid_p), probe[0], probe[1], str(work_dir_p))
+                    cb(f"✓ {ep_label_p}: تم سحب الترجمة المدمجة ({probe[1]}).")
+            if source_sub_p is None:
+                is_raw_whisper_p = True
+                source_sub_p = transcribe_with_whisper(
+                    str(vid_p),
+                    str(work_dir_p / "whisper.srt"),
+                    model_size=whisper_model,
+                    log_cb=cb,
+                )
+
+            entries_p = parse_source_subtitles(source_sub_p)
+
+            if (api_key.strip() or "Local" in provider) and not glossary_box["val"]:
+                glossary_box["val"] = load_or_extract_series_glossary(
+                    series_name=series_name,
+                    entries=entries_p,
+                    is_raw_whisper=is_raw_whisper_p,
+                    provider=_provider_key(provider),
+                    api_key=api_key,
+                    model_name=llm_model,
+                    base_url=base_url,
+                    log_cb=cb,
+                )
+
+            reused_p: Dict[int, str] = {}
+            if tmem:
+                for e in entries_p:
+                    if getattr(e, "keep_untranslated", False):
+                        continue
+                    k = _tkey(getattr(e, "plain_text", ""))
+                    if k and k in tmem:
+                        reused_p[e.index] = tmem[k]
+            if reused_p:
+                cb(f"♻️ {ep_label_p}: {len(reused_p)} سطر مكرر (أوبنينج/إندينج) أُعيد استخدام ترجمته — المتبقي {len(entries_p) - len(reused_p)} سطر.")
+
+            translations_p = translate_entries(
+                entries=[e for e in entries_p if e.index not in reused_p],
+                provider=_provider_key(provider),
+                api_key=api_key,
+                model_name=llm_model,
+                base_url=base_url,
+                series_name=series_name,
+                glossary=glossary_box["val"],
+                checkpoint_path=str(work_dir_p / "translation_checkpoint.json"),
+                log_cb=cb,
+            )
+            translations_p.update(reused_p)
+
+            idx2key_p = {
+                e.index: _tkey(getattr(e, "plain_text", ""))
+                for e in entries_p
+                if not getattr(e, "keep_untranslated", False)
+            }
+            for _idx, _ar in translations_p.items():
+                _k = idx2key_p.get(_idx)
+                if _k:
+                    tmem[_k] = _ar
+            try:
+                _tmp_tmem = tmem_path.with_suffix(".tmp")
+                _tmp_tmem.write_text(json.dumps(tmem, ensure_ascii=False), encoding="utf-8")
+                os.replace(str(_tmp_tmem), str(tmem_path))  # كتابة ذرّية: رفع Drive ممكن يشتغل بالتوازي
+            except Exception:
+                pass
+
+            glossary_box["val"] = learn_glossary_from_translation(
+                series_name=series_name,
+                entries=entries_p,
+                translations=translations_p,
+                glossary=glossary_box["val"],
+                provider=_provider_key(provider),
+                api_key=api_key,
+                model_name=llm_model,
+                base_url=base_url,
+                log_cb=cb,
+            )
+
+            vw_p, vh_p, _, _ = probe_video_info(str(vid_p))
+            ep_ass_p = ass_root / f"{series_safe}_{ep_label_p}_AR.ass"
+            write_responsive_ass(
+                entries=entries_p,
+                translations=translations_p,
+                out_ass_path=str(ep_ass_p),
+                target_w=vw_p,
+                target_h=vh_p,
+                style_preset=style_preset,
+                credits=credits_dict if has_credits else None,
+                wrap_mode=wrap_mode,
+                soften_exclaim=soften_exclaim,
+            )
+            return {
+                "ep_label": ep_label_p,
+                "work_dir": work_dir_p,
+                "entries": entries_p,
+                "ep_ass": str(ep_ass_p),
+            }
+
+        def _bg_log(m) -> None:
+            s = str(m)
+            if s.startswith("[whisper_prog]"):
+                return  # نبضات التفريغ اللحظية بتتخطى في وضع الخلفية
+            push(s)
+
+        prep_box: Dict[str, Any] = {}
+
+        def _start_bg_prep(gi_p: int) -> None:
+            if gi_p <= 0 or gi_p > total:
+                return
+            if prep_box.get("thread") is not None:
+                return  # فيه تجهيز شغال أصلاً — التجهيز دايماً خيط واحد في نفس اللحظة
+            vid_p = all_eps[gi_p - 1]
+            prep_box.clear()
+            prep_box["gi"] = gi_p
+
+            def _bg() -> None:
+                try:
+                    prep_box["result"] = _prep_episode(gi_p, vid_p, _bg_log)
+                except BaseException as exc_p:
+                    prep_box["error"] = exc_p
+
+            t = threading.Thread(target=_bg, daemon=True)
+            prep_box["thread"] = t
+            push(f"🧵 تجهيز مبكر: الحلقة {gi_p} من {total} بدأت تتجهز في الخلفية (ترجمة/تفريغ) أثناء شغل الحالية.")
+            t.start()
+
+        # ابدأ تجهيز أول حلقة ناقصة فوراً
+        _first_pending = _next_pending(1)
+        if _first_pending:
+            _start_bg_prep(_first_pending)
+
         for gi, vid in enumerate(all_eps, 1):
             ep_label = f"EP{gi:03d}"
             grind_ctx["gi"] = gi
             out_mp4 = part_dir_for(gi) / f"{series_safe}_{ep_label}_AR.mp4"
 
-            if out_mp4.exists() and out_mp4.stat().st_size > 1024 * 1024:
+            if gi in skip_set:
                 push(f"⏭️ {ep_label} جاهزة مسبقاً — تخطي ({out_mp4.name})")
-                rendered[ep_label] = str(out_mp4)
                 continue
 
             push(f"━━━━━━ {ep_label} ({gi}/{total}): {vid.name} ━━━━━━")
-            work_dir = RAW_CACHE_ROOT / "_work" / series_safe / ep_label
-            work_dir.mkdir(parents=True, exist_ok=True)
 
             try:
-                source_sub = None
-                is_raw_whisper = False
-                if sub_mode.startswith("Auto"):
-                    probe = probe_embedded_subtitles(str(vid))
-                    if probe is not None:
-                        source_sub = extract_embedded_subtitle(str(vid), probe[0], probe[1], str(work_dir))
-                        push(f"✓ {ep_label}: تم سحب الترجمة المدمجة ({probe[1]}).")
-                if source_sub is None:
-                    is_raw_whisper = True
-                    source_sub = yield from run_live(
-                        transcribe_with_whisper,
-                        str(vid),
-                        str(work_dir / "whisper.srt"),
-                        model_size=whisper_model,
-                        badge=f"WHISPER [{ep_label} {gi}/{total}]",
-                        title=f"حلقة {gi} من {total} خام بدون ترجمة — تفريغ الصوت...",
+                # استهلاك التجهيز المبكر للحلقة دي (مع الانتظار لو لسه شغال)
+                prep = None
+                pt = prep_box.get("thread")
+                if pt is not None:
+                    same = prep_box.get("gi") == gi
+                    if same and pt.is_alive():
+                        push(f"⏳ الشغل الحالي خلص قبل تجهيز {ep_label} — مستنيين الترجمة تكمل...")
+                        while pt.is_alive():
+                            last_log = logs[-1] if logs else "..."
+                            yield pack(render_progress_hud(
+                                0.0,
+                                f"PREP [{ep_label} {gi}/{total}]",
+                                f"تجهيز الحلقة {gi} من {total}: سحب ترجمة/تفريغ + ترجمة بالذكاء الاصطناعي...",
+                                str(last_log)[-110:],
+                                "الخلفية شغالة — أول ما تخلص يبدأ الحرق فوراً",
+                                mode="cyan",
+                                overall_pct=((gi - 1) / total) * 100.0,
+                                grind_label=f"طحن الموسم: {gi - 1} من {total}",
+                            ))
+                            time.sleep(0.4)
+                    pt.join()
+                    if same and prep_box.get("error") is None and prep_box.get("result"):
+                        prep = prep_box["result"]
+                        push(f"⚡ {ep_label}: التجهيز المبكر جاهز — الحرق هيبدأ على طول من غير انتظار.")
+                    elif same and prep_box.get("error") is not None:
+                        push(f"⚠️ التجهيز المبكر لـ {ep_label} فشل: {prep_box['error']} — هنجهزها دلوقتي بالطريقة العادية.")
+                    prep_box.clear()
+
+                if prep is None:
+                    # خطة بديلة: تجهيز مباشر في الخيط الرئيسي (أول مرة أو بعد فشل التجهيز المبكر)
+                    prep = yield from run_live(
+                        _prep_episode,
+                        gi, vid,
+                        badge=f"PREP [{ep_label} {gi}/{total}]",
+                        title=f"تجهيز الحلقة {gi} من {total}: سحب ترجمة/تفريغ + ترجمة...",
                         accepts_progress_cb=False,
                     )
+                    push(f"✓ {ep_label}: الترجمة وملف الـ ASS جاهزين.")
 
-                entries = parse_source_subtitles(source_sub)
+                last_ass = str(prep["ep_ass"])
 
-                if (api_key.strip() or "Local" in provider) and not glossary:
-                    glossary = yield from run_live(
-                        load_or_extract_series_glossary,
-                        series_name=series_name,
-                        entries=entries,
-                        is_raw_whisper=is_raw_whisper,
-                        provider=_provider_key(provider),
-                        api_key=api_key,
-                        model_name=llm_model,
-                        base_url=base_url,
-                        badge=f"SERIES GLOSSARY [{ep_label}]",
-                        title="تجهيز قاموس أسماء ومصطلحات الأنمي (مرة واحدة لكل الموسم)...",
-                        accepts_progress_cb=False,
-                    )
-
-                reused: Dict[int, str] = {}
-                if tmem:
-                    for e in entries:
-                        if getattr(e, "keep_untranslated", False):
-                            continue
-                        k = _tkey(getattr(e, "plain_text", ""))
-                        if k and k in tmem:
-                            reused[e.index] = tmem[k]
-                if reused:
-                    push(f"♻️ {ep_label}: {len(reused)} سطر مكرر (أوبنينج/إندينج) أُعيد استخدام ترجمته — المتبقي {len(entries) - len(reused)} سطر.")
-
-                translations = yield from run_live(
-                    translate_entries,
-                    entries=[e for e in entries if e.index not in reused],
-                    provider=_provider_key(provider),
-                    api_key=api_key,
-                    model_name=llm_model,
-                    base_url=base_url,
-                    series_name=series_name,
-                    glossary=glossary,
-                    checkpoint_path=str(work_dir / "translation_checkpoint.json"),
-                    badge=f"TRANSLATION [{ep_label} {gi}/{total}]",
-                    title=f"ترجمة حلقة {gi} من {total} بأسلوب Celestial-Dragons ({len(entries) - len(reused)} سطر)...",
-                    accepts_progress_cb=False,
-                )
-                translations.update(reused)
-
-                idx2key = {
-                    e.index: _tkey(getattr(e, "plain_text", ""))
-                    for e in entries
-                    if not getattr(e, "keep_untranslated", False)
-                }
-                for _idx, _ar in translations.items():
-                    _k = idx2key.get(_idx)
-                    if _k:
-                        tmem[_k] = _ar
-                try:
-                    tmem_path.write_text(json.dumps(tmem, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
-
-                glossary = yield from run_live(
-                    learn_glossary_from_translation,
-                    series_name=series_name,
-                    entries=entries,
-                    translations=translations,
-                    glossary=glossary,
-                    provider=_provider_key(provider),
-                    api_key=api_key,
-                    model_name=llm_model,
-                    base_url=base_url,
-                    badge=f"GLOSSARY LEARN [{ep_label}]",
-                    title="حفظ أسماء ومصطلحات الحلقة في قاموس الأنمي...",
-                    accepts_progress_cb=False,
-                )
-
-                vw, vh, _, _ = probe_video_info(str(vid))
-                ep_ass = ass_root / f"{series_safe}_{ep_label}_AR.ass"
-                write_responsive_ass(
-                    entries=entries,
-                    translations=translations,
-                    out_ass_path=str(ep_ass),
-                    target_w=vw,
-                    target_h=vh,
-                    style_preset=style_preset,
-                    credits=credits_dict if has_credits else None,
-                    wrap_mode=wrap_mode,
-                    soften_exclaim=soften_exclaim,
-                )
-                last_ass = str(ep_ass)
+                # ابدأ تجهيز الحلقة اللي بعدها في الخلفية قبل ما الحرق يبدأ
+                _start_bg_prep(_next_pending(gi + 1))
 
                 yield from run_live(
                     burn_and_compress_native,
                     video_path=str(vid),
-                    ass_path=str(ep_ass),
+                    ass_path=str(prep["ep_ass"]),
                     output_path=str(out_mp4),
                     fonts_dir=str(FONTS_DIR),
                     codec=codec,
@@ -1655,8 +1754,8 @@ def step_batch_process(
                 yield from run_live(
                     qc_burned_episode,
                     str(vid), str(out_mp4),
-                    ass_path=str(ep_ass),
-                    expected_lines=len(entries),
+                    ass_path=str(prep["ep_ass"]),
+                    expected_lines=len(prep["entries"]),
                     qc_dir=str(series_root / "_qc" / ep_label),
                     badge=f"QC [{ep_label} {gi}/{total}]",
                     title=f"فحص جودة حلقة {gi} من {total} بعد الحرق...",
@@ -1685,7 +1784,7 @@ def step_batch_process(
                                 )
                     except Exception as up_exc:
                         push(f"⚠️ فشل النسخ الاحتياطي لـ {ep_label} على Drive: {up_exc} — الحلقة محفوظة محلياً ومكملين.")
-                shutil.rmtree(work_dir, ignore_errors=True)
+                shutil.rmtree(str(prep["work_dir"]), ignore_errors=True)
                 if cleanup_temp:
                     try:
                         vid.unlink(missing_ok=True)
