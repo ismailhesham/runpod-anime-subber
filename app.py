@@ -2158,8 +2158,8 @@ def step_restore_preview(
             max_seconds=10.0,
             start_seconds=_mid_preview_start(str(vid_path)),
             crf=18,
-            badge="PREVIEW · AI RESTORE ×4",
-            title=f"معاينة الترميم: 10 ثوانٍ من منتصف الحلقة بموديل {MODEL_LABELS.get(restore_model, restore_model)}",
+            badge=f"PREVIEW · AI RESTORE ×{int(restore_scale)}",
+            title=f"معاينة الترميم: 10 ثوانٍ من منتصف الحلقة بموديل {MODEL_LABELS.get(restore_model, restore_model)} ×{int(restore_scale)}",
         )
         push("✅ معاينة الترميم جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم الحلقة كاملة.")
         yield pack(
@@ -2399,8 +2399,8 @@ def rtab_preview(model: str, scale: str, ep_names, eps_state: List[str]):
             restore_video, push, pack,
             str(ep), out_prev,
             model_key=model, scale=int(scale), max_seconds=10.0, start_seconds=_mid_preview_start(str(ep)), crf=18,
-            badge="PREVIEW · AI RESTORE ×4",
-            title=f"معاينة الترميم: 10 ثوانٍ من منتصف {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)}",
+            badge=f"PREVIEW · AI RESTORE ×{int(scale)}",
+            title=f"معاينة الترميم: 10 ثوانٍ من منتصف {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)} ×{int(scale)}",
         )
         push("✅ المعاينة جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم المجموعة.")
         yield pack(
@@ -2715,12 +2715,12 @@ def build_ui() -> gr.Blocks:
                                     link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
                                     file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
 
-                            with gr.Accordion("🧪 ترميم ×4 بالذكاء الاصطناعي (اختياري — للأنمي القديم منخفض الجودة)", open=True, elem_classes=["sb-accordion"]):
+                            with gr.Accordion("🧪 الترميم بالذكاء الاصطناعي (اختياري — للأنمي القديم منخفض الجودة)", open=True, elem_classes=["sb-accordion"]):
                                 restore_model = gr.Dropdown(
                                     choices=[
                                         ("بدون ترميم — الحلقة تكمل عادي", "off"),
-                                        ("Real-CUGAN ×4 — أعلى جودة (موصى به للأنمي القديم)", "cugan"),
-                                        ("realesr-animevideov3 ×4 — الخيار السريع", "v3"),
+                                        ("Real-CUGAN — أعلى جودة + تنظيف ضوضاء DVD (الأبطأ)", "cugan"),
+                                        ("Real-ESRGAN v3 — الأسرع ⚡ (كفاية لمعظم المصادر)", "v3"),
                                     ],
                                     value="off",
                                     label="موديل الترميم — يُحمَّل تلقائياً أول مرة فقط ويُحفظ في /workspace/models",
@@ -2732,7 +2732,7 @@ def build_ui() -> gr.Blocks:
                                         ("×4 — للمصادر 720p/1080p النظيفة فقط", "4"),
                                     ],
                                     value="2",
-                                    label="مقياس الترميم (لـ CUGAN — v3 ثابت ×4)",
+                                    label="مقياس الترميم — v3 يكبّر ×4 داخلياً ثم يصغّر للمقياس المختار",
                                 )
                                 restore_preview_btn = gr.Button(
                                     "👁️ معاينة الترميم — 10 ثوانٍ من منتصف الحلقة",
@@ -2873,8 +2873,8 @@ def build_ui() -> gr.Blocks:
                             out_video_files = gr.Files(label="🎥 تحميل الفيديوهات النهائية لجهازك")
                             out_ass_file = gr.File(label="📝 تحميل ملف الترجمة المنسّق (.ass)")
 
-            with gr.TabItem("🧪 الترميم ×4"):
-                gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">🧪 ترميم ×4: اترك مربع المصادر فاضياً واضغط تحميل لعرض المحمّل مسبقاً (أو الصق روابط/مسارات) → اختر أي عدد حلقات → معاينة 10 ثوانٍ → ترميم → ضغط → احكم: قبول يمسح المرمَّم ويبقي المضغوط، رفض يمسح المضغوط ويبقي المرمَّم لإعادة الضغط</div>')
+            with gr.TabItem("🧪 الترميم"):
+                gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">🧪 الترميم: اترك مربع المصادر فاضياً واضغط تحميل لعرض المحمّل مسبقاً (أو الصق روابط/مسارات) → اختر أي عدد حلقات → معاينة 10 ثوانٍ → ترميم → ضغط → احكم: قبول يمسح المرمَّم ويبقي المضغوط، رفض يمسح المضغوط ويبقي المرمَّم لإعادة الضغط</div>')
                 rtab_links = gr.Textbox(
                     label="روابط التورنت / الماجنت أو مسارات ملفات/مجلدات محلية — واحد في كل سطر",
                     placeholder="اتركه فاضياً لعرض كل الحلقات المحمّلة مسبقاً — أو الصق: magnet:?xt=urn:btih:... / مسار مجلد محلي",
@@ -2883,10 +2883,10 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     rtab_model = gr.Dropdown(
                         choices=[
-                            ("Real-CUGAN ×4 — أعلى جودة (موصى به للأنمي القديم)", "cugan"),
-                            ("realesr-animevideov3 ×4 — الخيار السريع", "v3"),
+                            ("Real-CUGAN — أعلى جودة + تنظيف ضوضاء DVD (الأبطأ)", "cugan"),
+                            ("Real-ESRGAN v3 — الأسرع ⚡ (كفاية لمعظم المصادر)", "v3"),
                         ],
-                        value="cugan",
+                        value="v3",
                         label="موديل الترميم",
                     )
                     rtab_scale = gr.Dropdown(
@@ -2902,7 +2902,7 @@ def build_ui() -> gr.Blocks:
                 rtab_eps = gr.Dropdown(choices=[], multiselect=True, label="الحلقات — اختر أي عدد (الكل محدد افتراضياً)", interactive=True)
                 rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ من منتصف أول حلقة مختارة", size="sm")
                 rtab_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ)")
-                rtab_run_btn = gr.Button("🚀 ترميم الحلقات المختارة ×4 — الأصلية تُمسح بعد نجاح كل حلقة [RESTORE]", variant="primary", size="lg")
+                rtab_run_btn = gr.Button("🚀 ترميم الحلقات المختارة — الأصلية تُمسح بعد نجاح كل حلقة [RESTORE]", variant="primary", size="lg")
                 with gr.Row():
                     rtab_codec = gr.Dropdown(
                         choices=[
