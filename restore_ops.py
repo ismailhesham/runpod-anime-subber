@@ -130,7 +130,7 @@ def _pick_cugan_tuning(px: int, vram_gb: float) -> Tuple[int, int]:
     """(tile_mode, batch_size) لـ CUGAN حسب حجم الفريم وذاكرة الكرت.
     tile_mode=0 يعني الفريم كاملاً دفعة واحدة (أسرع بكتير) لو الذاكرة تكفي."""
     if px <= 640 * 480:
-        return 0, 16
+        return 0, 12
     if px <= 1280 * 720:
         if vram_gb >= 14:
             return 0, 8
