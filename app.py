@@ -725,6 +725,7 @@ def load_settings() -> Dict:
         "base_url": "https://api.deepseek.com",
         "style_preset": "bleach_style",
         "wrap_mode": "sequential",
+        "soften_exclaim": True,
         "dood_api_key": os.environ.get("DOODSTREAM_API_KEY", ""),
         "gdrive_remote": "gdrive",
         "gdrive_folder": "Runpod_Anime",
@@ -752,7 +753,7 @@ _drive_restore_glossaries()
 
 
 def save_settings(
-    provider, llm_model, api_key, base_url, style_preset, wrap_mode, dood_api_key,
+    provider, llm_model, api_key, base_url, style_preset, wrap_mode, soften_exclaim, dood_api_key,
     gdrive_remote, gdrive_folder,
     codec, preset, cq, audio_bitrate,
     credit_translator, credit_typesetter, credit_encoder,
@@ -765,6 +766,7 @@ def save_settings(
         "base_url": base_url,
         "style_preset": style_preset,
         "wrap_mode": wrap_mode,
+        "soften_exclaim": bool(soften_exclaim),
         "dood_api_key": dood_api_key,
         "gdrive_remote": gdrive_remote,
         "gdrive_folder": gdrive_folder,
@@ -886,6 +888,7 @@ def step1_process_for_preview(
     series_pick: str,
     style_preset: str,
     wrap_mode: str,
+    soften_exclaim: bool,
     saved_raw_1080: str,
     link_1080: str, file_1080: Optional[str],
     link_720: str, file_720: Optional[str],
@@ -1151,6 +1154,7 @@ def step1_process_for_preview(
                 style_preset=style_preset,
                 credits=credits_dict if has_credits else None,
                 wrap_mode=wrap_mode,
+                soften_exclaim=soften_exclaim,
             )
             if ass_out is None:
                 ass_out = q_ass
@@ -1281,6 +1285,7 @@ def step_batch_process(
     series_pick: str,
     style_preset: str,
     wrap_mode: str,
+    soften_exclaim: bool,
     sub_mode: str,
     whisper_model: str,
     provider: str,
@@ -1619,6 +1624,7 @@ def step_batch_process(
                     style_preset=style_preset,
                     credits=credits_dict if has_credits else None,
                     wrap_mode=wrap_mode,
+                    soften_exclaim=soften_exclaim,
                 )
                 last_ass = str(ep_ass)
 
@@ -1993,6 +1999,10 @@ def build_ui() -> gr.Blocks:
                                 value=cfg.get("wrap_mode", "sequential"),
                                 label="تقسيم الأسطر العربية الطويلة",
                             )
+                            soften_exclaim = gr.Checkbox(
+                                value=bool(cfg.get("soften_exclaim", True)),
+                                label="تخفيف علامات التعجب (تحويل ! الخبرية إلى نقطة وحذفها بعد أوه/آه، مع الإبقاء على الصياح)",
+                            )
                         with gr.Row():
                             codec = gr.Dropdown(
                                 choices=[
@@ -2071,7 +2081,7 @@ def build_ui() -> gr.Blocks:
         save_btn.click(
             fn=save_settings,
             inputs=[
-                provider, llm_model, api_key, base_url, style_preset, wrap_mode, dood_api_key,
+                provider, llm_model, api_key, base_url, style_preset, wrap_mode, soften_exclaim, dood_api_key,
                 gdrive_remote, gdrive_folder,
                 codec, preset, cq, audio_bitrate,
                 credit_translator, credit_typesetter, credit_encoder,
@@ -2087,7 +2097,7 @@ def build_ui() -> gr.Blocks:
         step1_btn.click(
             fn=step1_process_for_preview,
             inputs=[
-                episode_name, series_name, series_picker, style_preset, wrap_mode,
+                episode_name, series_name, series_picker, style_preset, wrap_mode, soften_exclaim,
                 saved_raw_1080,
                 link_1080, file_1080,
                 link_720, file_720,
@@ -2109,7 +2119,7 @@ def build_ui() -> gr.Blocks:
         batch_btn.click(
             fn=step_batch_process,
             inputs=[
-                batch_links, series_name, series_picker, style_preset, wrap_mode,
+                batch_links, series_name, series_picker, style_preset, wrap_mode, soften_exclaim,
                 sub_mode, whisper_model,
                 provider, api_key, llm_model, base_url,
                 codec, cq, preset, audio_bitrate,
