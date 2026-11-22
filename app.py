@@ -866,6 +866,7 @@ def list_cached_raw_videos() -> List[str]:
             if p.is_file()
             and p.suffix.lower() in VIDEO_EXTENSIONS
             and "_work" not in p.parts
+            and "_player" not in p.parts
             and p.stat().st_size > 1024 * 1024
             and not any(p.parent.glob("*.aria2"))
         ]
@@ -2219,6 +2220,18 @@ def step_restore_preview(
             badge=f"PREVIEW · AI RESTORE ×{int(restore_scale)}",
             title=f"معاينة الترميم: 10 ثوانٍ من منتصف الحلقة بموديل {MODEL_LABELS.get(restore_model, restore_model)} ×{int(restore_scale)}",
         )
+        # المعاينة HEVC — نحوّلها H.264 سريع حتى تعمل في كل المتصفحات
+        play_prev = out_prev
+        try:
+            play_prev = yield from run_live(
+                make_browser_preview,
+                out_prev, str(Path(out_prev).with_name(Path(out_prev).stem + "_h264.mp4")),
+                badge="PLAYER · H264",
+                title="تجهيز نسخة المتصفح للمعاينة (H.264)...",
+            )
+        except Exception as pv_exc:
+            push(f"⚠️ تعذر تحويل المعاينة لنسخة متصفح: {pv_exc} — ستُعرض النسخة الأصلية.")
+            play_prev = out_prev
         push("✅ معاينة الترميم جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم الحلقة كاملة.")
         yield pack(
             render_progress_hud(
@@ -2226,10 +2239,10 @@ def step_restore_preview(
                 "PREVIEW READY",
                 "معاينة الترميم جاهزة (10 ثوانٍ)",
                 MODEL_LABELS.get(restore_model, restore_model),
-                out_prev,
+                play_prev,
                 mode="done",
             ),
-            vid_val=out_prev,
+            vid_val=play_prev,
         )
     except Exception as exc:
         push(f"❌ خطأ أثناء معاينة الترميم: {exc}\n{traceback.format_exc()[-1000:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
@@ -2474,10 +2487,22 @@ def rtab_preview(model: str, scale: str, ep_names, eps_state: List[str]):
             badge=f"PREVIEW · AI RESTORE ×{int(scale)}",
             title=f"معاينة الترميم: 10 ثوانٍ من منتصف {ep.name[:60]} بموديل {MODEL_LABELS.get(model, model)} ×{int(scale)}",
         )
+        # المعاينة HEVC — نحوّلها H.264 سريع حتى تعمل في كل المتصفحات (ثوانٍ معدودة لعشر ثوانٍ)
+        play_prev = out_prev
+        try:
+            play_prev = yield from _live_gen(
+                make_browser_preview, push, pack,
+                out_prev, str(Path(out_prev).with_name(Path(out_prev).stem + "_h264.mp4")),
+                badge="PLAYER · H264",
+                title="تجهيز نسخة المتصفح للمعاينة (H.264)...",
+            )
+        except Exception as pv_exc:
+            push(f"⚠️ تعذر تحويل المعاينة لنسخة متصفح: {pv_exc} — ستُعرض النسخة الأصلية.")
+            play_prev = out_prev
         push("✅ المعاينة جاهزة — شغّلها واحكم على الجودة والثبات قبل ترميم المجموعة.")
         yield pack(
-            render_progress_hud(100.0, "PREVIEW READY", "معاينة الترميم جاهزة (10 ثوانٍ)", MODEL_LABELS.get(model, model), out_prev, mode="done"),
-            vid_val=out_prev,
+            render_progress_hud(100.0, "PREVIEW READY", "معاينة الترميم جاهزة (10 ثوانٍ)", MODEL_LABELS.get(model, model), play_prev, mode="done"),
+            vid_val=play_prev,
         )
     except Exception as exc:
         push(f"❌ خطأ أثناء المعاينة: {exc}\n{traceback.format_exc()[-1000:]}")
@@ -2561,7 +2586,21 @@ def rtab_run(model: str, scale: str, force: bool, sel_names, eps_state: List[str
         if failed:
             push(f"⚠️ خلص الترميم مع {len(failed)} حلقة فاشلة: {'، '.join(failed[:5])}")
         push(f"✅ اكتمل الترميم: {done_n} من {total} حلقة. الخطوة التالية: اضغط المرمَّمة بزر الضغط ثم احكم قبول/رفض.")
+        player_file = last_done
         if last_done:
+            # المرمَّم HEVC لا يعمل في متصفحات كثيرة — نسخة H.264 سريعة للمشغّل فقط (المرمَّم الأصلي محفوظ للضغط)
+            player_dir = restored_dir / "_player"
+            player_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                player_file = yield from _live_gen(
+                    make_browser_preview, push, pack,
+                    last_done, str(player_dir / (Path(last_done).stem + "_h264.mp4")),
+                    badge="PLAYER · H264",
+                    title="تجهيز نسخة مشاهدة سريعة للمتصفح (H.264 على كرت الشاشة)...",
+                )
+            except Exception as pv_exc:
+                push(f"⚠️ تعذر تجهيز نسخة المشاهدة: {pv_exc} — المشغّل هيستخدم الملف الأصلي.")
+                player_file = last_done
             push(f"📺 آخر حلقة مترممة جاهزة للمشاهدة في المشغّل أسفل التبويب: {Path(last_done).name}")
         yield pack(
             render_progress_hud(
@@ -2573,7 +2612,7 @@ def rtab_run(model: str, scale: str, force: bool, sel_names, eps_state: List[str
                 mode="done" if not failed else "error",
             ),
             raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
-            vid=last_done if last_done else gr.update(),
+            vid=player_file if player_file else gr.update(),
         )
     except Exception as exc:
         push(f"❌ خطأ أثناء ترميم الدفعة: {exc}\n{traceback.format_exc()[-1000:]}")
@@ -2653,7 +2692,21 @@ def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
         if failed:
             push(f"⚠️ فشل ضغط {len(failed)} حلقة: {'، '.join(failed[:5])}")
         push(f"✅ اكتمل الضغط: {done_n} من {total} حلقة. شاهد المضغوطة واحكم: «عاجبني» يمسح المرمَّمة ويبقي المضغوطة، «مش عاجبني» يمسح المضغوطة ويبقي المرمَّمة لإعادة الضغط بإعدادات أخرى.")
+        player_file = last_done
         if last_done:
+            # المضغوطة HEVC — نسخة H.264 سريعة للمشغّل حتى يحكم على الجودة قبل قبول/رفض
+            player_dir = comp_dir / "_player"
+            player_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                player_file = yield from _live_gen(
+                    make_browser_preview, push, pack,
+                    last_done, str(player_dir / (Path(last_done).stem + "_h264.mp4")),
+                    badge="PLAYER · H264",
+                    title="تجهيز نسخة مشاهدة سريعة للمتصفح (H.264 على كرت الشاشة)...",
+                )
+            except Exception as pv_exc:
+                push(f"⚠️ تعذر تجهيز نسخة المشاهدة: {pv_exc} — المشغّل هيستخدم الملف الأصلي.")
+                player_file = last_done
             push(f"📺 آخر نسخة مضغوطة جاهزة للمشاهدة في المشغّل أسفل التبويب: {Path(last_done).name}")
         yield pack(
             render_progress_hud(
@@ -2665,7 +2718,7 @@ def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
                 mode="done" if not failed else "error",
             ),
             raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
-            vid=last_done if last_done else gr.update(),
+            vid=player_file if player_file else gr.update(),
         )
     except Exception as exc:
         push(f"❌ خطأ أثناء الضغط: {exc}\n{traceback.format_exc()[-1000:]}")
@@ -2702,6 +2755,7 @@ def rtab_accept(sel_names, eps_state: List[str]):
         try:
             freed += master.stat().st_size / 1e6
             master.unlink()
+            (restored_dir / "_player" / f"{master.stem}_h264.mp4").unlink(missing_ok=True)
             kept += 1
             push(f"✅ {ep.name}: المضغوطة محفوظة ({comp.name}) ومسحنا المرمَّم الضخم.")
         except Exception as de:
@@ -2740,6 +2794,7 @@ def rtab_reject(sel_names, eps_state: List[str]):
         for comp in comps:
             try:
                 comp.unlink()
+                (comp_dir / "_player" / f"{comp.stem}_h264.mp4").unlink(missing_ok=True)
                 removed += 1
                 push(f"🗑️ {ep.name}: مسحنا المضغوطة ({comp.name})، والمرمَّم محفوظ — غيّر الكوديك أو CQ واضغط تاني.")
             except Exception as de:
