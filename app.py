@@ -2422,10 +2422,11 @@ def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
         _append_disk_log(line)
         print(line, flush=True)
 
-    def pack(hud_html: str, raw_dd=gr.update()):
-        return (hud_html, "\n".join(logs[-150:]), raw_dd)
+    def pack(hud_html: str, raw_dd=gr.update(), vid=gr.update()):
+        return (hud_html, "\n".join(logs[-150:]), raw_dd, vid)
 
     try:
+        last_done = None
         picked = _rtab_selected(sel_names, eps_state)
         if not picked:
             push("⚠️ حمّل المصادر واختر حلقة واحدة على الأقل أولاً.")
@@ -2454,6 +2455,7 @@ def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
                     title=f"ترميم حلقة {i} من {total} ×{int(scale)} بموديل {MODEL_LABELS.get(model, model)}...",
                 )
                 done_n += 1
+                last_done = str(out)
                 try:
                     if ep.is_file() and ep.resolve() != out.resolve() and str(ep.resolve()).startswith(str(RAW_CACHE_ROOT.resolve())):
                         ep.unlink()
@@ -2468,6 +2470,8 @@ def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
         if failed:
             push(f"⚠️ خلص الترميم مع {len(failed)} حلقة فاشلة: {'، '.join(failed[:5])}")
         push(f"✅ اكتمل الترميم: {done_n} من {total} حلقة. الخطوة التالية: اضغط المرمَّمة بزر الضغط ثم احكم قبول/رفض.")
+        if last_done:
+            push(f"📺 آخر حلقة مترممة جاهزة للمشاهدة في المشغّل أسفل التبويب: {Path(last_done).name}")
         yield pack(
             render_progress_hud(
                 100.0,
@@ -2478,6 +2482,7 @@ def rtab_run(model: str, scale: str, sel_names, eps_state: List[str]):
                 mode="done" if not failed else "error",
             ),
             raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+            vid=last_done if last_done else gr.update(),
         )
     except Exception as exc:
         push(f"❌ خطأ أثناء ترميم الدفعة: {exc}\n{traceback.format_exc()[-1000:]}")
@@ -2504,10 +2509,11 @@ def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
         _append_disk_log(line)
         print(line, flush=True)
 
-    def pack(hud_html: str, raw_dd=gr.update()):
-        return (hud_html, "\n".join(logs[-150:]), raw_dd)
+    def pack(hud_html: str, raw_dd=gr.update(), vid=gr.update()):
+        return (hud_html, "\n".join(logs[-150:]), raw_dd, vid)
 
     try:
+        last_done = None
         picked = _rtab_selected(sel_names, eps_state)
         if not picked:
             push("⚠️ اختر حلقة واحدة على الأقل أولاً.")
@@ -2540,6 +2546,7 @@ def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
                     title=f"ضغط حلقة {i} من {total} ({'كرت الشاشة HEVC' if codec == 'hevc_nvenc' else 'x265 معالج'} · CQ {int(cq)})",
                 )
                 done_n += 1
+                last_done = str(out)
                 src_mb = master.stat().st_size / 1e6
                 out_mb = out.stat().st_size / 1e6
                 push(f"📦 {out.name}: {src_mb:.0f}MB → {out_mb:.0f}MB")
@@ -2551,6 +2558,8 @@ def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
         if failed:
             push(f"⚠️ فشل ضغط {len(failed)} حلقة: {'، '.join(failed[:5])}")
         push(f"✅ اكتمل الضغط: {done_n} من {total} حلقة. شاهد المضغوطة واحكم: «عاجبني» يمسح المرمَّمة ويبقي المضغوطة، «مش عاجبني» يمسح المضغوطة ويبقي المرمَّمة لإعادة الضغط بإعدادات أخرى.")
+        if last_done:
+            push(f"📺 آخر نسخة مضغوطة جاهزة للمشاهدة في المشغّل أسفل التبويب: {Path(last_done).name}")
         yield pack(
             render_progress_hud(
                 100.0,
@@ -2561,6 +2570,7 @@ def rtab_compress(codec: str, cq: float, sel_names, eps_state: List[str]):
                 mode="done" if not failed else "error",
             ),
             raw_dd=gr.update(choices=[""] + list_cached_raw_videos()),
+            vid=last_done if last_done else gr.update(),
         )
     except Exception as exc:
         push(f"❌ خطأ أثناء الضغط: {exc}\n{traceback.format_exc()[-1000:]}")
@@ -2901,7 +2911,7 @@ def build_ui() -> gr.Blocks:
                     rtab_load_btn = gr.Button("⬇️ تحميل / فحص الحلقات", variant="primary", scale=1)
                 rtab_eps = gr.Dropdown(choices=[], multiselect=True, label="الحلقات — اختر أي عدد (الكل محدد افتراضياً)", interactive=True)
                 rtab_preview_btn = gr.Button("👁️ معاينة 10 ثوانٍ من منتصف أول حلقة مختارة", size="sm")
-                rtab_preview_video = gr.Video(label="معاينة الترميم (10 ثوانٍ)")
+                rtab_preview_video = gr.Video(label="📺 المشغّل — معاينة 10 ثوانٍ، والحلقة كاملة تظهر هنا بعد الترميم أو الضغط")
                 rtab_run_btn = gr.Button("🚀 ترميم الحلقات المختارة — الأصلية تُمسح بعد نجاح كل حلقة [RESTORE]", variant="primary", size="lg")
                 with gr.Row():
                     rtab_codec = gr.Dropdown(
@@ -2934,12 +2944,12 @@ def build_ui() -> gr.Blocks:
         rtab_run_btn.click(
             fn=rtab_run,
             inputs=[rtab_model, rtab_scale, rtab_eps, rtab_state],
-            outputs=[rtab_hud, rtab_log, saved_raw_1080],
+            outputs=[rtab_hud, rtab_log, saved_raw_1080, rtab_preview_video],
         )
         rtab_compress_btn.click(
             fn=rtab_compress,
             inputs=[rtab_codec, rtab_cq, rtab_eps, rtab_state],
-            outputs=[rtab_hud, rtab_log, saved_raw_1080],
+            outputs=[rtab_hud, rtab_log, saved_raw_1080, rtab_preview_video],
         )
         rtab_accept_btn.click(
             fn=rtab_accept,
