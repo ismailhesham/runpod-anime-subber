@@ -1558,7 +1558,8 @@ def _wizard_choice(mode, upload, choices, item, compress=False):
         dest_dir = RAW_CACHE_ROOT / "_wizard_subs" / hashlib.sha256(item["path"].encode()).hexdigest()
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / ("subtitle" + source.suffix.lower())
-        shutil.copy2(source, dest)
+        if source.resolve() != dest.resolve():
+            shutil.copy2(source, dest)
         entry["subtitle"] = str(dest)
     updated[item["path"]] = entry
     return updated, gr.update(visible=mode == "ترجمة يدوية")
