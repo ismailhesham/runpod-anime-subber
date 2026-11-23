@@ -3335,6 +3335,11 @@ def build_ui() -> gr.Blocks:
     .gradio-container h1,.gradio-container h2,.gradio-container h3,.gradio-container p,.clear-flow p,.clear-flow h1,.clear-flow h2,.clear-flow h3,.clear-flow strong,.clear-flow span,.clear-flow label {color:#e0ecff!important}
     .clear-flow input,.clear-flow textarea,.clear-flow select,.clear-flow [role=listbox],.clear-flow [role=option] {background:#090f1a!important;color:#e0ecff!important}
     .clear-flow label {background:#101b2c!important} .clear-flow input[type=radio],.clear-flow input[type=checkbox] {accent-color:#3bc5ff!important;background:transparent!important}
+    .episode-picker label {cursor:pointer!important;min-height:44px!important;display:flex!important;align-items:center!important;gap:10px!important}
+    .episode-picker input[type=checkbox] {appearance:none!important;-webkit-appearance:none!important;display:inline-grid!important;place-content:center!important;flex:0 0 22px!important;width:22px!important;height:22px!important;min-width:22px!important;opacity:1!important;border:2px solid #6983a6!important;border-radius:4px!important;background:#091322!important;position:relative!important;pointer-events:auto!important;margin:0!important}
+    .episode-picker input[type=checkbox]:checked {background:#149cda!important;border-color:#67dbff!important}
+    .episode-picker input[type=checkbox]:checked::after {content:"✓";color:white!important;font-size:18px!important;font-weight:900!important;line-height:18px!important}
+    .episode-picker label:has(input:checked) {background:#143951!important;border:1px solid #4acbff!important}
     .clear-flow button {font-size:16px!important}
     .clear-flow .prose {line-height:1.8}
     """
@@ -3366,7 +3371,9 @@ def _build_clear_flow(single, cfg):
         else:
             local_file = gr.State(None)
             list_button = gr.Button("اعرض ملفات التورنت")
-            picks = gr.CheckboxGroup(label="علّم على الحلقات المطلوبة", choices=[])
+            picks = gr.CheckboxGroup(label="علّم على الحلقات المطلوبة", choices=[], interactive=True, elem_classes=["episode-picker"])
+            picked_count = gr.Markdown("المختار: ٠ حلقات")
+            listed_source = gr.State("")
         download = gr.Button("حمّل وتحقق من الحلقة" if single else "حمّل وتحقق من الحلقات المختارة", variant="primary")
         status = gr.Markdown("الترجمة مش هتبدأ في الخطوة دي.")
         next_button = gr.Button("التالي: الترجمة ←", interactive=False)
@@ -3448,7 +3455,16 @@ def _build_clear_flow(single, cfg):
             yield from step_download_wizard(src,selected,mapping,anime,SERIES_NEW_OPT)
     download.click(download_source,[source,picks,file_map,series,local_file],[manifest,choices,next_button,status,download])
     if not single:
-        list_button.click(step_list_batch_files,[source],[picks,file_map,status])
+        def refresh_listing(src, selected, previous_source):
+            update, mapping, note = step_list_batch_files(src)
+            valid = {value for _, value in update.get("choices", [])}
+            kept = [value for value in (selected or []) if value in valid] if src == previous_source else []
+            update["value"] = kept
+            update["interactive"] = True
+            return update, mapping, note, src, f"المختار: {len(kept)} حلقات"
+        list_button.click(refresh_listing,[source,picks,listed_source],[picks,file_map,status,listed_source,picked_count])
+        picks.change(lambda selected: f"المختار: {len(selected or [])} حلقات",[picks],[picked_count],queue=False)
+        source.change(lambda: (gr.update(choices=[],value=[]),{},"", "المختار: ٠ حلقات"),outputs=[picks,file_map,listed_source,picked_count],queue=False)
     def next_step(items):
         return _wizard_next(items)
     next_button.click(next_step,[manifest],[source_group,subtitle_group])
