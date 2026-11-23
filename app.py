@@ -690,7 +690,7 @@ def _grind_rank(overall: float) -> str:
 def render_progress_hud(
     pct: float = 0.0,
     badge: str = "HUNTER HUD · STANDBY",
-    title: str = "جاهز — اضغط [STRIKE] للترجمة والحرق والضغط MP4",
+    title: str = "جاهز — اختار الحلقات وحمّلها الأول",
     metric: str = "السرعة: — · المتبقي: —",
     detail: str = "الحلقات الخام والقواميس والموديلات محفوظة دائماً في /workspace",
     mode: str = "cyan",
@@ -1462,10 +1462,104 @@ def step_list_batch_files(batch_links: str):
             val = f"{li}:{fidx}"
             choices.append((label, val))
             mapping[val] = (li, fidx)
-        notes.append(f"✅ رابط {li+1}: {len(vids)} ملف فيديو — اختر من القايمة تحت، أو سيبها فاضية لتحميل الموسم كله.")
+        notes.append(f"✅ رابط {li+1}: {len(vids)} ملف فيديو — علّم على الحلقات المطلوبة قبل التحميل.")
     if not choices and not notes:
         notes.append("⚠️ لم يتم العثور على ملفات فيديو في الروابط.")
     return gr.update(choices=choices, value=[]), mapping, "\n".join(notes)
+
+
+
+def _verify_wizard_video(path: Path, expected_size: int = 0) -> None:
+    if not path.is_file() or Path(str(path) + ".aria2").exists():
+        raise ValueError(f"الملف لسه ما اكتملش: {path.name}")
+    if expected_size and path.stat().st_size != expected_size:
+        raise ValueError(f"حجم الملف غير مكتمل: {path.name}")
+    width, height, _, duration = probe_video_info(str(path))
+    if not width or not height or not duration or duration <= 0:
+        raise ValueError(f"ملف الفيديو غير قابل للقراءة: {path.name}")
+
+
+def step_download_wizard(batch_links, picks, file_map, series_name, series_pick, progress=gr.Progress()):
+    """Download only. Never translate or burn, and never unlock a partial batch."""
+    logs = []
+    def log(message):
+        logs.append(str(message))
+    yield [], {}, gr.update(interactive=False), "جاري التحميل...", gr.update(interactive=False)
+    try:
+        links = [line.strip() for line in (batch_links or "").splitlines() if line.strip()]
+        if not links:
+            raise ValueError("حط رابط تورنت أو مسار فيديو الأول.")
+        if not picks and any(not Path(link).exists() for link in links):
+            raise ValueError("اعرض ملفات التورنت وعلّم على الحلقات المطلوبة الأول.")
+        series = series_name.strip() if series_pick == SERIES_NEW_OPT else str(series_pick or series_name).strip()
+        if not series:
+            raise ValueError("اختار الأنمي أو اكتب اسمه الأول.")
+        manifest = []
+        for li, link in enumerate(links):
+            selected = [int(file_map[value][1]) for value in (picks or [])
+                        if value in (file_map or {}) and int(file_map[value][0]) == li]
+            if Path(link).is_dir():
+                files = collect_episode_videos(link)
+                expected = [(path, 0, f"local:{path.resolve()}") for path in files]
+            elif Path(link).is_file() and Path(link).suffix.lower() in VIDEO_EXTENSIONS:
+                path = Path(link)
+                expected = [(path, 0, f"local:{path.resolve()}")]
+            else:
+                if not selected:
+                    continue
+                listing = {int(i): (rel, size) for i, rel, size in list_torrent_files(link, None)}
+                if any(i not in listing for i in selected):
+                    raise ValueError("قائمة الملفات اتغيرت. اعرض التورنت واختار الحلقات من جديد.")
+                root = _raw_cache_dir_for_source("season", link, None, f"{_safe_name(series)}_{li+1}")
+                download_season_batch(link, None, str(root), log_cb=log,
+                    progress_cb=lambda pct, metric, detail: progress(pct / 100, desc=str(metric)),
+                    select_files=selected)
+                source_key = hashlib.sha256(link.encode()).hexdigest()
+                expected = [(root / listing[i][0], listing[i][1], f"torrent:{source_key}:{i}") for i in selected]
+            for path, size, source_id in expected:
+                _verify_wizard_video(path, size)
+                resolved = str(path.resolve())
+                if not any(item["path"] == resolved for item in manifest):
+                    manifest.append({"id": source_id, "path": resolved, "name": path.name,
+                                     "size": path.stat().st_size, "series": series})
+        if not manifest:
+            raise ValueError("مفيش حلقات مختارة أو ملفات فيديو جاهزة.")
+        manifest.sort(key=lambda item: episode_sort_key(Path(item["path"])))
+        for item in manifest:
+            item["source_input"] = batch_links
+            item["picks"] = sorted(picks or [])
+        yield manifest, {}, gr.update(interactive=True), f"✓ اتأكدنا من {len(manifest)} ملف فيديو. اضغط التالي لملفات الترجمة.", gr.update(interactive=True)
+    except Exception as exc:
+        yield [], {}, gr.update(interactive=False), "❌ " + str(exc) + "\n" + "\n".join(logs[-8:]), gr.update(interactive=True)
+
+
+def _wizard_next(manifest, links=None, picks=None):
+    if not manifest:
+        raise gr.Error("حمّل الحلقات واتأكد منها الأول.")
+    for item in manifest:
+        if links is not None and (item.get("source_input") != links or item.get("picks") != sorted(picks or [])):
+            raise gr.Error("الاختيار اتغير. حمّل الاختيار الحالي الأول.")
+        _verify_wizard_video(Path(item["path"]), item["size"])
+    return gr.update(visible=False), gr.update(visible=True)
+
+
+def _wizard_choice(mode, upload, choices, item):
+    updated = dict(choices or {})
+    entry = dict(updated.get(item["path"], {}))
+    entry["mode"] = mode
+    if not upload:
+        entry.pop("subtitle", None)
+    if upload:
+        source = Path(upload if isinstance(upload, str) else upload.name)
+        if source.suffix.lower() not in (".srt", ".ass") or not parse_source_subtitles(str(source)):
+            raise gr.Error("ارفع ملف SRT أو ASS صالح وفيه ترجمة.")
+        dest_dir = RAW_CACHE_ROOT / "_wizard_subs" / hashlib.sha256(item["path"].encode()).hexdigest()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / ("subtitle" + source.suffix.lower())
+        shutil.copy2(source, dest)
+        entry["subtitle"] = str(dest)
+    updated[item["path"]] = entry
+    return updated, gr.update(visible=mode == "ترجمة يدوية")
 
 
 def step_batch_process(
@@ -1499,6 +1593,8 @@ def step_batch_process(
     concurrency: float = 3,
     queue_layout: str = "grid",
     manual_eps_text: str = "",
+    downloaded_manifest=None,
+    subtitle_choices=None,
 ):
     """Season batch mode: one or more torrent links (each may hold a whole season or more),
     download all episodes, translate + burn + compress each, and collect them into one
@@ -1637,29 +1733,44 @@ def step_batch_process(
             push(f"🎯 وضع الاختيار الانتقائي: {sum(len(v) for v in sel_map.values())} ملفاً مختاراً من {len(sel_map)} رابط.")
 
         all_eps: List[Path] = []
-        for idx, lnk in enumerate(links, 1):
-            if os.path.isdir(lnk):
-                vids = collect_episode_videos(lnk)
-                push(f"📂 مجلد محلي [{idx}]: {lnk} — {len(vids)} ملف فيديو.")
-            elif os.path.isfile(lnk) and Path(lnk).suffix.lower() in VIDEO_EXTENSIONS:
-                vids = [Path(lnk)]
-                push(f"📄 ملف محلي [{idx}]: {Path(lnk).name}")
-            else:
-                sel = sel_map.get(idx - 1) if sel_map else None
-                if sel_map and not sel:
-                    push(f"⏭️ الرابط {idx}: لا توجد حلقات مختارة منه — تم تخطيه.")
-                    continue
-                cdir = _raw_cache_dir_for_source("season", lnk, None, f"{series_safe}_{idx}")
-                vids = yield from run_live(
-                    download_season_batch,
-                    lnk, None, str(cdir),
-                    select_files=sel,
-                    badge=f"SEASON DOWNLOAD [{idx}/{len(links)}]",
-                    title=f"تحميل / فحص الدفعة رقم {idx} من {len(links)} (ممكن تحتوي موسماً كاملاً)",
-                    accepts_progress_cb=True,
-                )
-            all_eps.extend(vids)
-
+        if downloaded_manifest is not None:
+            if not downloaded_manifest:
+                raise ValueError("ارجع للخطوة الأولى وحمّل الحلقات.")
+            for item in downloaded_manifest:
+                _verify_wizard_video(Path(item["path"]), item["size"])
+                if item["series"] != series_name:
+                    # series_name below is the resolved anime identity.
+                    if item["series"] != (series_pick if series_pick != SERIES_NEW_OPT else series_name):
+                        raise ValueError("اسم الأنمي اتغير. ارجع لمرحلة التحميل.")
+                choice = (subtitle_choices or {}).get(item["path"], {})
+                if choice.get("mode") == "ترجمة يدوية":
+                    sub = choice.get("subtitle", "")
+                    if not sub or not Path(sub).is_file() or not parse_source_subtitles(sub):
+                        raise ValueError(f"ارفع ترجمة {item['name']} قبل التشغيل.")
+                all_eps.append(Path(item["path"]))
+        else:
+            for idx, lnk in enumerate(links, 1):
+                if os.path.isdir(lnk):
+                    vids = collect_episode_videos(lnk)
+                    push(f"📂 مجلد محلي [{idx}]: {lnk} — {len(vids)} ملف فيديو.")
+                elif os.path.isfile(lnk) and Path(lnk).suffix.lower() in VIDEO_EXTENSIONS:
+                    vids = [Path(lnk)]
+                    push(f"📄 ملف محلي [{idx}]: {Path(lnk).name}")
+                else:
+                    sel = sel_map.get(idx - 1) if sel_map else None
+                    if sel_map and not sel:
+                        push(f"⏭️ الرابط {idx}: لا توجد حلقات مختارة منه — تم تخطيه.")
+                        continue
+                    cdir = _raw_cache_dir_for_source("season", lnk, None, f"{series_safe}_{idx}")
+                    vids = yield from run_live(
+                        download_season_batch,
+                        lnk, None, str(cdir),
+                        select_files=sel,
+                        badge=f"SEASON DOWNLOAD [{idx}/{len(links)}]",
+                        title=f"تحميل / فحص الدفعة رقم {idx} من {len(links)} (ممكن تحتوي موسماً كاملاً)",
+                        accepts_progress_cb=True,
+                    )
+                all_eps.extend(vids)
         unique = {str(p.resolve()): p for p in all_eps}
         all_eps = sorted(unique.values(), key=episode_sort_key)
         total = len(all_eps)
@@ -1785,18 +1896,26 @@ def step_batch_process(
 
         # ═══ الترجمة اليدوية لحلقات بعينها: أرقامها بتتحدد قبل التشغيل، وملفاتها بتترفع من الواجهة ═══
         manual_set: set = set()
-        _mtxt = str(manual_eps_text or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
-        # نطاقات زي 3-5 أو 3~5 أو 3 الى 5، وبعدها أي رقم لوحده (3 / 03 / 003 كلهم نفس الحلقة)
-        for _a, _b in re.findall(r"(\d+)\s*(?:-|–|—|~|الى|إلى|to)\s*(\d+)", _mtxt):
-            _lo, _hi = sorted((int(_a), int(_b)))
-            for _g in range(_lo, min(_hi, total) + 1):
-                if _g >= 1:
+        manual_by_path = {}
+        if downloaded_manifest is not None:
+            for index, path in enumerate(all_eps, 1):
+                choice = (subtitle_choices or {}).get(str(path.resolve()), {})
+                if choice.get("mode") == "ترجمة يدوية":
+                    manual_set.add(index)
+                    manual_by_path[str(path.resolve())] = choice["subtitle"]
+        else:
+            _mtxt = str(manual_eps_text or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+            # نطاقات زي 3-5 أو 3~5 أو 3 الى 5، وبعدها أي رقم لوحده (3 / 03 / 003 كلهم نفس الحلقة)
+            for _a, _b in re.findall(r"(\d+)\s*(?:-|–|—|~|الى|إلى|to)\s*(\d+)", _mtxt):
+                _lo, _hi = sorted((int(_a), int(_b)))
+                for _g in range(_lo, min(_hi, total) + 1):
+                    if _g >= 1:
+                        manual_set.add(_g)
+            _mtxt_single = re.sub(r"(\d+)\s*(?:-|–|—|~|الى|إلى|to)\s*(\d+)", " ", _mtxt)
+            for _tok in re.findall(r"\d+", _mtxt_single):
+                _g = int(_tok)
+                if 1 <= _g <= total:
                     manual_set.add(_g)
-        _mtxt_single = re.sub(r"(\d+)\s*(?:-|–|—|~|الى|إلى|to)\s*(\d+)", " ", _mtxt)
-        for _tok in re.findall(r"\d+", _mtxt_single):
-            _g = int(_tok)
-            if 1 <= _g <= total:
-                manual_set.add(_g)
         if manual_set:
             push(f"✍️ ترجمة يدوية للحلقات: {', '.join(f'EP{g:03d}' for g in sorted(manual_set))} — الباقي ترجمة تلقائية. ارفع الملفات من قسم ✍️ الترجمة اليدوية.")
 
@@ -1823,7 +1942,8 @@ def step_batch_process(
             except Exception as ex_m:
                 cb(f"⚠️ {ep_label_m}: تعذر سحب ترجمة مدمجة للترجمة اليدوية ({ex_m}) — ارفع الملف المترجم جاهز.")
             cb(f"⏸️ {ep_label_m}: ترجمة يدوية — مستني ملف الترجمة المترجم. ارفعه من قسم ✍️ الترجمة اليدوية في الواجهة (رقم الحلقة {gi_m}).")
-            target: Optional[Path] = None
+            selected_sub = manual_by_path.get(str(vid_m.resolve()))
+            target: Optional[Path] = Path(selected_sub) if selected_sub else None
             last_ping = 0.0
             while target is None:
                 for ext in (".srt", ".ass"):
@@ -2794,6 +2914,7 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(**_build_blocks_kwargs()) as demo:
         gr.HTML(f"<style>{SHADOW_BLADE_CSS}</style>{SHADOW_BLADE_HEAD}")
         gr.HTML(SHADOW_BLADE_HERO_HTML)
+        gr.HTML("<style>#subtitle-wizard, #subtitle-wizard p, #subtitle-wizard strong, #subtitle-wizard h2, #subtitle-wizard span, #subtitle-wizard label, #wizard-status p {color:#dceaff !important} #subtitle-wizard label {background:#16243a !important} #subtitle-wizard .prose {direction:rtl} #subtitle-wizard a {color:#145180 !important} #subtitle-wizard .group {border-color:#385477 !important}</style>")
 
         job_state = gr.State({})
 
@@ -2802,7 +2923,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     with gr.Column(scale=2):
                         with gr.Column(visible=True, elem_classes=["sb-wiz-step"]) as step1_group:
-                            gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">⚔️ الخطوة 1 · جهّز الحلقة: اختر المصدر أو حلقة محفوظة ثم اضغط ARISE</div>')
+                            gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:4px 0 10px;letter-spacing:.5px;font-size:15px;">١ · اختار الحلقات وحمّلها، وبعد التحقق انتقل لملفات الترجمة</div>')
                             with gr.Row():
                                 episode_name = gr.Textbox(
                                     label="📌 اسم الحلقة / مجلد الإخراج",
@@ -2824,28 +2945,7 @@ def build_ui() -> gr.Blocks:
                                     )
                                 style_preset = gr.State("bleach_style")  # fixed: Bleach geometry, no UI control
 
-                            with gr.Accordion("🔗 الحلقات المحفوظة على السيرفر أو روابط التورنت (حفظ دائم بدون إعادة تحميل)", open=True, elem_classes=["sb-accordion"]):
-                                with gr.Row():
-                                    saved_raw_1080 = gr.Dropdown(
-                                        choices=[""] + list_cached_raw_videos(),
-                                        value="",
-                                        label="📦 اختر حلقة خام محمّلة مسبقاً على السيرفر (/workspace/raw_episodes)",
-                                        interactive=True,
-                                        scale=4,
-                                    )
-                                    refresh_raw_btn = gr.Button("🔄 تحديث المحفوظ", size="sm", scale=1)
-
-                                with gr.Row():
-                                    link_1080 = gr.Textbox(label="رابط 1080p (Magnet / URL)", placeholder="magnet:?xt=...")
-                                    file_1080 = gr.File(label="أو ملف .torrent / فيديو 1080p", type="filepath")
-                                with gr.Row():
-                                    link_720 = gr.Textbox(label="رابط 720p (Magnet / URL)", placeholder="magnet:?xt=...")
-                                    file_720 = gr.File(label="أو ملف .torrent / فيديو 720p", type="filepath")
-                                with gr.Row():
-                                    link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
-                                    file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
-
-                            with gr.Accordion("📚 وضع المواسم الكاملة — روابط دفعات (الرابط الواحد ممكن يحتوي موسماً أو أكثر)", open=False, elem_classes=["sb-accordion"]):
+                            with gr.Accordion("📚 وضع المواسم الكاملة — روابط دفعات (الرابط الواحد ممكن يحتوي موسماً أو أكثر)", open=True, elem_classes=["sb-accordion"]):
                                 batch_links = gr.Textbox(
                                     label="روابط التورنت / الماجنت أو مسارات ملفات/مجلدات محلية — واحد في كل سطر",
                                     placeholder="magnet:?xt=urn:btih:...\nhttps://example.com/Season2.torrent",
@@ -2857,30 +2957,62 @@ def build_ui() -> gr.Blocks:
                                     elem_id="sb-batch-list-btn",
                                 )
                                 batch_file_picks = gr.CheckboxGroup(
-                                    label="اختيار حلقات معينة من التورنت — سيبها فاضية لو عايز الموسم كله",
+                                    label="علّم على الحلقات اللي عايز تحملها",
                                     choices=[],
                                     value=[],
                                     elem_classes=["sb-batch-picker"],
                                 )
                                 batch_file_map = gr.State({})
-                                manual_eps_text = gr.Textbox(
-                                    label="حلقات بترجمة يدوية — أرقام الحلقات مفصولة بفواصل (مثال: 2,5) · سيبه فاضي لو كله تلقائي",
-                                    placeholder="مثال: 2,5",
-                                )
-                                batch_btn = gr.Button(
-                                    "🚀 شغّل الموسم كاملاً: تحميل كل الحلقات ← ترجمة بأسلوب المترجم ← حرق ← ضغط ← فولدرات 35 حلقة [SEASON STRIKE]",
+                                wizard_manifest = gr.State([])
+                                wizard_choices = gr.State({})
+                                manual_eps_text = gr.State("")
+                                wizard_download = gr.Button("١ · حمّل الحلقات المختارة", variant="primary")
+                                wizard_status = gr.Markdown(elem_id="wizard-status", value="اختار الحلقات، وبعد التحميل هتفتح خطوة الترجمة لوحدها.")
+                                wizard_next = gr.Button("التالي: ملفات الترجمة ←", interactive=False)
+
+                            with gr.Accordion("حلقة واحدة · الوضع السابق", open=False):
+                                with gr.Accordion("🔗 الحلقات المحفوظة على السيرفر أو روابط التورنت (حفظ دائم بدون إعادة تحميل)", open=True, elem_classes=["sb-accordion"]):
+                                    with gr.Row():
+                                        saved_raw_1080 = gr.Dropdown(
+                                            choices=[""] + list_cached_raw_videos(),
+                                            value="",
+                                            label="📦 اختر حلقة خام محمّلة مسبقاً على السيرفر (/workspace/raw_episodes)",
+                                            interactive=True,
+                                            scale=4,
+                                        )
+                                        refresh_raw_btn = gr.Button("🔄 تحديث المحفوظ", size="sm", scale=1)
+
+                                    with gr.Row():
+                                        link_1080 = gr.Textbox(label="رابط 1080p (Magnet / URL)", placeholder="magnet:?xt=...")
+                                        file_1080 = gr.File(label="أو ملف .torrent / فيديو 1080p", type="filepath")
+                                    with gr.Row():
+                                        link_720 = gr.Textbox(label="رابط 720p (Magnet / URL)", placeholder="magnet:?xt=...")
+                                        file_720 = gr.File(label="أو ملف .torrent / فيديو 720p", type="filepath")
+                                    with gr.Row():
+                                        link_480 = gr.Textbox(label="رابط 480p (Magnet / URL)", placeholder="magnet:?xt=...")
+                                        file_480 = gr.File(label="أو ملف .torrent / فيديو 480p", type="filepath")
+
+                                step1_btn = gr.Button(
+                                    "⚔️ ARISE · ابدأ الطحن — ترجمة وحرق وضغط MP4 [STRIKE]",
                                     variant="primary",
                                     size="lg",
-                                    elem_id="sb-batch-btn",
+                                    elem_id="sb-step1-btn",
                                 )
 
-                            with gr.Accordion("✍️ الترجمة اليدوية — ارفع ملف مترجم لحلقة", open=False, elem_classes=["sb-accordion"]):
-                                with gr.Row():
-                                    manual_ep_num = gr.Number(value=1, precision=0, label="رقم الحلقة")
-                                    manual_sub_file = gr.File(label="ملف الترجمة المترجم (SRT أو ASS)", file_types=[".srt", ".ass"])
-                                manual_sub_btn = gr.Button("💾 احفظ الملف للحلقة", size="sm")
-                                manual_sub_status = gr.Markdown("")
-
+                        with gr.Column(visible=False, elem_id="subtitle-wizard", elem_classes=["sb-wiz-step"]) as wizard_subtitle_group:
+                            gr.Markdown("## ٢ · ملفات الترجمة\nالحلقات اللي اتحمّلت واتأكدنا منها بس. اختار أوتوماتيك أو ارفع ملف الترجمة لنفس الحلقة.")
+                            @gr.render(inputs=[wizard_manifest])
+                            def render_subtitle_rows(items):
+                                for item in items or []:
+                                    with gr.Group():
+                                        gr.Markdown("**" + html.escape(item["name"]) + "**")
+                                        mode = gr.Radio(["أوتوماتيك", "ترجمة يدوية"], value="أوتوماتيك", label="طريقة الترجمة", key="mode-" + item["id"])
+                                        upload = gr.File(label="ارفع ترجمة نفس الحلقة · SRT / ASS", file_types=[".srt", ".ass"], type="filepath", visible=False, key="sub-" + item["id"])
+                                        def change_choice(mode_value, file_value, current, item=item):
+                                            return _wizard_choice(mode_value, file_value, current, item)
+                                        mode.change(change_choice, [mode, upload, wizard_choices], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
+                                        upload.upload(change_choice, [mode, upload, wizard_choices], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
+                                        upload.clear(change_choice, [mode, upload, wizard_choices], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
                             with gr.Accordion("🔑 مفاتيح DeepSeek / Gemini والإعدادات الدائمة", open=False, elem_classes=["sb-accordion"]):
                                 with gr.Row():
                                     provider = gr.Dropdown(
@@ -3005,12 +3137,8 @@ def build_ui() -> gr.Blocks:
                                 rar_make_btn = gr.Button("📦 اعمل أرشيف للمختار", variant="primary")
                                 rar_status = gr.Textbox(label="النتيجة", lines=5, interactive=False)
 
-                            step1_btn = gr.Button(
-                                "⚔️ ARISE · ابدأ الطحن — ترجمة وحرق وضغط MP4 [STRIKE]",
-                                variant="primary",
-                                size="lg",
-                                elem_id="sb-step1-btn",
-                            )
+                            batch_btn = gr.Button("ابدأ الترجمة والمعالجة", variant="primary", size="lg")
+                            wizard_back = gr.Button("رجوع لاختيار الحلقات")
 
                         progress_hud = gr.HTML(value=render_progress_hud())
 
@@ -3086,7 +3214,6 @@ def build_ui() -> gr.Blocks:
         rar_make_btn.click(fn=step_archive_selected, inputs=[rar_series_dd, rar_eps_cb], outputs=[rar_status])
 
         refresh_raw_btn.click(fn=lambda: gr.update(choices=[""] + list_cached_raw_videos()), outputs=[saved_raw_1080])
-        manual_sub_btn.click(fn=step_save_manual_sub, inputs=[series_name, manual_ep_num, manual_sub_file], outputs=[manual_sub_status])
         refresh_local_btn.click(fn=lambda: gr.update(choices=list_local_outputs()), outputs=[local_dropdown])
         local_dropdown.change(fn=_browser_preview_path, inputs=[local_dropdown], outputs=[preview_player])
 
@@ -3118,8 +3245,26 @@ def build_ui() -> gr.Blocks:
             outputs=[batch_file_picks, batch_file_map, log_box],
         )
 
+        wizard_download.click(step_download_wizard,
+            [batch_links, batch_file_picks, batch_file_map, series_name, series_picker],
+            [wizard_manifest, wizard_choices, wizard_next, wizard_status, wizard_download])
+        wizard_next.click(_wizard_next, [wizard_manifest, batch_links, batch_file_picks], [step1_group, wizard_subtitle_group])
+        wizard_back.click(lambda: (gr.update(visible=True), gr.update(visible=False)),
+                          outputs=[step1_group, wizard_subtitle_group])
+        batch_links.change(lambda: ([], {}, gr.update(interactive=False)),
+                           outputs=[wizard_manifest, wizard_choices, wizard_next])
+        batch_file_picks.change(lambda: ([], {}, gr.update(interactive=False)),
+                                outputs=[wizard_manifest, wizard_choices, wizard_next])
+
+        def run_wizard_batch(*args):
+            for result in step_batch_process(*args):
+                result = list(result)
+                failed = isinstance(result[8], dict) and result[8].get("visible") is True
+                result[8] = gr.update(visible=False)
+                yield tuple(result) + (gr.update(visible=failed),)
+
         batch_btn.click(
-            fn=step_batch_process,
+            fn=run_wizard_batch,
             inputs=[
                 batch_links, series_name, series_picker, style_preset, wrap_mode, soften_exclaim,
                 sub_mode, whisper_model,
@@ -3131,14 +3276,14 @@ def build_ui() -> gr.Blocks:
                 batch_file_picks, batch_file_map,
                 enable_telegram,
                 concurrency, queue_layout,
-                manual_eps_text,
+                manual_eps_text, wizard_manifest, wizard_choices,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
                 out_video_files, out_ass_file, job_state,
                 step1_group, step2_group, downloads_group, links_box,
                 archive_group, archive_prompt_md,
-                en_subs_files,
+                en_subs_files, wizard_subtitle_group,
             ],
         )
 
