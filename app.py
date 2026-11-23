@@ -1544,6 +1544,44 @@ def _wizard_next(manifest, links=None, picks=None):
     return gr.update(visible=False), gr.update(visible=True)
 
 
+def _wizard_subtitle_tracks(path):
+    result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s",
+        "-show_entries", "stream=index,codec_name:stream_tags=language,title:stream_disposition=default,forced",
+        "-of", "json", str(path)], capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError("تعذرت قراءة مسارات الترجمة داخل الحلقة.")
+    tracks = json.loads(result.stdout or "{}").get("streams", [])
+    for pos, track in enumerate(tracks):
+        track["position"] = pos
+        track["supported"] = track.get("codec_name") in {"ass", "ssa", "subrip", "srt", "webvtt", "mov_text"}
+    return tracks
+
+
+def _wizard_track_choices(tracks):
+    choices = [("ارفع ملف SRT / ASS من جهازك", "upload")]
+    for track in tracks:
+        tags = track.get("tags", {})
+        flags = track.get("disposition", {})
+        label = f"#{track['index']} · {tags.get('language', 'und')} · {tags.get('title', 'بدون عنوان')} · {track.get('codec_name', '?')}"
+        label += f" · default={flags.get('default', 0)} · forced={flags.get('forced', 0)}"
+        if not track["supported"]:
+            label += " · صورة: يحتاج OCR (غير متاح)"
+        choices.append((label, str(track["index"])))
+    return choices
+
+
+def _wizard_export_track(path, track):
+    out_dir = RAW_CACHE_ROOT / "_wizard_track_exports" / hashlib.sha256(str(path).encode()).hexdigest() / str(track["index"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Per-file, per-stream directory avoids overwriting another track.
+    extension = ".ass" if track["codec_name"] in ("ass", "ssa") else ".srt"
+    cached = out_dir / ("extracted_source" + extension)
+    extracted = cached if cached.is_file() and cached.stat().st_size else Path(extract_embedded_subtitle(str(path), track["position"], track["codec_name"], str(out_dir)))
+    destination = out_dir / (Path(path).stem + f".track-{track['index']}." + re.sub(r"[^a-zA-Z0-9_-]", "_", track.get("tags", {}).get("language", "und")) + extracted.suffix)
+    shutil.copy2(extracted, destination)
+    return str(destination)
+
+
 def _wizard_choice(mode, upload, choices, item, compress=False):
     updated = dict(choices or {})
     entry = dict(updated.get(item["path"], {}))
@@ -3402,6 +3440,24 @@ def _build_clear_flow(single, cfg):
                 with gr.Group():
                     gr.Markdown("### " + html.escape(item["name"]))
                     mode = gr.Radio(["أوتوماتيك", "ترجمة يدوية"], value=saved.get("mode", "أوتوماتيك"), label="الترجمة", interactive=True, key=("single-" if single else "batch-") + "mode-" + item["id"])
+                    if saved.get("mode") == "ترجمة يدوية":
+                        gr.Markdown("نزّل مسار الترجمة، ترجمه برا الأداة، وبعدها ارفع ملفك المترجم تحت. الحرق اليدوي بيستخدم الملف اللي رفعته فقط، مش المسار الأصلي.")
+                        try:
+                            tracks = _wizard_subtitle_tracks(item["path"])
+                            if not tracks:
+                                gr.Markdown("مفيش مسارات ترجمة داخل الحلقة. ارفع ملفك المترجم تحت.")
+                            for track in tracks:
+                                label = _wizard_track_choices([track])[1][0]
+                                if track["supported"]:
+                                    try:
+                                        exported = _wizard_export_track(item["path"], track)
+                                        gr.File(value=exported, label=label, interactive=False, height=80, key=("single-" if single else "batch-")+item["id"]+"export-"+str(track["index"]))
+                                    except Exception:
+                                        gr.Markdown(html.escape(label) + " · تعذر استخراج المسار.")
+                                else:
+                                    gr.Markdown(html.escape(label))
+                        except Exception as exc:
+                            gr.Markdown(html.escape(str(exc)))
                     with gr.Accordion("ارفع ترجمة يدوية لنفس الحلقة · SRT / ASS", open=saved.get("mode") == "ترجمة يدوية"):
                         upload = gr.File(label="ملف الترجمة اليدوية", type="filepath", file_types=[".srt", ".ass"], interactive=True, height=160, key=("single-" if single else "batch-") + "sub-" + item["id"])
                     compress = gr.Checkbox(value=saved.get("compress",False), label="اضغط الحلقة بعد ما الحرق يخلص", interactive=True, key=("single-" if single else "batch-") + "compress-" + item["id"])
