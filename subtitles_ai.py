@@ -1189,6 +1189,7 @@ def write_responsive_ass(
     credits: Optional[Dict[str, str]] = None,
     wrap_mode: str = "sequential",
     soften_exclaim: bool = True,
+    preserve_wording: bool = False,
 ) -> str:
     prof = ensure_style_profile()
     geom = prof["responsive_geometry"]
@@ -1228,27 +1229,31 @@ def write_responsive_ass(
                 continue
 
         raw_final = entry.plain_text if entry.keep_untranslated else translations.get(entry.index, entry.plain_text)
-        # التقسيم التتابعي (أسلوب Celestial): السطر الطويل يصبح حدثين متتاليين زمنياً بدل سطر مكدس
-        seq_segs: Optional[List[str]] = None
-        if (
-            wrap_mode == "sequential"
-            and not entry.keep_untranslated
-            and entry.target_style in ("Main", "Top", "Narrator", "Narrator - Top")
-            and (entry.end_ms - entry.start_ms) >= 1700
-        ):
-            _cand = _enforce_celestial_punctuation(
-                raw_final, entry.target_style, source_text=entry.plain_text, as_segments=True,
-                soften=soften_exclaim,
-            )
-            if len(_cand) >= 2:
-                seq_segs = _cand
-        if seq_segs is None:
-            final_text = _enforce_celestial_punctuation(
-                raw_final, entry.target_style, source_text=entry.plain_text,
-                wrap=(wrap_mode == "stacked"), soften=soften_exclaim,
-            )
+        if preserve_wording:
+            seq_segs = None
+            final_text = raw_final.replace("\n", r"\N")
         else:
-            final_text = ""
+            # التقسيم التتابعي (أسلوب Celestial): السطر الطويل يصبح حدثين متتاليين زمنياً بدل سطر مكدس
+            seq_segs: Optional[List[str]] = None
+            if (
+                wrap_mode == "sequential"
+                and not entry.keep_untranslated
+                and entry.target_style in ("Main", "Top", "Narrator", "Narrator - Top")
+                and (entry.end_ms - entry.start_ms) >= 1700
+            ):
+                _cand = _enforce_celestial_punctuation(
+                    raw_final, entry.target_style, source_text=entry.plain_text, as_segments=True,
+                    soften=soften_exclaim,
+                )
+                if len(_cand) >= 2:
+                    seq_segs = _cand
+            if seq_segs is None:
+                final_text = _enforce_celestial_punctuation(
+                    raw_final, entry.target_style, source_text=entry.plain_text,
+                    wrap=(wrap_mode == "stacked"), soften=soften_exclaim,
+                )
+            else:
+                final_text = ""
 
         eff_style = entry.target_style
         inline_an8 = ""
