@@ -29,6 +29,7 @@ from media_ops import (
     extract_episode_number,
     make_browser_preview,
     make_rar_archive,
+    extract_card_frame,
     probe_video_info,
     branded_stem,
     clean_torrent_title,
@@ -735,6 +736,81 @@ def render_progress_hud(
     """
 
 
+def render_multi_hud(
+    cards: List[Dict[str, Any]],
+    queued: List[str],
+    layout: str,
+    done_n: int,
+    fail_n: int,
+    total: int,
+    conc: int,
+    warn: str = "",
+) -> str:
+    """لوحة تقدم متعددة الحلقات: كارت لكل حلقة شغالة (صورة + خطوة + شريط) بشكل شبكة أو صفوف.
+    الشبكة = الشكل A، الصفوف = الشكل B."""
+    ov = max(0.0, min(100.0, (done_n / max(1, total)) * 100.0))
+    rank = _grind_rank(ov)
+    warn_html = (
+        f'<div style="margin-top:8px;font-size:12.5px;font-weight:700;color:var(--sb-amber);">⚠️ {html.escape(warn)}</div>'
+        if warn else ""
+    )
+    head = f"""
+    <div class="sb-prog-card sb-mode-violet" style="margin-bottom:12px;">
+        <div class="sb-prog-top">
+            <div>
+                <div class="sb-prog-badge">MULTI GRIND · {conc}X</div>
+                <div class="sb-prog-title">طحن الموسم: {done_n} من {total} حلقة خلصت{(' · ' + str(fail_n) + ' فشلت') if fail_n else ''}</div>
+            </div>
+            <div class="sb-prog-pct">{ov:.1f}%</div>
+        </div>
+        <div class="sb-prog-track"><div class="sb-prog-fill sb-fill-violet" style="width: {ov:.1f}%;"></div></div>
+        <div class="sb-prog-meta"><span>🏆 RANK {rank}</span><span>⚡ {len(cards)} شغالة دلوقتي</span></div>
+        {warn_html}
+    </div>
+    """
+
+    def _card_html(c: Dict[str, Any], compact: bool = False) -> str:
+        mode_cls = {"violet": "sb-mode-violet", "done": "sb-mode-done", "error": "sb-mode-error"}.get(c.get("mode", "cyan"), "")
+        pct = max(0.0, min(100.0, float(c.get("pct", 0.0))))
+        frame = c.get("frame") or ""
+        if frame:
+            thumb = f'<img src="data:image/jpeg;base64,{frame}" style="width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:5px;border:1px solid rgba(56,189,248,0.25);display:block;">'
+        else:
+            thumb = (
+                '<div style="width:100%;aspect-ratio:16/9;border-radius:5px;border:1px dashed rgba(56,189,248,0.3);'
+                'background:#060B18;display:flex;align-items:center;justify-content:center;'
+                'color:var(--sb-muted);font-size:12px;">الصورة هتظهر أول ما الحرق يبدأ</div>'
+            )
+        return f"""
+        <div class="sb-prog-card {mode_cls}" style="margin:0;">
+            {thumb}
+            <div class="sb-prog-top" style="margin-top:8px;margin-bottom:4px;">
+                <div>
+                    <div class="sb-prog-badge">BURN · {html.escape(str(c.get('ep','')))}</div>
+                    <div class="sb-prog-title">{html.escape(str(c.get('name','')))}</div>
+                </div>
+                <div style="font-family:'JetBrains Mono',monospace;font-weight:900;color:var(--sb-cyan-bright);direction:ltr;font-size:19px;">{pct:.1f}%</div>
+            </div>
+            <div class="sb-prog-track"><div class="sb-prog-fill" style="width:{pct:.1f}%;"></div></div>
+            <div class="sb-prog-meta" style="margin-top:5px;"><span>⚡ {html.escape(str(c.get('step','')))}</span></div>
+        </div>
+        """
+
+    queue_html = ""
+    if queued:
+        queue_html = (
+            '<div style="margin-top:10px;font-size:12px;color:var(--sb-muted);">⏳ في الطابور: '
+            + " · ".join(html.escape(q) for q in queued) + "</div>"
+        )
+
+    cards_joined = "".join(_card_html(c) for c in cards)
+    if layout == "rows":
+        body = f'<div style="display:flex;flex-direction:column;gap:10px;">{cards_joined}</div>'
+    else:
+        body = f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;">{cards_joined}</div>'
+    return head + body + queue_html
+
+
 def load_settings() -> Dict:
     defaults = {
         "provider": "DeepSeek API (موصى به)",
@@ -752,6 +828,8 @@ def load_settings() -> Dict:
         "x265_preset": "slow",
         "cq": 27,
         "audio_bitrate": "copy",
+        "concurrency": 3,
+        "queue_layout": "grid",
         "credit_translator": "",
         "credit_typesetter": "",
         "credit_encoder": "",
@@ -775,6 +853,7 @@ def save_settings(
     provider, llm_model, api_key, base_url, style_preset, wrap_mode, soften_exclaim, dood_api_key,
     gdrive_remote, gdrive_folder,
     codec, preset, x265_preset, cq, audio_bitrate,
+    concurrency, queue_layout,
     credit_translator, credit_typesetter, credit_encoder,
     logo_position, logo_opacity, logo_scale,
 ) -> str:
@@ -794,6 +873,8 @@ def save_settings(
         "x265_preset": x265_preset,
         "cq": int(cq),
         "audio_bitrate": audio_bitrate,
+        "concurrency": max(1, min(10, int(concurrency))),
+        "queue_layout": "rows" if str(queue_layout) == "rows" else "grid",
         "credit_translator": credit_translator,
         "credit_typesetter": credit_typesetter,
         "credit_encoder": credit_encoder,
@@ -804,6 +885,32 @@ def save_settings(
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return f"✅ تم حفظ جميع المفاتيح والإعدادات الدائمة في `{SETTINGS_FILE}`."
+
+
+def step_save_manual_sub(series_name_val: str, ep_num, file_obj) -> str:
+    """يحفظ ملف الترجمة المترجم يدوياً في المكان اللي وضع الموسم بيتراقبه.
+    الحلقة اليدوية تلقطه وتكمل لوحدها — حتى لو الأداة شغالة دلوقتي."""
+    if not file_obj:
+        return "⚠️ اختر ملف الترجمة الأول."
+    try:
+        gi = int(ep_num)
+    except Exception:
+        return "⚠️ رقم الحلقة مش واضح."
+    if gi < 1:
+        return "⚠️ رقم الحلقة لازم يكون 1 أو أكتر."
+    src_path = getattr(file_obj, "name", None) or str(file_obj)
+    ext = Path(src_path).suffix.lower()
+    if ext not in (".srt", ".ass"):
+        return "⚠️ الملف لازم يكون SRT أو ASS."
+    try:
+        series_safe_m = _safe_name((series_name_val or "").strip() or "Anime_Season")
+        d = RAW_CACHE_ROOT / "_manual_subs" / series_safe_m
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / f"EP{gi:03d}{ext}"
+        shutil.copy2(src_path, str(dest))
+        return f"✅ ملف الحلقة {gi} محفوظ ({dest.name}) — الأداة هتلقطه وتكمّل لوحدها لو شغالة."
+    except Exception as exc:
+        return f"❌ تعذر حفظ الملف: {exc}"
 
 
 def _on_provider_change(prov: str) -> Tuple[Any, Any]:
@@ -1389,6 +1496,9 @@ def step_batch_process(
     batch_file_picks_sel: Optional[List[str]] = None,
     batch_file_map_val: Optional[Dict[str, Any]] = None,
     enable_telegram: bool = False,
+    concurrency: float = 3,
+    queue_layout: str = "grid",
+    manual_eps_text: str = "",
 ):
     """Season batch mode: one or more torrent links (each may hold a whole season or more),
     download all episodes, translate + burn + compress each, and collect them into one
@@ -1418,8 +1528,9 @@ def step_batch_process(
         lnk=gr.update(),
         arch=gr.update(),
         arch_txt=gr.update(),
+        subs=gr.update(),
     ):
-        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val, g1, g2, dls, lnk, arch, arch_txt)
+        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val, g1, g2, dls, lnk, arch, arch_txt, subs)
 
     def run_live(fn: Callable, *args, badge: str, title: str, mode: str = "cyan", accepts_progress_cb: bool = True, **kwargs):
         ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
@@ -1672,9 +1783,76 @@ def step_batch_process(
         if skip_set:
             push(f"⏭️ {len(skip_set)} حلقة جاهزة مسبقاً — هتتخطى من غير تجهيز.")
 
+        # ═══ الترجمة اليدوية لحلقات بعينها: أرقامها بتتحدد قبل التشغيل، وملفاتها بتترفع من الواجهة ═══
+        manual_set: set = set()
+        for _tok in re.split(r"[,،;\s]+", str(manual_eps_text or "")):
+            if _tok.strip().isdigit():
+                _g = int(_tok.strip())
+                if 1 <= _g <= total:
+                    manual_set.add(_g)
+        if manual_set:
+            push(f"✍️ ترجمة يدوية للحلقات: {', '.join(f'EP{g:03d}' for g in sorted(manual_set))} — الباقي ترجمة تلقائية. ارفع الملفات من قسم ✍️ الترجمة اليدوية.")
+
+        manual_dir = RAW_CACHE_ROOT / "_manual_subs" / series_safe
+
+        def _wait_manual_ass(gi_m: int, vid_m: Path, log_cb=None) -> Dict[str, Any]:
+            """حلقة يدوية: تستنى ملف الترجمة المترجم من الواجهة، تحوّله ASS بنفس الستايل، وترجع prep جاهز.
+            بتستنى من غير ما تحجب باقي الحلقات، وبتكتب في اللوج كل دقيقة — مفيش استنى صامت."""
+            cb = log_cb if callable(log_cb) else push
+            ep_label_m = f"EP{gi_m:03d}"
+            work_dir_m = RAW_CACHE_ROOT / "_work" / series_safe / ep_label_m
+            work_dir_m.mkdir(parents=True, exist_ok=True)
+            manual_dir.mkdir(parents=True, exist_ok=True)
+            # لو فيه ترجمة مدمجة: احفظ نسخة إنجليزية للتحميل قبل الاستنى — هو بيترجم منها برا
+            try:
+                probe_m = probe_embedded_subtitles(str(vid_m))
+                if probe_m is not None:
+                    src_m = extract_embedded_subtitle(str(vid_m), probe_m[0], probe_m[1], str(work_dir_m))
+                    en_dir_m = series_root / "_subs_en"
+                    en_dir_m.mkdir(parents=True, exist_ok=True)
+                    keep_m = en_dir_m / f"{series_dot}.{ep_label_m}.en{Path(src_m).suffix}"
+                    shutil.copy2(src_m, str(keep_m))
+                    cb(f"💾 {ep_label_m}: الترجمة الإنجليزية محفوظة للتحميل: {keep_m.name} — ترجمها وارفعها من قسم ✍️ الترجمة اليدوية.")
+            except Exception as ex_m:
+                cb(f"⚠️ {ep_label_m}: تعذر سحب ترجمة مدمجة للترجمة اليدوية ({ex_m}) — ارفع الملف المترجم جاهز.")
+            cb(f"⏸️ {ep_label_m}: ترجمة يدوية — مستني ملف الترجمة المترجم. ارفعه من قسم ✍️ الترجمة اليدوية في الواجهة (رقم الحلقة {gi_m}).")
+            target: Optional[Path] = None
+            last_ping = 0.0
+            while target is None:
+                for ext in (".srt", ".ass"):
+                    cand = manual_dir / f"{ep_label_m}{ext}"
+                    if cand.is_file() and cand.stat().st_size > 10:
+                        target = cand
+                        break
+                if target is None:
+                    if time.monotonic() - last_ping >= 60:
+                        last_ping = time.monotonic()
+                        cb(f"⌛ {ep_label_m}: لسه مستني ملف الترجمة اليدوي ({ep_label_m}.srt أو .ass)...")
+                    time.sleep(2)
+            cb(f"✓ {ep_label_m}: استلمت ملف الترجمة اليدوي: {target.name}")
+            entries_m = parse_source_subtitles(str(target))
+            if not entries_m:
+                raise ValueError(f"ملف الترجمة اليدوي للحلقة {gi_m} فاضي أو غير مقروء.")
+            translations_m = {e.index: getattr(e, "plain_text", "") for e in entries_m}
+            vw_m, vh_m, _, _ = probe_video_info(str(vid_m))
+            ep_ass_m = ass_root / f"{branded_stem(f'{series_dot}.{ep_label_m}', quality_token(vh_m))}.ass"
+            write_responsive_ass(
+                entries=entries_m,
+                translations=translations_m,
+                out_ass_path=str(ep_ass_m),
+                target_w=vw_m,
+                target_h=vh_m,
+                style_preset=style_preset,
+                credits=credits_dict if has_credits else None,
+                wrap_mode=wrap_mode,
+                soften_exclaim=soften_exclaim,
+            )
+            cb(f"✓ {ep_label_m}: ملف الـ ASS من الترجمة اليدوية جاهز للحرق.")
+            return {"ep_label": ep_label_m, "work_dir": work_dir_m, "entries": entries_m, "ep_ass": str(ep_ass_m)}
+
         def _next_pending(start_gi: int) -> int:
             for gj in range(start_gi, total + 1):
-                if gj not in skip_set:
+                if gj not in skip_set and gj not in manual_set:
                     return gj
             return 0
 
@@ -1693,6 +1871,15 @@ def step_batch_process(
                 if probe is not None:
                     source_sub_p = extract_embedded_subtitle(str(vid_p), probe[0], probe[1], str(work_dir_p))
                     cb(f"✓ {ep_label_p}: تم سحب الترجمة المدمجة ({probe[1]}).")
+                    # نسخة دائمة من الترجمة الإنجليزية للتحميل (ترجمة خارجية) — النسخة الأصلية تتمسح مع فولدر العمل
+                    try:
+                        en_dir_p = series_root / "_subs_en"
+                        en_dir_p.mkdir(parents=True, exist_ok=True)
+                        keep_p = en_dir_p / f"{series_dot}.{ep_label_p}.en{Path(source_sub_p).suffix}"
+                        shutil.copy2(source_sub_p, str(keep_p))
+                        cb(f"💾 {ep_label_p}: الترجمة الإنجليزية محفوظة للتحميل: {keep_p.name}")
+                    except Exception as keep_exc:
+                        cb(f"⚠️ {ep_label_p}: تعذر حفظ نسخة الترجمة الإنجليزية للتحميل: {keep_exc}")
             if source_sub_p is None:
                 is_raw_whisper_p = True
                 source_sub_p = transcribe_with_whisper(
@@ -1816,12 +2003,178 @@ def step_batch_process(
             push(f"🧵 تجهيز مبكر: الحلقة {gi_p} من {total} بدأت تتجهز في الخلفية (ترجمة/تفريغ) أثناء شغل الحالية.")
             t.start()
 
+        # ═══ وضع التوازي: حتى N حلقات مع بعض (التجهيز/الترجمة/التفريغ خيط واحد دايماً) ═══
+        conc_n = max(1, min(10, int(concurrency or 3)))
+        pending_gis = [g for g in range(1, total + 1) if g not in skip_set]
+
+        def _grind_parallel():
+            nonlocal last_ass
+            push(f"🚀 وضع التوازي مفعّل: {conc_n} حلقات مع بعض — الترجمة والتفريغ واحدة ورا التانية عشان الذاكرة والقاموس.")
+            free_b = shutil.disk_usage(str(STORAGE_ROOT)).free
+            try:
+                est_b = sum(all_eps[g - 1].stat().st_size for g in pending_gis[:conc_n] if all_eps[g - 1].exists())
+            except Exception:
+                est_b = 0
+            need_b = est_b + conc_n * 1300 * 1024 * 1024  # خام + ناتج + مساحة عمل لكل حلقة متزامنة
+            disk_warn = ""
+            if free_b < need_b:
+                disk_warn = (
+                    f"المساحة الفاضية ({free_b / 1e9:.1f}GB) أقل من المطلوب تقريباً لتشغيل {conc_n} حلقات مع بعض "
+                    f"({need_b / 1e9:.1f}GB) — قلّل العدد أو نظّف البود."
+                )
+                push(f"⚠️ {disk_warn}")
+
+            work_q: "queue.Queue[int]" = queue.Queue()
+            for g in pending_gis:
+                work_q.put(g)
+            cards_box: Dict[int, Dict[str, Any]] = {}
+            prep_results: Dict[int, Dict[str, Any]] = {}
+            prep_lock = threading.Lock()   # التجهيز (سحب ترجمة/تفريغ/ترجمة) واحد في اللحظة
+            tg_lock = threading.Lock()     # رفع تيليجرام واحد في اللحظة مع الفاصل الهادي
+            state_lock = threading.Lock()  # رفع ملفات الحالة الصغيرة على Drive واحد في اللحظة
+
+            def _worker() -> None:
+                while True:
+                    try:
+                        gi = work_q.get_nowait()
+                    except queue.Empty:
+                        return
+                    vid = all_eps[gi - 1]
+                    ep_label = f"EP{gi:03d}"
+                    card: Dict[str, Any] = {"ep": ep_label, "name": f"{series_dot}.{ep_label}", "step": "في الطابور", "pct": 0.0, "frame": "", "mode": "cyan"}
+                    cards_box[gi] = card
+                    try:
+                        try:
+                            _, _vh0, _, _ = probe_video_info(str(vid))
+                        except Exception:
+                            _vh0 = 0
+                        out_mp4 = part_dir_for(gi) / (branded_stem(f"{series_dot}.{ep_label}", quality_token(_vh0)) + ".mp4")
+                        push(f"━━━━━━ {ep_label} ({gi}/{total}): {vid.name} ━━━━━━")
+                        if gi in manual_set:
+                            card["step"] = "مستني ملف الترجمة اليدوي"
+                            prep = _wait_manual_ass(gi, vid, _bg_log)  # من غير prep_lock: مفيش ترجمة AI ولا ذاكرة هنا
+                        else:
+                            card["step"] = "تجهيز الترجمة"
+                            with prep_lock:
+                                prep = _prep_episode(gi, vid, _bg_log)
+                        prep_results[gi] = prep
+                        card["pct"] = 5.0
+
+                        frame_ts = {"t": 0.0}
+
+                        def _burn_prog(p, met, det, _c=card, _vid=vid):
+                            _c["pct"] = 5.0 + float(p) * 0.75
+                            _c["step"] = f"حرق وضغط ({codec})"
+                            now_m = time.monotonic()
+                            if now_m - frame_ts["t"] >= 4.0:
+                                frame_ts["t"] = now_m
+                                f = extract_card_frame(str(_vid), float(p) / 100.0)
+                                if f:
+                                    _c["frame"] = f
+
+                        burn_and_compress_native(
+                            video_path=str(vid),
+                            ass_path=str(prep["ep_ass"]),
+                            output_path=str(out_mp4),
+                            fonts_dir=str(FONTS_DIR),
+                            codec=codec,
+                            cq=int(cq),
+                            preset=preset,
+                            x265_preset=x265_preset,
+                            audio_bitrate=audio_bitrate,
+                            logo_path=str(LOGO_FILE) if LOGO_FILE.is_file() else "",
+                            logo_position=logo_position,
+                            logo_opacity=float(logo_opacity),
+                            logo_scale=float(logo_scale),
+                            log_cb=push,
+                            progress_cb=_burn_prog,
+                        )
+                        card["pct"] = 82.0
+                        card["step"] = "فحص الجودة"
+                        qc_burned_episode(
+                            str(vid), str(out_mp4),
+                            ass_path=str(prep["ep_ass"]),
+                            expected_lines=len(prep["entries"]),
+                            qc_dir=str(series_root / "_qc" / ep_label),
+                            log_cb=push,
+                            progress_cb=lambda p, m, d: card.update({"pct": 82.0 + float(p) * 0.06}),
+                        )
+                        rendered[ep_label] = str(out_mp4)
+                        if drive_ok:
+                            try:
+                                card["step"] = "نسخ احتياطي Drive"
+                                upload_to_rclone(
+                                    str(out_mp4), drv_remote, f"{drv_folder}/{series_safe}",
+                                    generate_link=False, log_cb=push,
+                                    progress_cb=lambda p, m, d: card.update({"pct": 88.0 + float(p) * 0.06}),
+                                )
+                                with state_lock:
+                                    for _sf, _sub in ((tmem_path, f"_state/{series_safe}"), (_glossary_dir() / f"{_glossary_slug(series_name)}.json", "_state/glossaries")):
+                                        if _sf.is_file():
+                                            upload_to_rclone(str(_sf), drv_remote, f"{drv_folder}/{_sub}", generate_link=False, log_cb=push)
+                            except Exception as up_exc:
+                                push(f"⚠️ فشل النسخ الاحتياطي لـ {ep_label} على Drive: {up_exc} — الحلقة محفوظة محلياً ومكملين.")
+                        if enable_telegram:
+                            if not tgchan or not tgchan.is_ready():
+                                if not tg_warned["v"]:
+                                    tg_warned["v"] = True
+                                    push("⚠️ الرفع على تيليجرام متفعّل بس تيليجرام مش جاهز — سجّل الدخول وأنشئ القناة من إعدادات 📡 تيليجرام. هيتم تخطي رفع تيليجرام للموسم ده.")
+                            else:
+                                try:
+                                    card["step"] = "رفع تيليجرام"
+                                    with tg_lock:
+                                        tgchan.upload_episode(series_name, gi, str(out_mp4), log_cb=push)
+                                        time.sleep(tgchan.UPLOAD_GAP_SECONDS)
+                                except Exception as tg_exc:
+                                    push(f"⚠️ فشل رفع {ep_label} على تيليجرام: {tg_exc} — الحلقة محفوظة ومكملين.")
+                        shutil.rmtree(str(prep["work_dir"]), ignore_errors=True)
+                        if cleanup_temp:
+                            try:
+                                vid.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        card["pct"] = 100.0
+                        card["step"] = "خلصت"
+                        card["mode"] = "done"
+                        push(f"✅ {ep_label} جاهزة: {out_mp4.name}")
+                    except Exception as ep_exc:
+                        card["mode"] = "error"
+                        card["step"] = "فشلت"
+                        failed.append(f"{ep_label} ({vid.name}): {ep_exc}")
+                        push(f"❌ فشلت {ep_label}: {ep_exc} — متابعة باقي الحلقات...")
+
+            threads = [threading.Thread(target=_worker, daemon=True) for _ in range(min(conc_n, len(pending_gis)))]
+            for t in threads:
+                t.start()
+            while any(t.is_alive() for t in threads):
+                live_cards = [cards_box[g] for g in sorted(cards_box)]
+                queued_names = [f"EP{g:03d}" for g in pending_gis if g not in cards_box][:conc_n]
+                yield pack(render_multi_hud(
+                    live_cards, queued_names, str(queue_layout),
+                    len(rendered) - len(skip_set), len(failed), total - len(skip_set), conc_n, disk_warn,
+                ))
+                time.sleep(0.6)
+            for t in threads:
+                t.join()
+            if prep_results:
+                last_ass = str(prep_results[max(prep_results)]["ep_ass"])
+            push(f"🏁 وضع التوازي خلص: {len(rendered) - len(skip_set)} حلقة اتعملت في الجولة دي، {len(failed)} فشلت.")
+
+        parallel_done = False
+        if conc_n > 1 and len(pending_gis) > 1:
+            yield from _grind_parallel()
+            parallel_done = True
+
         # ابدأ تجهيز أول حلقة ناقصة فوراً
-        _first_pending = _next_pending(1)
+        _first_pending = 0 if parallel_done else _next_pending(1)
         if _first_pending:
             _start_bg_prep(_first_pending)
 
-        for gi, vid in enumerate(all_eps, 1):
+        # الوضع المتتابع: الحلقات التلقائية الأول بالترتيب، واليدوية تتأجل للآخر عشان مستناش غيرها
+        _seq_order = [(g, all_eps[g - 1]) for g in range(1, total + 1) if g not in manual_set] + [
+            (g, all_eps[g - 1]) for g in sorted(manual_set)
+        ]
+        for gi, vid in (_seq_order if not parallel_done else []):
             ep_label = f"EP{gi:03d}"
             grind_ctx["gi"] = gi
 
@@ -1840,6 +2193,15 @@ def step_batch_process(
             try:
                 # استهلاك التجهيز المبكر للحلقة دي (مع الانتظار لو لسه شغال)
                 prep = None
+                if gi in manual_set:
+                    prep = yield from run_live(
+                        _wait_manual_ass,
+                        gi, vid,
+                        badge=f"MANUAL SUB [{ep_label} {gi}/{total}]",
+                        title=f"الحلقة {gi} من {total}: ترجمة يدوية — مستنية رفع الملف من قسم ✍️ الترجمة اليدوية...",
+                        accepts_progress_cb=False,
+                    )
+                    push(f"✓ {ep_label}: ملف الترجمة اليدوي اتقري وجاهز للحرق.")
                 pt = prep_box.get("thread")
                 if pt is not None:
                     same = prep_box.get("gi") == gi
@@ -1964,6 +2326,20 @@ def step_batch_process(
                 continue
 
         all_local = list_local_outputs()
+        # ═══ ملفات الترجمة الإنجليزية للترجمة الخارجية: فردية + أرشيف واحد للكل ═══
+        en_files: List[str] = []
+        en_dir = series_root / "_subs_en"
+        if en_dir.is_dir():
+            en_files = sorted(str(p) for p in list(en_dir.glob("*.srt")) + list(en_dir.glob("*.ass")))
+            if len(en_files) > 1:
+                try:
+                    zip_path = shutil.make_archive(str(series_root / "_subs_en_all"), "zip", root_dir=str(en_dir))
+                    en_files.append(zip_path)
+                    push(f"📦 {len(en_files) - 1} ملف ترجمة إنجليزية جاهزين للتحميل + أرشيف واحد يجمعهم.")
+                except Exception as zip_exc:
+                    push(f"⚠️ تعذر تجميع ملفات الترجمة الإنجليزية في أرشيف: {zip_exc} — الملفات الفردية متاحة.")
+            elif en_files:
+                push("📄 ملف الترجمة الإنجليزية جاهز للتحميل من قسم التحميلات.")
         first_video = next(iter(rendered.values()), None)
         preview_file = first_video
         if first_video:
@@ -2007,6 +2383,7 @@ def step_batch_process(
             state_val={"folder": str(series_root), "files": rendered},
             g2=gr.update(visible=True),
             dls=gr.update(visible=True),
+            subs=(en_files if en_files else gr.update()),
             arch=gr.update(visible=(done_n > 1)),
             arch_txt=gr.update(value=f'<div style="color:#eaf6ff;font-size:16px;font-weight:600;padding:2px 0 8px;">الدفعة خلصت ({done_n} حلقة). تجمعهم في أرشيف واحد؟</div>') if done_n > 1 else gr.update(),
         )
@@ -2479,12 +2856,23 @@ def build_ui() -> gr.Blocks:
                                     elem_classes=["sb-batch-picker"],
                                 )
                                 batch_file_map = gr.State({})
+                                manual_eps_text = gr.Textbox(
+                                    label="حلقات بترجمة يدوية — أرقام الحلقات مفصولة بفواصل (مثال: 2,5) · سيبه فاضي لو كله تلقائي",
+                                    placeholder="مثال: 2,5",
+                                )
                                 batch_btn = gr.Button(
                                     "🚀 شغّل الموسم كاملاً: تحميل كل الحلقات ← ترجمة بأسلوب المترجم ← حرق ← ضغط ← فولدرات 35 حلقة [SEASON STRIKE]",
                                     variant="primary",
                                     size="lg",
                                     elem_id="sb-batch-btn",
                                 )
+
+                            with gr.Accordion("✍️ الترجمة اليدوية — ارفع ملف مترجم لحلقة", open=False, elem_classes=["sb-accordion"]):
+                                with gr.Row():
+                                    manual_ep_num = gr.Number(value=1, precision=0, label="رقم الحلقة")
+                                    manual_sub_file = gr.File(label="ملف الترجمة المترجم (SRT أو ASS)", file_types=[".srt", ".ass"])
+                                manual_sub_btn = gr.Button("💾 احفظ الملف للحلقة", size="sm")
+                                manual_sub_status = gr.Markdown("")
 
                             with gr.Accordion("🔑 مفاتيح DeepSeek / Gemini والإعدادات الدائمة", open=False, elem_classes=["sb-accordion"]):
                                 with gr.Row():
@@ -2559,6 +2947,13 @@ def build_ui() -> gr.Blocks:
                                     ]
                                     _audio_val = cfg["audio_bitrate"] if cfg["audio_bitrate"] in ("copy", "128k", "160k", "192k") else "copy"
                                     audio_bitrate = gr.Dropdown(choices=_audio_choices, value=_audio_val, label="الصوت")
+                                with gr.Row():
+                                    concurrency = gr.Slider(minimum=1, maximum=10, step=1, value=int(cfg.get("concurrency", 3)), label="عدد الحلقات مع بعض")
+                                    queue_layout = gr.Dropdown(
+                                        choices=[("شبكة كروت", "grid"), ("صفوف طويلة", "rows")],
+                                        value=cfg.get("queue_layout", "grid") if cfg.get("queue_layout", "grid") in ("grid", "rows") else "grid",
+                                        label="شكل عرض الحلقات",
+                                    )
                                 with gr.Row():
                                     logo_position = gr.Dropdown(
                                         choices=[("أعلى اليمين", "top-right"), ("أعلى الشمال", "top-left"), ("أسفل اليمين", "bottom-right"), ("أسفل الشمال", "bottom-left")],
@@ -2647,6 +3042,7 @@ def build_ui() -> gr.Blocks:
                         with gr.Group(visible=False) as downloads_group:
                             out_video_files = gr.Files(label="🎥 تحميل الفيديوهات النهائية لجهازك")
                             out_ass_file = gr.File(label="📝 تحميل ملف الترجمة المنسّق (.ass)")
+                            en_subs_files = gr.Files(label="📄 ملفات الترجمة الإنجليزية — للترجمة الخارجية")
 
         provider.change(fn=_on_provider_change, inputs=[provider], outputs=[llm_model, base_url])
 
@@ -2662,6 +3058,7 @@ def build_ui() -> gr.Blocks:
                 provider, llm_model, api_key, base_url, style_preset, wrap_mode, soften_exclaim, dood_api_key,
                 gdrive_remote, gdrive_folder,
                 codec, preset, x265_preset, cq, audio_bitrate,
+                concurrency, queue_layout,
                 credit_translator, credit_typesetter, credit_encoder,
                 logo_position, logo_opacity, logo_scale,
             ],
@@ -2682,6 +3079,7 @@ def build_ui() -> gr.Blocks:
         rar_make_btn.click(fn=step_archive_selected, inputs=[rar_series_dd, rar_eps_cb], outputs=[rar_status])
 
         refresh_raw_btn.click(fn=lambda: gr.update(choices=[""] + list_cached_raw_videos()), outputs=[saved_raw_1080])
+        manual_sub_btn.click(fn=step_save_manual_sub, inputs=[series_name, manual_ep_num, manual_sub_file], outputs=[manual_sub_status])
         refresh_local_btn.click(fn=lambda: gr.update(choices=list_local_outputs()), outputs=[local_dropdown])
         local_dropdown.change(fn=_browser_preview_path, inputs=[local_dropdown], outputs=[preview_player])
 
@@ -2725,12 +3123,15 @@ def build_ui() -> gr.Blocks:
                 logo_position, logo_opacity, logo_scale,
                 batch_file_picks, batch_file_map,
                 enable_telegram,
+                concurrency, queue_layout,
+                manual_eps_text,
             ],
             outputs=[
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
                 out_video_files, out_ass_file, job_state,
                 step1_group, step2_group, downloads_group, links_box,
                 archive_group, archive_prompt_md,
+                en_subs_files,
             ],
         )
 
