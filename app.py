@@ -20,6 +20,7 @@ from media_ops import (
     VIDEO_EXTENSIONS,
     _has_nvenc,
     burn_and_compress_native,
+    burn_then_optional_compress,
     qc_burned_episode,
     collect_episode_videos,
     download_season_batch,
@@ -1543,10 +1544,11 @@ def _wizard_next(manifest, links=None, picks=None):
     return gr.update(visible=False), gr.update(visible=True)
 
 
-def _wizard_choice(mode, upload, choices, item):
+def _wizard_choice(mode, upload, choices, item, compress=False):
     updated = dict(choices or {})
     entry = dict(updated.get(item["path"], {}))
     entry["mode"] = mode
+    entry["compress"] = bool(compress)
     if not upload:
         entry.pop("subtitle", None)
     if upload:
@@ -1794,13 +1796,19 @@ def step_batch_process(
                 pass
         _q_folder = f".{next(iter(_res_set))}" if len(_res_set) == 1 and next(iter(_res_set)) else ""
         branded_folder = f"{series_dot}.EP1-{total}{_q_folder}.{BRAND_TAG}"
+        if downloaded_manifest is not None:
+            identity = [{"flow": (downloaded_manifest[0].get("flow", "batch")), "path": str(path.resolve()), "size": path.stat().st_size,
+                         "subtitle": (subtitle_choices or {}).get(str(path.resolve()), {}),
+                         "codec": codec, "cq": cq, "burn_quality": 16} for path in all_eps]
+            digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
+            branded_folder += "." + digest
         new_root = STORAGE_ROOT / branded_folder
         if new_root != series_root:
             try:
                 if new_root.is_dir():
                     series_root = new_root  # استكمال في فولدر موجود بنفس الاسم
                 else:
-                    if series_root.is_dir() and any(series_root.iterdir()):
+                    if downloaded_manifest is None and series_root.is_dir() and any(series_root.iterdir()):
                         series_root.rename(new_root)
                     else:
                         new_root.mkdir(parents=True, exist_ok=True)
@@ -1845,7 +1853,7 @@ def step_batch_process(
         _st = load_settings()
         drv_remote = str(_st.get("gdrive_remote", "gdrive")).strip() or "gdrive"
         drv_folder = str(_st.get("gdrive_folder", "Runpod_Anime")).strip() or "Runpod_Anime"
-        drive_ok = rclone_remote_configured(drv_remote)
+        drive_ok = rclone_remote_configured(drv_remote) if downloaded_manifest is None else False
         if drive_ok:
             push("☁️ Google Drive متربط — هيتم رفع كل حلقة أول بأول + حفظ الذاكرة والقاموس.")
             drive_download_file(drv_remote, f"{drv_folder}/_state/{series_safe}", "_translation_memory.json", str(series_root / "_translation_memory.json"))
@@ -1881,7 +1889,7 @@ def step_batch_process(
             found0 = None
             if d0.is_dir():
                 cands = sorted(d0.glob(f"{series_dot}.EP{gi0:03d}.*.mp4"))
-                cands = [c for c in cands if "_preview" not in c.stem and c.stat().st_size > 1024 * 1024]
+                cands = [c for c in cands if not any(tag in c.stem for tag in ("_preview", ".burned.", ".burning.", ".compressing.")) and c.stat().st_size > 1024 * 1024]
                 if cands:
                     found0 = cands[0]
             if found0 is None:
@@ -2191,7 +2199,7 @@ def step_batch_process(
 
                         def _burn_prog(p, met, det, _c=card, _vid=vid):
                             _c["pct"] = 5.0 + float(p) * 0.75
-                            _c["step"] = f"حرق وضغط ({codec})"
+                            _c["step"] = str(met)
                             now_m = time.monotonic()
                             if now_m - frame_ts["t"] >= 4.0:
                                 frame_ts["t"] = now_m
@@ -2199,13 +2207,14 @@ def step_batch_process(
                                 if f:
                                     _c["frame"] = f
 
-                        burn_and_compress_native(
+                        burn_then_optional_compress(
                             video_path=str(vid),
                             ass_path=str(prep["ep_ass"]),
                             output_path=str(out_mp4),
                             fonts_dir=str(FONTS_DIR),
                             codec=codec,
                             cq=int(cq),
+                            compress_after=bool((subtitle_choices or {}).get(str(vid.resolve()), {}).get("compress", False)),
                             preset=preset,
                             x265_preset=x265_preset,
                             audio_bitrate=audio_bitrate,
@@ -2374,13 +2383,14 @@ def step_batch_process(
                 burn_vid = str(vid)
 
                 yield from run_live(
-                    burn_and_compress_native,
+                    burn_then_optional_compress,
                     video_path=burn_vid,
                     ass_path=str(prep["ep_ass"]),
                     output_path=str(out_mp4),
                     fonts_dir=str(FONTS_DIR),
                     codec=codec,
                     cq=int(cq),
+                    compress_after=bool((subtitle_choices or {}).get(str(vid.resolve()), {}).get("compress", False)),
                     preset=preset,
                     x265_preset=x265_preset,
                     audio_bitrate=audio_bitrate,
@@ -2388,8 +2398,8 @@ def step_batch_process(
                     logo_position=logo_position,
                     logo_opacity=float(logo_opacity),
                     logo_scale=float(logo_scale),
-                    badge=f"ENCODE [{ep_label} {gi}/{total}]",
-                    title=f"حرق وضغط حلقة {gi} من {total} ({codec})...",
+                    badge=f"BURN / OPTIONAL COMPRESS [{ep_label} {gi}/{total}]",
+                    title=f"حرق ثم ضغط اختياري للحلقة {gi} من {total} ({codec})...",
                     accepts_progress_cb=True,
                 )
                 yield from run_live(
@@ -2902,7 +2912,7 @@ def _build_blocks_kwargs() -> Dict:
     return kwargs
 
 
-def build_ui() -> gr.Blocks:
+def build_legacy_ui() -> gr.Blocks:
     cfg = load_settings()
     if tgchan:
         try:
@@ -3008,11 +3018,14 @@ def build_ui() -> gr.Blocks:
                                         gr.Markdown("**" + html.escape(item["name"]) + "**")
                                         mode = gr.Radio(["أوتوماتيك", "ترجمة يدوية"], value="أوتوماتيك", label="طريقة الترجمة", key="mode-" + item["id"])
                                         upload = gr.File(label="ارفع ترجمة نفس الحلقة · SRT / ASS", file_types=[".srt", ".ass"], type="filepath", visible=False, key="sub-" + item["id"])
-                                        def change_choice(mode_value, file_value, current, item=item):
-                                            return _wizard_choice(mode_value, file_value, current, item)
-                                        mode.change(change_choice, [mode, upload, wizard_choices], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
-                                        upload.upload(change_choice, [mode, upload, wizard_choices], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
-                                        upload.clear(change_choice, [mode, upload, wizard_choices], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
+                                        compress = gr.Checkbox(value=False, label="اضغط الحلقة بعد ما الحرق يخلص", key="compress-" + item["id"])
+                                        gr.Markdown("الحرق واللوجو أساسي بجودة عالية. الضغط بعده اختياري، وبيحتاج وقت ومساحة زيادة وممكن يفقد تفاصيل إضافية.")
+                                        def change_choice(mode_value, file_value, current, compress_value, item=item):
+                                            return _wizard_choice(mode_value, file_value, current, item, compress_value)
+                                        mode.change(change_choice, [mode, upload, wizard_choices, compress], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
+                                        upload.upload(change_choice, [mode, upload, wizard_choices, compress], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
+                                        upload.clear(change_choice, [mode, upload, wizard_choices, compress], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
+                                        compress.change(change_choice, [mode, upload, wizard_choices, compress], [wizard_choices, upload], concurrency_id="wizard-choices", concurrency_limit=1)
                             with gr.Accordion("🔑 مفاتيح DeepSeek / Gemini والإعدادات الدائمة", open=False, elem_classes=["sb-accordion"]):
                                 with gr.Row():
                                     provider = gr.Dropdown(
@@ -3137,7 +3150,7 @@ def build_ui() -> gr.Blocks:
                                 rar_make_btn = gr.Button("📦 اعمل أرشيف للمختار", variant="primary")
                                 rar_status = gr.Textbox(label="النتيجة", lines=5, interactive=False)
 
-                            batch_btn = gr.Button("ابدأ الترجمة والمعالجة", variant="primary", size="lg")
+                            batch_btn = gr.Button("ابدأ الترجمة والحرق", variant="primary", size="lg")
                             wizard_back = gr.Button("رجوع لاختيار الحلقات")
 
                         progress_hud = gr.HTML(value=render_progress_hud())
@@ -3310,6 +3323,164 @@ def build_ui() -> gr.Blocks:
         )
 
     return demo
+
+
+
+def build_ui() -> gr.Blocks:
+    """Independent tab instances. Only the current step is shown in each tab."""
+    cfg = load_settings()
+    css = SHADOW_BLADE_CSS + """
+    body, .gradio-container, .main, .wrap {background-color:#081120!important} .gradio-container{width:100%!important;max-width:1100px!important;margin:auto!important} .clear-flow {direction:rtl; width:100%!important;max-width:1050px;margin:auto} .gradio-container{background:#081120!important;min-width:0!important} [role=tab]{color:#c6dbf8!important} .clear-flow input[type=radio]:checked+span{color:#45ccff!important;font-weight:700} .clear-flow input[type=radio]{appearance:auto!important;opacity:1!important}
+    .gradio-container h1,.gradio-container h2,.gradio-container h3,.gradio-container p,.clear-flow p,.clear-flow h1,.clear-flow h2,.clear-flow h3,.clear-flow strong,.clear-flow span,.clear-flow label {color:#e0ecff!important}
+    .clear-flow input,.clear-flow textarea,.clear-flow select,.clear-flow [role=listbox],.clear-flow [role=option] {background:#090f1a!important;color:#e0ecff!important}
+    .clear-flow label {background:#101b2c!important} .clear-flow input[type=radio],.clear-flow input[type=checkbox] {accent-color:#3bc5ff!important;background:transparent!important}
+    .clear-flow button {font-size:16px!important}
+    .clear-flow .prose {line-height:1.8}
+    """
+    kwargs = _build_blocks_kwargs()
+    if "css" in kwargs:
+        kwargs["css"] = css
+    with gr.Blocks(**kwargs) as demo:
+        gr.HTML("<style>" + css + "</style>")
+        gr.Markdown("# سَبّر الأنمي\nاختار وضع الشغل. كل تبويب ليه خطواته وملفاته واختياراته المستقلة.")
+        with gr.Tabs():
+            for single, title in [(False, "دفعة حلقات / موسم"), (True, "حلقة واحدة")]:
+                with gr.Tab(title), gr.Column(elem_classes=["clear-flow"]):
+                    _build_clear_flow(single, cfg)
+    return demo
+
+
+def _build_clear_flow(single, cfg):
+    manifest = gr.State([])
+    choices = gr.State({})
+    file_map = gr.State({})
+    job = gr.State({})
+    with gr.Column() as source_group:
+        gr.Markdown("## ١ · مصدر الحلقة" if single else "## ١ · اختار الحلقات وحمّلها")
+        series = gr.Textbox(label="اسم الأنمي", placeholder="مثال: Bleach")
+        source = gr.Textbox(label="رابط الحلقة أو مسار فيديو محفوظ" if single else "روابط التورنت، رابط في كل سطر", lines=2)
+        if single:
+            local_file = gr.File(label="أو ارفع فيديو / ملف تورنت", type="filepath", file_types=[".mp4", ".mkv", ".torrent", ".webm"])
+            picks = gr.State([])
+        else:
+            local_file = gr.State(None)
+            list_button = gr.Button("اعرض ملفات التورنت")
+            picks = gr.CheckboxGroup(label="علّم على الحلقات المطلوبة", choices=[])
+        download = gr.Button("حمّل وتحقق من الحلقة" if single else "حمّل وتحقق من الحلقات المختارة", variant="primary")
+        status = gr.Markdown("الترجمة مش هتبدأ في الخطوة دي.")
+        next_button = gr.Button("التالي: الترجمة ←", interactive=False)
+    with gr.Column(visible=False) as subtitle_group:
+        gr.Markdown("## ٢ · الترجمة والإخراج\nالحرق أساسي بجودة عالية. الضغط مرحلة منفصلة واختيارية بعده.")
+        @gr.render(inputs=[manifest, choices])
+        def render_rows(items, selections):
+            for item in items or []:
+                saved = (selections or {}).get(item["path"], {})
+                with gr.Group():
+                    gr.Markdown("### " + html.escape(item["name"]))
+                    mode = gr.Radio(["أوتوماتيك", "ترجمة يدوية"], value=saved.get("mode", "أوتوماتيك"), label="الترجمة", key=("single-" if single else "batch-") + "mode-" + item["id"])
+                    with gr.Accordion("ارفع ترجمة يدوية لنفس الحلقة · SRT / ASS", open=saved.get("mode") == "ترجمة يدوية"):
+                        upload = gr.File(label="ملف الترجمة اليدوية", type="filepath", file_types=[".srt", ".ass"], interactive=True, height=160, key=("single-" if single else "batch-") + "sub-" + item["id"])
+                    compress = gr.Checkbox(value=saved.get("compress",False), label="اضغط الحلقة بعد ما الحرق يخلص", key=("single-" if single else "batch-") + "compress-" + item["id"])
+                    if saved.get("subtitle"):
+                        gr.Markdown("✓ ملف الترجمة محفوظ لنفس الحلقة")
+                    def change(mode_value, upload_value, current, compress_value, item=item):
+                        return _wizard_choice(mode_value, upload_value, current, item, compress_value)
+                    def save_choice(mode_value, upload_value, current, compress_value, item=item):
+                        if not upload_value:
+                            upload_value = (current or {}).get(item["path"], {}).get("subtitle")
+                        updated = _wizard_choice(mode_value, upload_value, current, item, compress_value)[0]
+                        return gr.skip() if updated == current else updated
+                    for event in [mode.change, upload.upload, compress.change]:
+                        event(save_choice, [mode, upload, choices, compress], [choices], concurrency_id="subtitle-choices", concurrency_limit=1)
+        gr.Markdown("من غير ضغط إضافي: الملف المحروق هو النهائي. مع الضغط: ترميز تاني، وقت ومساحة زيادة وممكن فقد تفاصيل إضافية. الحرق الأول بجودة 16، مش وعد بجودة مطابقة للأصل.")
+        with gr.Accordion("إعدادات الترجمة والحرق والضغط", open=False):
+            provider = gr.Dropdown(["DeepSeek API (موصى به)", "Gemini API", "OpenAI-Compatible / Local"], value=cfg["provider"], label="محرك الترجمة")
+            key = gr.Textbox(value=cfg["api_key"], label="API Key", type="password")
+            model = gr.Textbox(value=cfg["llm_model"], label="الموديل")
+            base = gr.Textbox(value=cfg["base_url"], label="Base URL")
+            codec = gr.Dropdown([("HEVC كرت الشاشة", "hevc_nvenc"), ("H.264 كرت الشاشة", "h264_nvenc"), ("HEVC معالج", "libx265"), ("AV1 كرت الشاشة", "av1_nvenc")], value=cfg["codec"], label="كوديك الإخراج")
+            cq = gr.Slider(18,30,value=cfg["cq"],step=1,label="جودة مرحلة الضغط الاختيارية CQ")
+            concurrency = gr.Slider(1,10,value=1 if single else cfg.get("concurrency",3),step=1,label="الحلقات المتزامنة",visible=not single)
+            logo_position = gr.Dropdown([("أعلى اليمين","top-right"),("أعلى الشمال","top-left"),("أسفل اليمين","bottom-right"),("أسفل الشمال","bottom-left")],value=cfg.get("logo_position","top-right"),label="مكان اللوجو")
+        start = gr.Button("ابدأ الترجمة والحرق", variant="primary")
+        back = gr.Button("رجوع للمصدر")
+    with gr.Column(visible=False) as processing_group:
+        gr.Markdown("## ٣ · الترجمة ← الحرق ← الضغط الاختياري ← الفحص")
+        progress = gr.HTML()
+    with gr.Column(visible=False) as result_group:
+        gr.Markdown("## ٤ · النتائج والرفع")
+        preview = gr.Video(label="معاينة الناتج")
+        videos = gr.Files(label="الفيديوهات الجاهزة")
+        ass = gr.File(label="ملف الترجمة المنسق")
+        en_files = gr.Files(label="ملفات الترجمة الإنجليزية")
+        with gr.Accordion("ارفع النتائج", open=False):
+            dood = gr.Checkbox(value=False,label="DoodStream")
+            drive = gr.Checkbox(value=False,label="Google Drive")
+            dood_key = gr.Textbox(value=cfg.get("dood_api_key",""),type="password",label="DoodStream API Key")
+            remote = gr.Textbox(value=cfg.get("gdrive_remote","gdrive"),label="Drive Remote")
+            folder = gr.Textbox(value=cfg.get("gdrive_folder","Runpod_Anime"),label="فولدر Drive")
+            upload_button = gr.Button("ارفع النتائج المختارة")
+            links = gr.Textbox(label="روابط الرفع",lines=4)
+        again = gr.Button("شغل جديد")
+    with gr.Accordion("تفاصيل السجل عند الحاجة", open=False):
+        logs = gr.Textbox(label="السجل",lines=10)
+    hidden_local = gr.State(None)
+    hidden_raw = gr.State(None)
+    hidden_archive = gr.State(None)
+    hidden_archive_text = gr.State(None)
+    def download_source(src, selected, mapping, anime, file_value):
+        if single:
+            try:
+                if not src and not file_value:
+                    raise ValueError("حط رابط أو ارفع ملف الأول.")
+                if not anime.strip():
+                    raise ValueError("اكتب اسم الأنمي الأول.")
+                path = download_torrent_or_url(src or None, (src if src and Path(src).is_file() and Path(src).suffix.lower() in VIDEO_EXTENSIONS else file_value),
+                    str(RAW_CACHE_ROOT / "single" / hashlib.sha256(str(src or file_value).encode()).hexdigest()[:20]))
+                for values in step_download_wizard(str(path), [], {}, anime, SERIES_NEW_OPT):
+                    for item in values[0]:
+                        item["flow"] = "single"
+                    yield values
+            except Exception as exc:
+                yield [], {}, gr.update(interactive=False), "❌ " + str(exc), gr.update(interactive=True)
+        else:
+            yield from step_download_wizard(src,selected,mapping,anime,SERIES_NEW_OPT)
+    download.click(download_source,[source,picks,file_map,series,local_file],[manifest,choices,next_button,status,download])
+    if not single:
+        list_button.click(step_list_batch_files,[source],[picks,file_map,status])
+    def next_step(items):
+        return _wizard_next(items)
+    next_button.click(next_step,[manifest],[source_group,subtitle_group])
+    back.click(lambda:(gr.update(visible=True),gr.update(visible=False)),outputs=[source_group,subtitle_group])
+    def invalidate():
+        return [],{},gr.update(interactive=False)
+    source.change(invalidate,outputs=[manifest,choices,next_button])
+    if not single:
+        picks.change(invalidate,outputs=[manifest,choices,next_button])
+    else:
+        local_file.change(invalidate,outputs=[manifest,choices,next_button])
+    def run(items, selection, anime, provider_v, key_v, model_v, base_v, codec_v, cq_v, count_v, logo_v):
+        if not items:
+            raise gr.Error("حمّل الملفات الأول.")
+        source_paths = "\n".join(item["path"] for item in items)
+        args = [source_paths,anime,SERIES_NEW_OPT,"bleach_style",cfg.get("wrap_mode","sequential"),cfg.get("soften_exclaim",True),
+                "Auto (سحب ترجمة MKV إن وجدت، وإلا Whisper)","large-v3",provider_v,key_v,model_v,base_v,
+                codec_v,cq_v,cfg.get("preset","p6"),cfg.get("x265_preset","slow"),"copy",
+                cfg.get("credit_translator",""),cfg.get("credit_typesetter",""),cfg.get("credit_encoder",""),False,
+                logo_v,cfg.get("logo_opacity",0.3),cfg.get("logo_scale",0.12),[],{},False,count_v,"grid","",items,selection]
+        completed = False
+        for result in step_batch_process(*args):
+            result = list(result)
+            failed = isinstance(result[8],dict) and result[8].get("visible") is True
+            completed = completed or (isinstance(result[9],dict) and result[9].get("visible") is True)
+            complete = completed
+            yield (result[0],result[1],result[2],result[5],result[6],result[7],result[14],
+                   gr.update(visible=failed),gr.update(visible=not failed and not complete),gr.update(visible=complete))
+    start.click(run,[manifest,choices,series,provider,key,model,base,codec,cq,concurrency,logo_position],
+                [progress,logs,preview,videos,ass,job,en_files,subtitle_group,processing_group,result_group])
+    upload_button.click(lambda: gr.update(visible=True),outputs=[processing_group],queue=False)
+    upload_button.click(step2_approve_and_upload,[job,dood,dood_key,drive,remote,folder,gr.State(False),series,gr.State(SERIES_NEW_OPT)],[progress,logs,links])
+    again.click(lambda:(gr.update(visible=True),gr.update(visible=False),gr.update(visible=False),gr.update(visible=False)),outputs=[source_group,subtitle_group,processing_group,result_group])
 
 
 if __name__ == "__main__":
