@@ -1785,11 +1785,18 @@ def step_batch_process(
 
         # ═══ الترجمة اليدوية لحلقات بعينها: أرقامها بتتحدد قبل التشغيل، وملفاتها بتترفع من الواجهة ═══
         manual_set: set = set()
-        for _tok in re.split(r"[,،;\s]+", str(manual_eps_text or "")):
-            if _tok.strip().isdigit():
-                _g = int(_tok.strip())
-                if 1 <= _g <= total:
+        _mtxt = str(manual_eps_text or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+        # نطاقات زي 3-5 أو 3~5 أو 3 الى 5، وبعدها أي رقم لوحده (3 / 03 / 003 كلهم نفس الحلقة)
+        for _a, _b in re.findall(r"(\d+)\s*(?:-|–|—|~|الى|إلى|to)\s*(\d+)", _mtxt):
+            _lo, _hi = sorted((int(_a), int(_b)))
+            for _g in range(_lo, min(_hi, total) + 1):
+                if _g >= 1:
                     manual_set.add(_g)
+        _mtxt_single = re.sub(r"(\d+)\s*(?:-|–|—|~|الى|إلى|to)\s*(\d+)", " ", _mtxt)
+        for _tok in re.findall(r"\d+", _mtxt_single):
+            _g = int(_tok)
+            if 1 <= _g <= total:
+                manual_set.add(_g)
         if manual_set:
             push(f"✍️ ترجمة يدوية للحلقات: {', '.join(f'EP{g:03d}' for g in sorted(manual_set))} — الباقي ترجمة تلقائية. ارفع الملفات من قسم ✍️ الترجمة اليدوية.")
 
