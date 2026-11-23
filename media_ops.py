@@ -1,3 +1,4 @@
+import base64
 import json
 import math
 import os
@@ -558,6 +559,24 @@ def probe_audio_codec(video_path: str) -> str:
         return out.splitlines()[0].strip().lower() if out else ""
     except Exception:
         return ""
+
+
+def extract_card_frame(video_path: str, frac: float = 0.5, width: int = 480) -> str:
+    """إطار JPEG واحد (base64) من الفيديو عند نسبة frac من مدته — لصور كروت التقدم.
+    بيرجع '' لو الفشل لأي سبب (مفيش فشل صامت في اللوج هنا لأن الاستدعاء متكرر)."""
+    try:
+        _, _, _, dur = probe_video_info(video_path)
+        t = max(0.5, float(dur or 0.0) * max(0.02, min(0.98, float(frac))))
+        res = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", video_path,
+             "-frames:v", "1", "-vf", f"scale={width}:-2", "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+            capture_output=True, timeout=30,
+        )
+        if res.returncode == 0 and res.stdout:
+            return base64.b64encode(res.stdout).decode("ascii")
+    except Exception:
+        pass
+    return ""
 
 
 def burn_and_compress_native(
