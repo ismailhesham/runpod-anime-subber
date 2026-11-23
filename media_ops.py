@@ -599,7 +599,8 @@ def burn_and_compress_native(
     """Single-pass NVENC burn: responsive ASS subtitles burned + compressed to MP4.
     When logo_path exists, the logo is overlaid (scaled, opacity-adjusted) in the chosen
     corner, subtitles burned on top. Missing logo = clean no-op."""
-    verify_required_fonts(fonts_dir)
+    if ass_path:
+        verify_required_fonts(fonts_dir)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     ass_filter = f"ass='{_escape_ffmpeg_path(os.path.abspath(ass_path))}':fontsdir='{_escape_ffmpeg_path(os.path.abspath(fonts_dir))}'"
 
@@ -715,7 +716,7 @@ def burn_and_compress_native(
         else:
             cmd = [
                 "ffmpeg", "-y", "-i", video_path,
-                "-vf", ass_filter, *v_args,
+                *(["-vf", ass_filter] if ass_path else []), *v_args,
                 *a_args,
                 "-movflags", "+faststart",
                 "-progress", "pipe:1",
@@ -723,7 +724,7 @@ def burn_and_compress_native(
             ]
 
         if log_cb:
-            log_cb(f"[ffmpeg] بدء الحرق والضغط لـ {Path(output_path).name} ({v_args[1]})...")
+            log_cb(f"[ffmpeg] بدء الترميز لـ {Path(output_path).name} ({v_args[1]})...")
         if progress_cb:
             progress_cb(0.5, f"تشغيل محرك {v_args[1]}...", Path(output_path).name)
 
@@ -793,10 +794,82 @@ def burn_and_compress_native(
     orig_mb = os.path.getsize(video_path) / (1024 * 1024)
     new_mb = os.path.getsize(output_path) / (1024 * 1024)
     if progress_cb:
-        progress_cb(100.0, "اكتمل الحرق والضغط 100% ✓", f"{orig_mb:.1f} MB → {new_mb:.1f} MB")
+        progress_cb(100.0, "اكتمل الترميز 100% ✓", f"{orig_mb:.1f} MB → {new_mb:.1f} MB")
     if log_cb:
         log_cb(f"[ffmpeg] اكتمل بنجاح: {orig_mb:.1f} MB -> {new_mb:.1f} MB ({output_path})")
     return output_path
+
+
+
+def burn_then_optional_compress(
+    video_path: str, ass_path: str, output_path: str, fonts_dir: str,
+    codec: str = "h264_nvenc", cq: int = 23, preset: str = "p6",
+    x265_preset: str = "slow", audio_bitrate: str = "160k",
+    logo_path: str = "", logo_position: str = "top-right",
+    logo_opacity: float = 0.30, logo_scale: float = 0.12,
+    log_cb=None, progress_cb=None, compress_after: bool = False,
+) -> str:
+    """Always burn first at quality 16; optionally encode a separate smaller delivery.
+    A good burn is never removed until the compressed delivery passes QC.
+    """
+    if not ass_path or not Path(ass_path).is_file():
+        raise ValueError("ملف الترجمة مطلوب لمرحلة الحرق الأساسية.")
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    token = str(time.time_ns())
+    burn = out.with_name(out.stem + ".burned." + token + ".mp4")
+    burn_tmp = out.with_name(out.stem + ".burning." + token + ".mp4")
+    compressed = out.with_name(out.stem + ".compressing." + token + ".mp4")
+    def log(message):
+        if log_cb:
+            log_cb(message)
+    def progress(stage, start, scale):
+        def emit(pct, metric, detail):
+            if progress_cb:
+                progress_cb(start + pct * scale, stage + " · " + metric, detail)
+        return emit
+    free = shutil.disk_usage(out.parent).free
+    if free < 256 * 1024 * 1024:
+        raise OSError("المساحة أقل من 256MB. فضّي مساحة قبل الحرق.")
+    if free < Path(video_path).stat().st_size * (6 if compress_after else 4):
+        log("⚠️ مساحة العمل قليلة بالنسبة لحجم المصدر. الحرق عالي الجودة ممكن يكبر، والضغط يحتاج وجود الملفين معًا؛ التقدير مش ضمان.")
+    log("🔥 BURN · حرق الترجمة واللوجو أولًا، جودة 16. مفيش تصغير حجم مستهدف في المرحلة دي.")
+    try:
+        burn_and_compress_native(video_path, ass_path, str(burn_tmp), fonts_dir,
+            codec=codec, cq=16, preset=preset, x265_preset=x265_preset,
+            audio_bitrate="copy", logo_path=logo_path, logo_position=logo_position,
+            logo_opacity=logo_opacity, logo_scale=logo_scale, log_cb=log_cb,
+            progress_cb=progress("BURN · الحرق", 0, 0.5 if compress_after else 0.95))
+        report = qc_burned_episode(video_path, str(burn_tmp), log_cb=log_cb)
+        if not report.get("ok"):
+            raise RuntimeError("فحص الملف المحروق فشل؛ الملف المؤقت محفوظ: " + str(burn_tmp))
+        os.replace(burn_tmp, burn)
+        if not compress_after:
+            log("⏭️ SKIP COMPRESSION · الضغط متوقف للحلقة. الملف المحروق هو الناتج النهائي.")
+            os.replace(burn, out)
+        else:
+            log("📦 COMPRESS · ضغط منفصل للملف المحروق، بدون حرق الترجمة أو اللوجو مرة تانية.")
+            if shutil.disk_usage(out.parent).free < max(burn.stat().st_size, 256 * 1024 * 1024):
+                raise OSError("مساحة الضغط غير كافية. الملف المحروق محفوظ: " + str(burn))
+            burn_and_compress_native(str(burn), "", str(compressed), fonts_dir,
+                codec=codec, cq=int(cq), preset=preset, x265_preset=x265_preset,
+                audio_bitrate=audio_bitrate, logo_path="", log_cb=log_cb,
+                progress_cb=progress("COMPRESS · الضغط", 50, 0.45))
+            report = qc_burned_episode(str(burn), str(compressed), log_cb=log_cb)
+            if not report.get("ok"):
+                raise RuntimeError("فحص النسخة المضغوطة فشل.")
+            os.replace(compressed, out)
+            burn.unlink()
+        if progress_cb:
+            progress_cb(100, "اكتمل الحرق" + (" والضغط المنفصل" if compress_after else " بدون ضغط إضافي"), out.name)
+        return str(out)
+    except BaseException as exc:
+        if burn.exists():
+            log("⚠️ الملف المحروق السليم محفوظ للاسترجاع: " + str(burn))
+        # Never promote a failed/partial compression to the final output.
+        if compressed.exists():
+            compressed.unlink()
+        raise
 
 
 def make_browser_preview(
