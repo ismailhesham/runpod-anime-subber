@@ -3340,6 +3340,8 @@ def build_ui() -> gr.Blocks:
     .episode-picker input[type=checkbox]:checked {background:#149cda!important;border-color:#67dbff!important}
     .episode-picker input[type=checkbox]:checked::after {content:"✓";color:white!important;font-size:18px!important;font-weight:900!important;line-height:18px!important}
     .episode-picker label:has(input:checked) {background:#143951!important;border:1px solid #4acbff!important}
+    .clear-flow .file-preview, .clear-flow .file-preview table, .clear-flow .file-preview tr, .clear-flow .file-preview td {background:#101b2c!important;color:#e0ecff!important}
+    .clear-flow .file-preview a {color:#65d9ff!important}
     .clear-flow button {font-size:16px!important}
     .clear-flow .prose {line-height:1.8}
     """
@@ -3356,6 +3358,19 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+def _wizard_source_text(source, uploaded_file):
+    """Use one explicit source, never silently prefer links over an upload."""
+    source = (source or "").strip()
+    if uploaded_file:
+        if source:
+            raise ValueError("اختار مصدر واحد: امسح الروابط أو احذف الملف المرفوع.")
+        path = Path(str(uploaded_file))
+        if not path.is_file():
+            raise ValueError("الملف المرفوع مش موجود. ارفعه تاني.")
+        return str(path)
+    return source
+
+
 def _build_clear_flow(single, cfg):
     manifest = gr.State([])
     choices = gr.State({})
@@ -3369,7 +3384,7 @@ def _build_clear_flow(single, cfg):
             local_file = gr.File(label="أو ارفع فيديو / ملف تورنت", type="filepath", file_types=[".mp4", ".mkv", ".torrent", ".webm"])
             picks = gr.State([])
         else:
-            local_file = gr.State(None)
+            local_file = gr.File(label="أو ارفع ملف تورنت من جهازك", type="filepath", file_types=[".torrent"], height=120)
             list_button = gr.Button("اعرض ملفات التورنت")
             picks = gr.CheckboxGroup(label="علّم على الحلقات المطلوبة", choices=[], interactive=True, elem_classes=["episode-picker"])
             picked_count = gr.Markdown("المختار: ٠ حلقات")
@@ -3437,9 +3452,14 @@ def _build_clear_flow(single, cfg):
     hidden_archive = gr.State(None)
     hidden_archive_text = gr.State(None)
     def download_source(src, selected, mapping, anime, file_value):
+        try:
+            resolved = _wizard_source_text(src, file_value)
+        except ValueError as exc:
+            yield [], {}, gr.update(interactive=False), "❌ " + str(exc), gr.update(interactive=True)
+            return
         if single:
             try:
-                if not src and not file_value:
+                if not resolved:
                     raise ValueError("حط رابط أو ارفع ملف الأول.")
                 if not anime.strip():
                     raise ValueError("اكتب اسم الأنمي الأول.")
@@ -3452,19 +3472,26 @@ def _build_clear_flow(single, cfg):
             except Exception as exc:
                 yield [], {}, gr.update(interactive=False), "❌ " + str(exc), gr.update(interactive=True)
         else:
-            yield from step_download_wizard(src,selected,mapping,anime,SERIES_NEW_OPT)
+            yield from step_download_wizard(resolved,selected,mapping,anime,SERIES_NEW_OPT)
     download.click(download_source,[source,picks,file_map,series,local_file],[manifest,choices,next_button,status,download])
     if not single:
-        def refresh_listing(src, selected, previous_source):
+        def refresh_listing(src, uploaded, selected, previous_source):
+            try:
+                src = _wizard_source_text(src, uploaded)
+            except ValueError as exc:
+                return gr.update(choices=[], value=[]), {}, "❌ " + str(exc), "", "المختار: ٠ حلقات"
             update, mapping, note = step_list_batch_files(src)
             valid = {value for _, value in update.get("choices", [])}
             kept = [value for value in (selected or []) if value in valid] if src == previous_source else []
             update["value"] = kept
             update["interactive"] = True
             return update, mapping, note, src, f"المختار: {len(kept)} حلقات"
-        list_button.click(refresh_listing,[source,picks,listed_source],[picks,file_map,status,listed_source,picked_count])
+        list_button.click(refresh_listing,[source,local_file,picks,listed_source],[picks,file_map,status,listed_source,picked_count])
         picks.change(lambda selected: f"المختار: {len(selected or [])} حلقات",[picks],[picked_count],queue=False)
-        source.change(lambda: (gr.update(choices=[],value=[]),{},"", "المختار: ٠ حلقات"),outputs=[picks,file_map,listed_source,picked_count],queue=False)
+        def clear_listing():
+            return gr.update(choices=[],value=[]), {}, "", "المختار: ٠ حلقات"
+        source.change(clear_listing,outputs=[picks,file_map,listed_source,picked_count],queue=False)
+        local_file.change(clear_listing,outputs=[picks,file_map,listed_source,picked_count],queue=False)
     def next_step(items):
         return _wizard_next(items)
     next_button.click(next_step,[manifest],[source_group,subtitle_group])
@@ -3474,8 +3501,7 @@ def _build_clear_flow(single, cfg):
     source.change(invalidate,outputs=[manifest,choices,next_button])
     if not single:
         picks.change(invalidate,outputs=[manifest,choices,next_button])
-    else:
-        local_file.change(invalidate,outputs=[manifest,choices,next_button])
+    local_file.change(invalidate,outputs=[manifest,choices,next_button])
     def run(items, selection, anime, provider_v, key_v, model_v, base_v, codec_v, cq_v, count_v, logo_v):
         if not items:
             raise gr.Error("حمّل الملفات الأول.")
