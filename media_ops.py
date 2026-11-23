@@ -546,6 +546,20 @@ def _parse_hms(val: str) -> float:
     return 0.0
 
 
+def probe_audio_codec(video_path: str) -> str:
+    """اسم كوديك أول تراك صوتي ('' لو مفيش صوت أو فشل الفحص)."""
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = (res.stdout or "").strip()
+        return out.splitlines()[0].strip().lower() if out else ""
+    except Exception:
+        return ""
+
+
 def burn_and_compress_native(
     video_path: str,
     ass_path: str,
@@ -573,13 +587,32 @@ def burn_and_compress_native(
     requested = codec
     if requested == "libx265" and log_cb:
         log_cb("وضع أصغر حجم: x265 على المعالج (preset slow) — أبطأ بكثير من كرت الشاشة.")
+    if requested == "hevc_nvenc" and log_cb:
+        log_cb("🎞️ وضع HEVC 10-bit (Main10): أعلى جودة في أقل حجم — بيشتغل على أي جهاز بيفك HEVC.")
+
+    # الصوت: نسخ كما هو (بدون إعادة ضغط) لو متوافق مع MP4، وإلا AAC مع سطر في اللوج
+    MP4_SAFE_AUDIO = {"aac", "mp3", "mp2", "ac3", "eac3", "opus", "flac", "alac"}
+    if (audio_bitrate or "").strip().lower() == "copy":
+        src_audio = probe_audio_codec(video_path)
+        if src_audio and src_audio not in MP4_SAFE_AUDIO:
+            if log_cb:
+                log_cb(f"⚠️ الصوت الأصلي ({src_audio}) مش مضمون داخل MP4 — هيتم تحويله AAC 160k بدل النسخ.")
+            a_args = ["-c:a", "aac", "-b:a", "160k"]
+        else:
+            a_args = ["-c:a", "copy"]
+            if log_cb:
+                log_cb(f"🎵 الصوت هيتنسخ زي ما هو بدون إعادة ضغط{f' ({src_audio})' if src_audio else ''}.")
+    else:
+        a_args = ["-c:a", "aac", "-b:a", audio_bitrate]
 
     def _build_v_args(eng: str) -> List[str]:
         if eng.endswith("_nvenc"):
+            hevc10 = eng == "hevc_nvenc"
             v = [
                 "-c:v", eng, "-preset", preset, "-rc", "vbr",
                 "-cq", str(cq), "-b:v", "0",
-                "-spatial-aq", "1", "-temporal-aq", "1", "-pix_fmt", "yuv420p",
+                "-spatial-aq", "1", "-temporal-aq", "1",
+                "-pix_fmt", "p010le" if hevc10 else "yuv420p",
             ]
             caps = _nvenc_opts(eng)
             if "-multipass" in caps:
@@ -591,7 +624,7 @@ def burn_and_compress_native(
             if "-tune" in caps:
                 v += ["-tune", "hq"]
             if eng == "hevc_nvenc":
-                v += ["-tag:v", "hvc1"]
+                v += ["-profile:v", "main10", "-tag:v", "hvc1"]
             return v
         if eng == "libx265":
             # بلا أي كاب على الأنظمة: x265 بيبني pool بكل أنوية المعالج تلقائياً
@@ -655,7 +688,7 @@ def burn_and_compress_native(
                 "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
                 "-filter_complex", fc,
                 "-map", "[vout]", "-map", "0:a?", *v_args,
-                "-c:a", "aac", "-b:a", audio_bitrate,
+                *a_args,
                 "-movflags", "+faststart",
                 "-progress", "pipe:1",
                 output_path,
@@ -664,7 +697,7 @@ def burn_and_compress_native(
             cmd = [
                 "ffmpeg", "-y", "-i", video_path,
                 "-vf", ass_filter, *v_args,
-                "-c:a", "aac", "-b:a", audio_bitrate,
+                *a_args,
                 "-movflags", "+faststart",
                 "-progress", "pipe:1",
                 output_path,
