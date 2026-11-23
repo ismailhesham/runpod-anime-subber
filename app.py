@@ -3342,6 +3342,7 @@ def build_ui() -> gr.Blocks:
     .episode-picker label:has(input:checked) {background:#143951!important;border:1px solid #4acbff!important}
     .clear-flow .file-preview, .clear-flow .file-preview table, .clear-flow .file-preview tr, .clear-flow .file-preview td {background:#101b2c!important;color:#e0ecff!important}
     .clear-flow .file-preview a {color:#65d9ff!important}
+    .clear-flow input[type=radio]:not(:disabled), .clear-flow label:has(input[type=radio]:not(:disabled)), .clear-flow input[type=checkbox]:not(:disabled) {cursor:pointer!important;pointer-events:auto!important}
     .clear-flow button {font-size:16px!important}
     .clear-flow .prose {line-height:1.8}
     """
@@ -3400,10 +3401,10 @@ def _build_clear_flow(single, cfg):
                 saved = (selections or {}).get(item["path"], {})
                 with gr.Group():
                     gr.Markdown("### " + html.escape(item["name"]))
-                    mode = gr.Radio(["أوتوماتيك", "ترجمة يدوية"], value=saved.get("mode", "أوتوماتيك"), label="الترجمة", key=("single-" if single else "batch-") + "mode-" + item["id"])
+                    mode = gr.Radio(["أوتوماتيك", "ترجمة يدوية"], value=saved.get("mode", "أوتوماتيك"), label="الترجمة", interactive=True, key=("single-" if single else "batch-") + "mode-" + item["id"])
                     with gr.Accordion("ارفع ترجمة يدوية لنفس الحلقة · SRT / ASS", open=saved.get("mode") == "ترجمة يدوية"):
                         upload = gr.File(label="ملف الترجمة اليدوية", type="filepath", file_types=[".srt", ".ass"], interactive=True, height=160, key=("single-" if single else "batch-") + "sub-" + item["id"])
-                    compress = gr.Checkbox(value=saved.get("compress",False), label="اضغط الحلقة بعد ما الحرق يخلص", key=("single-" if single else "batch-") + "compress-" + item["id"])
+                    compress = gr.Checkbox(value=saved.get("compress",False), label="اضغط الحلقة بعد ما الحرق يخلص", interactive=True, key=("single-" if single else "batch-") + "compress-" + item["id"])
                     if saved.get("subtitle"):
                         gr.Markdown("✓ ملف الترجمة محفوظ لنفس الحلقة")
                     def change(mode_value, upload_value, current, compress_value, item=item):
