@@ -169,6 +169,13 @@ def list_saved_series() -> List[Tuple[str, str]]:
                     out.append((f"📚 {name}", name))
     except Exception:
         pass
+    # Include the actual output library even when no glossary exists yet.
+    known = {value.casefold() for _, value in out}
+    if STORAGE_ROOT.is_dir():
+        for folder in sorted(STORAGE_ROOT.iterdir(), key=lambda p: p.name.casefold()):
+            if folder.is_dir() and not folder.name.startswith("_") and folder.name.casefold() not in known:
+                out.append(("📁 " + folder.name, folder.name))
+                known.add(folder.name.casefold())
     return out
 
 
@@ -1557,6 +1564,12 @@ def _wizard_subtitle_tracks(path):
     return tracks
 
 
+def _wizard_arabic_track(path):
+    tracks = [t for t in _wizard_subtitle_tracks(path) if t["supported"] and t.get("tags", {}).get("language", "").lower() in {"ar", "ara", "arabic"}]
+    # Prefer a full track over signs or forced-only tracks, then default.
+    return max(tracks, key=lambda t: (not bool(t.get("disposition", {}).get("forced")), "sign" not in t.get("tags", {}).get("title", "").lower(), t.get("disposition", {}).get("default", 0))) if tracks else None
+
+
 def _wizard_track_choices(tracks):
     choices = [("ارفع ملف SRT / ASS من جهازك", "upload")]
     for track in tracks:
@@ -1598,6 +1611,8 @@ def _wizard_choice(mode, upload, choices, item, compress=False):
         dest = dest_dir / ("subtitle" + source.suffix.lower())
         if source.resolve() != dest.resolve():
             shutil.copy2(source, dest)
+        if entry.get("subtitle") != str(dest):
+            entry.pop("source_kind", None)
         entry["subtitle"] = str(dest)
     updated[item["path"]] = entry
     return updated, gr.update(visible=mode == "ترجمة يدوية")
@@ -1944,12 +1959,20 @@ def step_batch_process(
         # ═══ الترجمة اليدوية لحلقات بعينها: أرقامها بتتحدد قبل التشغيل، وملفاتها بتترفع من الواجهة ═══
         manual_set: set = set()
         manual_by_path = {}
+        arabic_ready = set()
         if downloaded_manifest is not None:
             for index, path in enumerate(all_eps, 1):
                 choice = (subtitle_choices or {}).get(str(path.resolve()), {})
                 if choice.get("mode") == "ترجمة يدوية":
                     manual_set.add(index)
                     manual_by_path[str(path.resolve())] = choice["subtitle"]
+                else:
+                    track = _wizard_arabic_track(path)
+                    if track:
+                        manual_set.add(index)
+                        manual_by_path[str(path.resolve())] = _wizard_export_track(path, track)
+                        arabic_ready.add(str(path.resolve()))
+                        push(f"✓ {path.name}: ترجمة عربية جاهزة، بدون DeepSeek، الصياغة الأصلية مع ستايلنا البصري.")
         else:
             _mtxt = str(manual_eps_text or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
             # نطاقات زي 3-5 أو 3~5 أو 3 الى 5، وبعدها أي رقم لوحده (3 / 03 / 003 كلهم نفس الحلقة)
@@ -2020,6 +2043,7 @@ def step_batch_process(
                 credits=credits_dict if has_credits else None,
                 wrap_mode=wrap_mode,
                 soften_exclaim=soften_exclaim,
+                preserve_wording=downloaded_manifest is not None,
             )
             cb(f"✓ {ep_label_m}: ملف الـ ASS من الترجمة اليدوية جاهز للحرق.")
             return {"ep_label": ep_label_m, "work_dir": work_dir_m, "entries": entries_m, "ep_ass": str(ep_ass_m)}
@@ -2303,7 +2327,7 @@ def step_batch_process(
                                 except Exception as tg_exc:
                                     push(f"⚠️ فشل رفع {ep_label} على تيليجرام: {tg_exc} — الحلقة محفوظة ومكملين.")
                         shutil.rmtree(str(prep["work_dir"]), ignore_errors=True)
-                        if cleanup_temp:
+                        if cleanup_temp and vid.resolve().is_relative_to(RAW_CACHE_ROOT.resolve()):
                             try:
                                 vid.unlink(missing_ok=True)
                             except OSError:
@@ -2491,7 +2515,7 @@ def step_batch_process(
                         except Exception as tg_exc:
                             push(f"⚠️ فشل رفع {ep_label} على تيليجرام: {tg_exc} — الحلقة محفوظة ومكملين.")
                 shutil.rmtree(str(prep["work_dir"]), ignore_errors=True)
-                if cleanup_temp:
+                if cleanup_temp and vid.resolve().is_relative_to(RAW_CACHE_ROOT.resolve()):
                     try:
                         vid.unlink(missing_ok=True)
                     except OSError:
@@ -3417,7 +3441,11 @@ def _build_clear_flow(single, cfg):
     job = gr.State({})
     with gr.Column() as source_group:
         gr.Markdown("## ١ · مصدر الحلقة" if single else "## ١ · اختار الحلقات وحمّلها")
-        series = gr.Textbox(label="اسم الأنمي", placeholder="مثال: Bleach")
+        series_picker = gr.Dropdown(choices=[(SERIES_NEW_OPT, SERIES_NEW_OPT)] + list_saved_series(), value=SERIES_NEW_OPT, label="اختار أنمي موجود أو أنمي جديد", interactive=True)
+        refresh_series = gr.Button("حدّث قائمة الأنمي", size="sm")
+        series = gr.Textbox(label="اسم الأنمي", placeholder="مثال: Bleach", interactive=True)
+        series_picker.change(lambda value: gr.update(visible=value == SERIES_NEW_OPT), [series_picker], [series], queue=False)
+        refresh_series.click(lambda: gr.update(choices=[(SERIES_NEW_OPT, SERIES_NEW_OPT)] + list_saved_series()), outputs=[series_picker], queue=False)
         source = gr.Textbox(label="رابط الحلقة أو مسار فيديو محفوظ" if single else "روابط التورنت، رابط في كل سطر", lines=2)
         if single:
             local_file = gr.File(label="أو ارفع فيديو / ملف تورنت", type="filepath", file_types=[".mp4", ".mkv", ".torrent", ".webm"])
@@ -3440,8 +3468,25 @@ def _build_clear_flow(single, cfg):
                 with gr.Group():
                     gr.Markdown("### " + html.escape(item["name"]))
                     mode = gr.Radio(["أوتوماتيك", "ترجمة يدوية"], value=saved.get("mode", "أوتوماتيك"), label="الترجمة", interactive=True, key=("single-" if single else "batch-") + "mode-" + item["id"])
+                    if saved.get("mode", "أوتوماتيك") == "أوتوماتيك":
+                        try:
+                            arabic = _wizard_arabic_track(item["path"])
+                            if arabic:
+                                gr.Markdown("✓ ترجمة عربية جاهزة: " + html.escape(_wizard_track_choices([arabic])[1][0]) + "<br>هنتخطى DeepSeek. نفس الصياغة والتوقيت، بستايلنا البصري فقط.")
+                        except Exception:
+                            gr.Markdown("تعذر فحص وجود ترجمة عربية. افحص الملف قبل التشغيل.")
                     if saved.get("mode") == "ترجمة يدوية":
-                        gr.Markdown("نزّل مسار الترجمة، ترجمه برا الأداة، وبعدها ارفع ملفك المترجم تحت. الحرق اليدوي بيستخدم الملف اللي رفعته فقط، مش المسار الأصلي.")
+                        arabic = _wizard_arabic_track(item["path"])
+                        if arabic:
+                            gr.Markdown("✓ فيه ترجمة عربية جاهزة في الحلقة: " + html.escape(_wizard_track_choices([arabic])[1][0]))
+                            use_arabic = gr.Button("استخدم العربي الموجود للحرق بدون AI", size="sm")
+                            def choose_arabic(current, compress_value, item=item, track=arabic):
+                                original = _wizard_export_track(item["path"], track)
+                                updated = _wizard_choice("ترجمة يدوية", original, current, item, compress_value)[0]
+                                updated[item["path"]]["source_kind"] = "embedded_arabic"
+                                return updated
+                        gr.Markdown("ملفك المرفوع SRT / ASS هيتحرق بمقاسات وخطوط وألوان ومكان ستايل Celestial Dragons، مع نفس كلامك وتوقيتك من غير تعديل.")
+                        gr.Markdown("نزّل مسار الترجمة، ترجمه برا الأداة، وبعدها ارفع ملفك المترجم تحت. الحرق اليدوي بيستخدم ملفك المرفوع، أو العربي الموجود لو ضغطت زر استخدامه بنفسك.")
                         try:
                             tracks = _wizard_subtitle_tracks(item["path"])
                             if not tracks:
@@ -3461,8 +3506,10 @@ def _build_clear_flow(single, cfg):
                     with gr.Accordion("ارفع ترجمة يدوية لنفس الحلقة · SRT / ASS", open=saved.get("mode") == "ترجمة يدوية"):
                         upload = gr.File(label="ملف الترجمة اليدوية", type="filepath", file_types=[".srt", ".ass"], interactive=True, height=160, key=("single-" if single else "batch-") + "sub-" + item["id"])
                     compress = gr.Checkbox(value=saved.get("compress",False), label="اضغط الحلقة بعد ما الحرق يخلص", interactive=True, key=("single-" if single else "batch-") + "compress-" + item["id"])
+                    if saved.get("mode") == "ترجمة يدوية" and arabic:
+                        use_arabic.click(choose_arabic, [choices, compress], [choices], concurrency_id="subtitle-choices", concurrency_limit=1)
                     if saved.get("subtitle"):
-                        gr.Markdown("✓ ملف الترجمة محفوظ لنفس الحلقة")
+                        gr.Markdown("✓ العربي الموجود متحدد للحرق بدون AI" if saved.get("source_kind") == "embedded_arabic" else "✓ ملف الترجمة محفوظ لنفس الحلقة")
                     def change(mode_value, upload_value, current, compress_value, item=item):
                         return _wizard_choice(mode_value, upload_value, current, item, compress_value)
                     def save_choice(mode_value, upload_value, current, compress_value, item=item):
@@ -3508,7 +3555,8 @@ def _build_clear_flow(single, cfg):
     hidden_raw = gr.State(None)
     hidden_archive = gr.State(None)
     hidden_archive_text = gr.State(None)
-    def download_source(src, selected, mapping, anime, file_value):
+    def download_source(src, selected, mapping, anime, file_value, selected_series):
+        anime = anime if selected_series == SERIES_NEW_OPT else selected_series
         try:
             resolved = _wizard_source_text(src, file_value)
         except ValueError as exc:
@@ -3530,7 +3578,7 @@ def _build_clear_flow(single, cfg):
                 yield [], {}, gr.update(interactive=False), "❌ " + str(exc), gr.update(interactive=True)
         else:
             yield from step_download_wizard(resolved,selected,mapping,anime,SERIES_NEW_OPT)
-    download.click(download_source,[source,picks,file_map,series,local_file],[manifest,choices,next_button,status,download])
+    download.click(download_source,[source,picks,file_map,series,local_file,series_picker],[manifest,choices,next_button,status,download])
     if not single:
         def refresh_listing(src, uploaded, selected, previous_source):
             try:
@@ -3556,10 +3604,13 @@ def _build_clear_flow(single, cfg):
     def invalidate():
         return [],{},gr.update(interactive=False)
     source.change(invalidate,outputs=[manifest,choices,next_button])
+    series_picker.change(invalidate,outputs=[manifest,choices,next_button],queue=False)
+    series.change(invalidate,outputs=[manifest,choices,next_button],queue=False)
     if not single:
         picks.change(invalidate,outputs=[manifest,choices,next_button])
     local_file.change(invalidate,outputs=[manifest,choices,next_button])
-    def run(items, selection, anime, provider_v, key_v, model_v, base_v, codec_v, cq_v, count_v, logo_v):
+    def run(items, selection, anime, provider_v, key_v, model_v, base_v, codec_v, cq_v, count_v, logo_v, selected_series):
+        anime = anime if selected_series == SERIES_NEW_OPT else selected_series
         if not items:
             raise gr.Error("حمّل الملفات الأول.")
         source_paths = "\n".join(item["path"] for item in items)
@@ -3576,7 +3627,7 @@ def _build_clear_flow(single, cfg):
             complete = completed
             yield (result[0],result[1],result[2],result[5],result[6],result[7],result[14],
                    gr.update(visible=failed),gr.update(visible=not failed and not complete),gr.update(visible=complete))
-    start.click(run,[manifest,choices,series,provider,key,model,base,codec,cq,concurrency,logo_position],
+    start.click(run,[manifest,choices,series,provider,key,model,base,codec,cq,concurrency,logo_position,series_picker],
                 [progress,logs,preview,videos,ass,job,en_files,subtitle_group,processing_group,result_group])
     upload_button.click(lambda: gr.update(visible=True),outputs=[processing_group],queue=False)
     upload_button.click(step2_approve_and_upload,[job,dood,dood_key,drive,remote,folder,gr.State(False),series,gr.State(SERIES_NEW_OPT)],[progress,logs,links])
@@ -3603,4 +3654,9 @@ if __name__ == "__main__":
     if "delete_cache" in launch_sig:
         launch_kwargs["delete_cache"] = (86400, 86400)
 
+    from export_page import start_export_server
+    try:
+        export_ui = start_export_server(auth=launch_kwargs["auth"])
+    except Exception as exc:
+        print("Export page did not start: " + str(exc), flush=True)
     ui.queue().launch(**launch_kwargs)
