@@ -750,8 +750,8 @@ def load_settings() -> Dict:
         "codec": "hevc_nvenc",
         "preset": "p7",
         "x265_preset": "slow",
-        "cq": 26,
-        "audio_bitrate": "160k",
+        "cq": 27,
+        "audio_bitrate": "copy",
         "credit_translator": "",
         "credit_typesetter": "",
         "credit_encoder": "",
@@ -2551,7 +2551,14 @@ def build_ui() -> gr.Blocks:
                                         label="سرعة x265 (المعالج)",
                                     )
                                     cq = gr.Slider(minimum=18, maximum=30, step=1, value=cfg["cq"], label="الجودة CQ")
-                                    audio_bitrate = gr.Dropdown(choices=["128k", "160k", "192k"], value=cfg["audio_bitrate"], label="صوت AAC")
+                                    _audio_choices = [
+                                        ("نسخ الصوت الأصلي بدون ضغط · موصى به", "copy"),
+                                        ("AAC 128k", "128k"),
+                                        ("AAC 160k", "160k"),
+                                        ("AAC 192k", "192k"),
+                                    ]
+                                    _audio_val = cfg["audio_bitrate"] if cfg["audio_bitrate"] in ("copy", "128k", "160k", "192k") else "copy"
+                                    audio_bitrate = gr.Dropdown(choices=_audio_choices, value=_audio_val, label="الصوت")
                                 with gr.Row():
                                     logo_position = gr.Dropdown(
                                         choices=[("أعلى اليمين", "top-right"), ("أعلى الشمال", "top-left"), ("أسفل اليمين", "bottom-right"), ("أسفل الشمال", "bottom-left")],
