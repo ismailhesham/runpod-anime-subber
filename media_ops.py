@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v", ".ts"}
@@ -74,7 +74,7 @@ def probe_video_info(video_path: str) -> Tuple[int, int, float, float]:
 
 _EP_NUM_PATTERNS = [
     re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})"),
-    re.compile(r"(?:^|[\s_\-\[\(])(?:ep|episode|e)[\s_.\-]*(\d{1,4})(?:v\d+)?(?:[\s_\-\]\)\.\[]|$)", re.IGNORECASE),
+    re.compile(r"(?:^|[\s_\-\[\(.])(?:ep|episode|e)[\s_.\-]*(\d{1,4})(?:v\d+)?(?:[\s_\-\]\)\.\[]|$)", re.IGNORECASE),
     re.compile(r"-\s*(\d{1,4})(?:v\d+)?\s*[\[\.\-]"),
     re.compile(r"(?:^|[\s_\-\[\(])(\d{2,4})(?:v\d+)?(?:[\s_\-\]\)\.\[]|$)"),
 ]
@@ -1108,3 +1108,220 @@ def qc_burned_episode(
     )
     return report
 
+
+
+# ═══ أرشفة الحلقات (RAR/7z) ═══
+
+def find_archive_tool() -> Optional[str]:
+    """rar لو موجود (أرشيف rar حقيقي)، وإلا 7z (WinRAR بيفتحه برضه)."""
+    return shutil.which("rar") or shutil.which("7z") or shutil.which("7za")
+
+
+def make_rar_archive(
+    files: List[str],
+    out_path: str,
+    log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[Callable[[float, str, str], None]] = None,
+) -> str:
+    """يجمع ملفات في أرشيف واحد بوضع التخزين (بدون إعادة ضغط = سرعة النسخ).
+    بيرجع مسار الأرشيف الفعلي (.rar مع rar أو .7z مع 7z)."""
+    def log(m: str) -> None:
+        if callable(log_cb):
+            try:
+                log_cb(m)
+            except Exception:
+                pass
+
+    def prog(p: float, met: str, det: str = "") -> None:
+        if callable(progress_cb):
+            try:
+                progress_cb(p, met, det)
+            except Exception:
+                pass
+
+    tool = find_archive_tool()
+    if not tool:
+        raise RuntimeError("مفيش أداة أرشفة على البود — نفّذ: apt-get install -y rar p7zip-full")
+    files = [f for f in files if os.path.isfile(f)]
+    if not files:
+        raise RuntimeError("مفيش ملفات للأرشفة.")
+
+    out = Path(out_path)
+    is_7z = os.path.basename(tool).startswith("7z")
+    if is_7z:
+        out = out.with_suffix(".7z")
+    total = len(files)
+    total_bytes = sum(os.path.getsize(f) for f in files)
+    work_dir = os.path.dirname(os.path.abspath(files[0]))
+    names = [os.path.basename(f) for f in files]
+
+    if is_7z:
+        cmd = [tool, "a", "-mx=0", "-y", str(out)] + names
+    else:
+        cmd = [tool, "a", "-m0", "-o+", str(out)] + names
+
+    log(f"📦 بدء الأرشفة ({os.path.basename(tool)}) · {total} ملف · {total_bytes / 1048576:.0f} ميجا ← {out.name}")
+    prog(1.0, f"0/{total} ملف", "أرشفة بدون إعادة ضغط")
+    proc = subprocess.Popen(
+        cmd, cwd=work_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace",
+    )
+    done = 0
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        matched = next((n for n in names if n in line), None)
+        if matched:
+            done += 1
+            log(f"   ➕ {matched}")
+            prog(min(99.0, done * 100.0 / total), f"{done}/{total} ملف", "أرشفة بدون إعادة ضغط")
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"أداة الأرشفة فشلت (كود {rc}) — راجع السجل.")
+    if not out.is_file() or out.stat().st_size == 0:
+        raise RuntimeError("الأرشيف ما اتعملش — راجع السجل.")
+    size_mb = out.stat().st_size / 1048576
+    log(f"✅ الأرشيف جاهز: {out.name} ({size_mb:.0f} ميجا، {total} ملف)")
+    prog(100.0, "اكتمل الأرشيف ✓", f"{out.name} · {size_mb:.0f}MB")
+    return str(out)
+
+
+# ═══ تسمية الإخراج ببراند الأداة ═══
+
+BRAND_TAG = "[Animerza]"
+
+_NAME_JUNK_RE = re.compile(
+    r"(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|h\.?264|h\.?265|hevc|av1|avc|aac[0-9.]*|flac|opus|mp3|"
+    r"10bit|8bit|web[- ]?dl|webrip|bdrip|blu[- ]?ray|hdtv|dvd|dual[- ]?audio|multi[- ]?subs?|"
+    r"multiple subtitle|proper|repack|subbed|dubbed|raw|batch|ddp[0-9.]*|dd\+|dts|truehd|atmos|5\.1|2\.0)\b"
+)
+_SE_TOKEN_RE = re.compile(r"(?i)S(\d{1,2})\s*E(\d{1,4})")
+_SEASON_WORD_RE = re.compile(r"(?i)\bseason\s*(\d{1,2})\b")
+_EPISODE_WORD_RE = re.compile(r"(?i)\b(?:episode|ep)\s*(\d{1,4})\b")
+
+
+def magnet_display_name(link: str) -> str:
+    """اسم العرض dn= من رابط ماجنت (فوري، بدون شبكة)."""
+    m = re.search(r"[?&]dn=([^&]+)", link or "")
+    if not m:
+        return ""
+    try:
+        import urllib.parse as _up
+        return _up.unquote_plus(m.group(1)).strip()
+    except Exception:
+        return m.group(1).strip()
+
+
+def dotted_core(name: str) -> str:
+    """يفضّل الفواصل بنقط: 'Black Clover S02E09' ← 'Black.Clover.S02E09'."""
+    s = re.sub(r"[\s_]+", ".", (name or "").strip())
+    s = re.sub(r"[^\w.\-\[\]]+", "", s)
+    s = re.sub(r"\.{2,}", ".", s).strip(".")
+    return s
+
+
+def branded_stem(core: str, quality: str = "") -> str:
+    """الاسم النهائي بدون امتداد: Core.1080p.[Animerza]"""
+    c = dotted_core(core)
+    if quality:
+        c = f"{c}.{quality}"
+    return f"{c}.{BRAND_TAG}"
+
+
+def quality_token(height: int) -> str:
+    if not height:
+        return ""
+    if height >= 2000:
+        return "2160p"
+    if height >= 1000:
+        return "1080p"
+    if height >= 700:
+        return "720p"
+    if height >= 400:
+        return "480p"
+    return f"{int(height)}p"
+
+
+def clean_torrent_title(raw: str) -> Dict[str, Any]:
+    """ينضّف اسم تورنت/ملف فانساب ← {series, season, episode, core} بنقط.
+    مثال: '[SubsPlease] Black Clover S02 - 09 (1080p) [ABC123].mkv' ← Black.Clover.S02E09"""
+    stem = Path((raw or "").strip()).stem
+    s = re.sub(r"\[[^\]]*\]", " ", stem)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = s.replace("_", " ")
+    season: Optional[int] = None
+    episode: Optional[int] = None
+    m = _SE_TOKEN_RE.search(s)
+    if m:
+        season, episode = int(m.group(1)), int(m.group(2))
+        series_part = s[: m.start()]
+    else:
+        ms, me = _SEASON_WORD_RE.search(s), _EPISODE_WORD_RE.search(s)
+        series_part = s
+        if ms and me:
+            season, episode = int(ms.group(1)), int(me.group(1))
+            series_part = s[: min(ms.start(), me.start())]
+        elif me:
+            episode = int(me.group(1))
+            series_part = s[: me.start()]
+        elif ms:
+            season = int(ms.group(1))
+            series_part = s[: ms.start()]
+        else:
+            mdash = re.search(r"(?i)\bS(\d{1,2})\s*[-–—]\s*(\d{1,4})\b", s)
+            if mdash and int(mdash.group(2)) not in _RESOLUTION_NUMBERS:
+                season, episode = int(mdash.group(1)), int(mdash.group(2))
+                series_part = s[: mdash.start()]
+            else:
+                mnum = re.search(r"[-–—]\s*(\d{1,4})\s*$", s)
+                if mnum and int(mnum.group(1)) not in _RESOLUTION_NUMBERS:
+                    episode = int(mnum.group(1))
+                    series_part = s[: mnum.start()]
+                else:
+                    epn = extract_episode_number(stem)
+                    if epn is not None:
+                        episode = epn
+                        mtok = re.search(rf"(?<!\d){epn}(?!\d)", s)
+                        series_part = s[: mtok.start()] if mtok else s
+    series = _NAME_JUNK_RE.sub(" ", series_part)
+    series = re.sub(r"[\-–—]+", " ", series)
+    series = re.sub(r"\s+", " ", series).strip(" .-")
+    core = dotted_core(series)
+    if season is not None and episode is not None:
+        tail = f"S{season:02d}E{episode:02d}"
+    elif episode is not None:
+        tail = f"EP{episode:02d}"
+    elif season is not None:
+        tail = f"S{season:02d}"
+    else:
+        tail = ""
+    if tail:
+        core = f"{core}.{tail}" if core else tail
+    if not core:
+        core = dotted_core(stem)
+    return {"series": series, "season": season, "episode": episode, "core": core}
+
+
+def torrent_episode_name(
+    source_link: Optional[str] = None,
+    torrent_file: Optional[str] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+) -> str:
+    """اسم حلقة نضيف (بنقط) من ماجنت/.torrent — '' لو مش متاح."""
+    link = (source_link or "").strip()
+    if link.lower().startswith("magnet:"):
+        dn = magnet_display_name(link)
+        if dn:
+            return clean_torrent_title(dn)["core"]
+    try:
+        files = list_torrent_files(source_link, torrent_file, log_cb=log_cb)
+    except Exception:
+        return ""
+    vids = [f for f in files if Path(f[1]).suffix.lower() in VIDEO_EXTENSIONS]
+    if not vids:
+        return ""
+    biggest = max(vids, key=lambda f: f[2])
+    return clean_torrent_title(Path(biggest[1]).name)["core"]
