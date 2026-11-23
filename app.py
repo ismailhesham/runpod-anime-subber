@@ -28,7 +28,15 @@ from media_ops import (
     list_torrent_files,
     extract_episode_number,
     make_browser_preview,
+    make_rar_archive,
     probe_video_info,
+    branded_stem,
+    clean_torrent_title,
+    dotted_core,
+    magnet_display_name,
+    quality_token,
+    torrent_episode_name,
+    BRAND_TAG,
     rclone_remote_configured,
     drive_download_file,
     upload_to_doodstream,
@@ -1039,7 +1047,22 @@ def step1_process_for_preview(
         yield pack(render_progress_hud(0.0, "تنبيه · لا يوجد مصدر", "أدخل رابط أو اختر حلقة محفوظة", "—", "—", mode="error"), state_val={})
         return
 
-    auto_base_name = episode_name.strip() or (Path(eff_1080).stem if (eff_1080 and os.path.isfile(eff_1080)) else "")
+    auto_base_name = episode_name.strip()
+    if not auto_base_name:
+        ln1080 = (link_1080 or "").strip()
+        core1080 = ""
+        try:
+            if ln1080.lower().startswith("magnet:") and magnet_display_name(ln1080):
+                core1080 = clean_torrent_title(magnet_display_name(ln1080))["core"]
+            elif ln1080.lower().split("?")[0].endswith(".torrent") or (os.path.isfile(ln1080) and ln1080.lower().endswith(".torrent")):
+                core1080 = torrent_episode_name(ln1080, None)
+        except Exception:
+            core1080 = ""
+        if core1080:
+            auto_base_name = core1080
+            push(f"🏷️ اسم الحلقة اتسحب تلقائياً من التورنت: {auto_base_name}")
+    if not auto_base_name:
+        auto_base_name = Path(eff_1080).stem if (eff_1080 and os.path.isfile(eff_1080)) else ""
     ep_folder_name = _safe_name(auto_base_name)
     ep_out_dir = STORAGE_ROOT / ep_folder_name
     work_dir = RAW_CACHE_ROOT / "_work" / ep_folder_name
@@ -1161,7 +1184,7 @@ def step1_process_for_preview(
         for q_label, vid_path in downloaded.items():
             burn_vid = str(vid_path)
             vw, vh, _, _ = probe_video_info(burn_vid)
-            q_ass = str(ep_out_dir / f"{ep_folder_name}_{q_label}_AR.ass")
+            q_ass = str(ep_out_dir / f"{branded_stem(auto_base_name, q_label)}.ass")
             write_responsive_ass(
                 entries=entries,
                 translations=translations,
@@ -1177,7 +1200,7 @@ def step1_process_for_preview(
                 ass_out = q_ass
             push(f"📐 تم توليد ملف ASS نسبي لجودة {q_label} ({vw}x{vh})")
 
-            out_mp4 = str(ep_out_dir / f"{ep_folder_name}_{q_label}_AR.mp4")
+            out_mp4 = str(ep_out_dir / f"{branded_stem(auto_base_name, q_label)}.mp4")
             yield from run_live(
                 burn_and_compress_native,
                 video_path=burn_vid,
@@ -1393,8 +1416,10 @@ def step_batch_process(
         g2=gr.update(),
         dls=gr.update(),
         lnk=gr.update(),
+        arch=gr.update(),
+        arch_txt=gr.update(),
     ):
-        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val, g1, g2, dls, lnk)
+        return (hud_html, "\n".join(logs[-150:]), preview_val, local_dd, raw_dd, vids_val, ass_val, state_val, g1, g2, dls, lnk, arch, arch_txt)
 
     def run_live(fn: Callable, *args, badge: str, title: str, mode: str = "cyan", accepts_progress_cb: bool = True, **kwargs):
         ev_q: "queue.Queue[Tuple[str, object]]" = queue.Queue()
@@ -1467,6 +1492,7 @@ def step_batch_process(
         return
 
     series_safe = _safe_name(series_name.strip() or "Anime_Season")
+    series_dot = dotted_core(series_name.strip() or "Anime_Season") or "Anime"
     series_root = STORAGE_ROOT / series_safe
     ass_root = series_root / "_ass_files"
     try:
@@ -1484,6 +1510,7 @@ def step_batch_process(
         render_progress_hud(0.0, "INIT · PREPARING", "تم تجهيز مساحة العمل — بدء طحن الموسم...", "—", "—"),
         g1=gr.update(visible=False),
         lnk=gr.update(visible=False),
+        arch=gr.update(visible=False),
     )
 
 
@@ -1533,6 +1560,34 @@ def step_batch_process(
         for pos, vp in enumerate(all_eps, 1):
             epn = extract_episode_number(vp.name)
             push(f"   {pos:03d}. {vp.name}" + (f"  (حلقة {epn})" if epn is not None else ""))
+
+        # ═══ فولدر الموسم بالبراند: One.Piece.EP1-50.1080p.[Animerza] ═══
+        _res_set = set()
+        for _vp in all_eps:
+            try:
+                _, _vh, _, _ = probe_video_info(str(_vp))
+                if _vh:
+                    _res_set.add(quality_token(_vh))
+            except Exception:
+                pass
+        _q_folder = f".{next(iter(_res_set))}" if len(_res_set) == 1 and next(iter(_res_set)) else ""
+        branded_folder = f"{series_dot}.EP1-{total}{_q_folder}.{BRAND_TAG}"
+        new_root = STORAGE_ROOT / branded_folder
+        if new_root != series_root:
+            try:
+                if new_root.is_dir():
+                    series_root = new_root  # استكمال في فولدر موجود بنفس الاسم
+                else:
+                    if series_root.is_dir() and any(series_root.iterdir()):
+                        series_root.rename(new_root)
+                    else:
+                        new_root.mkdir(parents=True, exist_ok=True)
+                    series_root = new_root
+                ass_root = series_root / "_ass_files"
+                ass_root.mkdir(parents=True, exist_ok=True)
+                push(f"📁 فولدر الموسم: {series_root.name}")
+            except Exception as exc:
+                push(f"⚠️ تعذر تسمية فولدر الموسم بالبراند ({exc}) — هيكمل بالاسم الحالي.")
 
         # ═══ هيكل الإخراج: فولدر واحد، يتقسم لفولدرات 35 حلقة للأنمي الطويل ═══
         split_parts = total > 35
@@ -1600,10 +1655,20 @@ def step_batch_process(
         # الحلقات الجاهزة مسبقاً تتخطى من الأول من غير أي إعادة تجهيز (استكمال بعد ريستارت)
         skip_set: set = set()
         for gi0 in range(1, total + 1):
-            out0 = part_dir_for(gi0) / f"{series_safe}_EP{gi0:03d}_AR.mp4"
-            if out0.exists() and out0.stat().st_size > 1024 * 1024:
+            d0 = part_dir_for(gi0)
+            found0 = None
+            if d0.is_dir():
+                cands = sorted(d0.glob(f"{series_dot}.EP{gi0:03d}.*.mp4"))
+                cands = [c for c in cands if "_preview" not in c.stem and c.stat().st_size > 1024 * 1024]
+                if cands:
+                    found0 = cands[0]
+            if found0 is None:
+                legacy0 = d0 / f"{series_safe}_EP{gi0:03d}_AR.mp4"
+                if legacy0.exists() and legacy0.stat().st_size > 1024 * 1024:
+                    found0 = legacy0
+            if found0 is not None:
                 skip_set.add(gi0)
-                rendered[f"EP{gi0:03d}"] = str(out0)
+                rendered[f"EP{gi0:03d}"] = str(found0)
         if skip_set:
             push(f"⏭️ {len(skip_set)} حلقة جاهزة مسبقاً — هتتخطى من غير تجهيز.")
 
@@ -1704,7 +1769,7 @@ def step_batch_process(
             )
 
             vw_p, vh_p, _, _ = probe_video_info(str(vid_p))
-            ep_ass_p = ass_root / f"{series_safe}_{ep_label_p}_AR.ass"
+            ep_ass_p = ass_root / f"{branded_stem(f'{series_dot}.{ep_label_p}', quality_token(vh_p))}.ass"
             write_responsive_ass(
                 entries=entries_p,
                 translations=translations_p,
@@ -1759,11 +1824,16 @@ def step_batch_process(
         for gi, vid in enumerate(all_eps, 1):
             ep_label = f"EP{gi:03d}"
             grind_ctx["gi"] = gi
-            out_mp4 = part_dir_for(gi) / f"{series_safe}_{ep_label}_AR.mp4"
 
             if gi in skip_set:
-                push(f"⏭️ {ep_label} جاهزة مسبقاً — تخطي ({out_mp4.name})")
+                push(f"⏭️ {ep_label} جاهزة مسبقاً — تخطي ({Path(rendered[ep_label]).name})")
                 continue
+
+            try:
+                _, _vh0, _, _ = probe_video_info(str(vid))
+            except Exception:
+                _vh0 = 0
+            out_mp4 = part_dir_for(gi) / (branded_stem(f"{series_dot}.{ep_label}", quality_token(_vh0)) + ".mp4")
 
             push(f"━━━━━━ {ep_label} ({gi}/{total}): {vid.name} ━━━━━━")
 
@@ -1937,6 +2007,8 @@ def step_batch_process(
             state_val={"folder": str(series_root), "files": rendered},
             g2=gr.update(visible=True),
             dls=gr.update(visible=True),
+            arch=gr.update(visible=(done_n > 1)),
+            arch_txt=gr.update(value=f'<div style="color:#eaf6ff;font-size:16px;font-weight:600;padding:2px 0 8px;">الدفعة خلصت ({done_n} حلقة). تجمعهم في أرشيف واحد؟</div>') if done_n > 1 else gr.update(),
         )
         yield pack(
             done_hud,
@@ -2078,8 +2150,9 @@ def step2_approve_and_upload(
                     if not series_eff or series_eff == SERIES_NEW_OPT:
                         series_eff = (series_name or "").strip()
                     if not series_eff:
-                        m = re.match(r"(.+?)_EP\d+", Path(mp40).stem)
-                        series_eff = m.group(1) if m else "Anime"
+                        stem0 = re.sub(r"\.\[Animerza\]$", "", Path(mp40).stem)
+                        m = re.match(r"(.+?)[_.](?:S\d{1,2}E\d{1,4}|EP?\d{1,4})[_.].*", stem0) or re.match(r"(.+?)_EP\d+", stem0)
+                        series_eff = (m.group(1).replace(".", " ").replace("_", " ").strip() if m else "Anime") or "Anime"
                     try:
                         tg_link = yield from run_upload_live(
                             tgchan.upload_episode, series_eff, ep_n, mp40,
@@ -2109,6 +2182,208 @@ def step2_approve_and_upload(
     except BaseException as exc:
         push(f"🛑 توقف مفاجئ أثناء الرفع ({type(exc).__name__}): {exc}\n{traceback.format_exc()[-800:]}\n🗂️ السجل الكامل محفوظ في: {RUN_LOG_FILE}")
         raise
+
+
+
+# ═══ أرشفة الحلقات الجاهزة (RAR/7z) ═══
+
+def list_series_dirs() -> List[str]:
+    """مجلدات الأنمي الجاهزة في مساحة التخزين (يستبعد المجلدات الداخلية)."""
+    try:
+        return sorted(d.name for d in STORAGE_ROOT.iterdir() if d.is_dir() and not d.name.startswith("_"))
+    except Exception:
+        return []
+
+
+def list_series_episodes(series_dir: str) -> List[str]:
+    """حلقات MP4 الجاهزة داخل مجلد أنمي (مع مجلدات Part لو موجودة)."""
+    base = STORAGE_ROOT / (series_dir or "")
+    if not base.is_dir():
+        return []
+    out: List[str] = []
+    for p in sorted(base.rglob("*.mp4"), key=lambda p: (extract_episode_number(p.name) or 99999, p.name)):
+        if "_preview" in p.stem or any(part.startswith("_") for part in p.relative_to(base).parts[:-1]):
+            continue
+        out.append(str(p.relative_to(base)))
+    return out
+
+
+def _rar_refresh_eps(series_dir: str):
+    eps = list_series_episodes(series_dir)
+    return gr.update(choices=eps, value=eps)
+
+
+def _archive_name_for(base_name: str, files: List[str]) -> str:
+    """One.Piece.EP1-50.1080p.[Animerza].rar — المدى والجودة من الملفات نفسها."""
+    base = re.sub(r"[\s_]+", ".", (base_name or "").strip()).strip(".")
+    base = re.sub(r"\.\[Animerza\]$", "", base, flags=re.IGNORECASE)
+    base = re.sub(r"_AR$", "", base)
+    base = re.sub(r"\.(2160p|1080p|720p|480p)$", "", base, flags=re.IGNORECASE)
+    base = re.sub(r"\.EP\d+(-\d+)?$", "", base, flags=re.IGNORECASE)  # المدى بييجي من الملفات
+    eps = sorted({n for n in (extract_episode_number(os.path.basename(f)) for f in files) if n})
+    qs = {m.group(1) for f in files if (m := re.search(r"[._](2160p|1080p|720p|480p)[._]", os.path.basename(f)))}
+    q_tok = f".{next(iter(qs))}" if len(qs) == 1 else ""
+    if len(eps) >= 2:
+        return f"{base}.EP{eps[0]}-{eps[-1]}{q_tok}.{BRAND_TAG}.rar"
+    if len(eps) == 1:
+        return f"{base}.EP{eps[0]}{q_tok}.{BRAND_TAG}.rar"
+    return f"{base}{q_tok}.{BRAND_TAG}.rar"
+
+
+def _skip_archive():
+    _append_disk_log(f"[{time.strftime('%H:%M:%S')}] 📦 تم تخطي الأرشيف — الحلقات هتفضل منفصلة.")
+    return gr.update(visible=False)
+
+
+def _stream_archive(files: List[str], out_path: str, push: Callable[[str], None]):
+    """يشغّل make_rar_archive في خيط وينقل سطور السجل لحظة بلحظة. بيرجع المسار أو يرمي الخطأ."""
+    ev_q: "queue.Queue[str]" = queue.Queue()
+    res_box: Dict[str, object] = {}
+
+    def _worker():
+        try:
+            res_box["val"] = make_rar_archive(files, out_path, log_cb=lambda m: ev_q.put(m))
+        except BaseException as exc:
+            res_box["err"] = exc
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    while t.is_alive() or not ev_q.empty():
+        try:
+            push(str(ev_q.get(timeout=0.3)))
+        except queue.Empty:
+            pass
+        yield
+    if "err" in res_box:
+        raise res_box["err"]
+    return res_box["val"]
+
+
+def step_autofill_name(link_1080, file_1080, saved_raw_1080, link_720, file_720, link_480, file_480):
+    """يملا خانة اسم الحلقة من اسم التورنت/الملف (زرار ⚡)."""
+    src_link = (link_1080 or "").strip() or (link_720 or "").strip() or (link_480 or "").strip()
+    src_file = file_1080 or file_720 or file_480
+    is_torrent_file = bool(src_file) and str(src_file).lower().endswith(".torrent")
+    if src_link.lower().startswith("magnet:") or src_link.lower().split("?")[0].endswith(".torrent") or is_torrent_file:
+        core = torrent_episode_name(src_link, src_file if is_torrent_file else None)
+        if core:
+            return gr.update(value=core)
+        return gr.update()
+    f = saved_raw_1080 if (saved_raw_1080 and os.path.isfile(saved_raw_1080)) else src_file
+    if f and os.path.isfile(f):
+        core = clean_torrent_title(Path(f).stem)["core"]
+        if core:
+            return gr.update(value=core)
+    return gr.update()
+
+
+def step_archive_batch(job_state: Dict):
+    """أرشيف واحد لكل مجلد من دفعة الموسم اللي خلصت (بعد موافقة المستخدم)."""
+    logs: List[str] = []
+    results: List[str] = []
+
+    def push(m: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {m}"
+        logs.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    def pack_status() -> str:
+        return "\n".join(results[-20:])
+
+    def log_text() -> str:
+        return "\n".join(logs[-150:])
+
+    if not job_state or not job_state.get("folder"):
+        push("⚠️ مفيش دفعة خلصت — شغّل الموسم الأول.")
+        yield (pack_status(), log_text(), gr.update())
+        return
+    base = Path(job_state["folder"])
+    dirs: List[Path] = []
+    if base.is_dir():
+        part_dirs = sorted([d for d in base.iterdir() if d.is_dir() and d.name.startswith("Part")])
+        dirs = part_dirs if part_dirs else [base]
+    groups: List[Tuple[Path, List[Path]]] = []
+    for d in dirs:
+        mp4s = sorted([p for p in d.glob("*.mp4") if "_preview" not in p.stem],
+                      key=lambda p: (extract_episode_number(p.name) or 99999, p.name))
+        if mp4s:
+            groups.append((d, mp4s))
+    if not groups:
+        push("⚠️ مفيش حلقات MP4 في فولدر الدفعة.")
+        yield (pack_status(), log_text(), gr.update())
+        return
+    total_files = sum(len(g[1]) for g in groups)
+    push(f"📦 طلب أرشيف الدفعة: {total_files} حلقة في {len(groups)} مجلد.")
+    archives: List[str] = []
+    for d, mp4s in groups:
+        out_name = _archive_name_for(base.name, [str(p) for p in mp4s])
+        out_path = str(d / out_name)
+        try:
+            gen = _stream_archive([str(p) for p in mp4s], out_path, push)
+            while True:
+                try:
+                    next(gen)
+                except StopIteration as si:
+                    archives.append(si.value)
+                    break
+                yield (pack_status(), log_text(), gr.update())
+            size_mb = os.path.getsize(archives[-1]) / 1048576
+            results.append(f"✅ {Path(archives[-1]).name} — {len(mp4s)} حلقة · {size_mb:.0f}MB")
+        except Exception as exc:
+            push(f"❌ فشل أرشيف {out_name}: {exc}")
+            results.append(f"❌ {out_name}: {exc}")
+        yield (pack_status(), log_text(), gr.update())
+    if archives:
+        push(f"✅ اكتمل الأرشيف: {len(archives)} أرشيف جاهز في فولدر الموسم.")
+    else:
+        push("❌ كل محاولات الأرشيف فشلت.")
+    yield (pack_status(), log_text(), gr.update(value=archives))
+
+
+def step_archive_selected(series_dir: str, picked_eps: Optional[List[str]]):
+    """أرشيف عند الطلب لحلقات جاهزة يختارها المستخدم من أي مجلد أنمي."""
+    lines: List[str] = []
+
+    def push(m: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {m}"
+        lines.append(line)
+        _append_disk_log(line)
+        print(line, flush=True)
+
+    def status() -> str:
+        return "\n".join(lines[-40:])
+
+    if not (series_dir or "").strip():
+        yield "⚠️ اختر مجلد الأنمي الأول."
+        return
+    base = STORAGE_ROOT / series_dir.strip()
+    if not base.is_dir():
+        yield "⚠️ المجلد مش موجود على البود."
+        return
+    picked = [p for p in (picked_eps or []) if p]
+    if not picked:
+        yield "⚠️ اختر حلقة واحدة على الأقل."
+        return
+    files = [str(base / rel) for rel in picked]
+    files = [f for f in files if os.path.isfile(f)]
+    if not files:
+        yield "⚠️ الملفات المختارة مش موجودة (اتمسحت؟)."
+        return
+    out_name = _archive_name_for(base.name, files)
+    out_path = str(base / out_name)
+    try:
+        gen = _stream_archive(files, out_path, push)
+        while True:
+            try:
+                next(gen)
+            except StopIteration as si:
+                push(f"📁 المسار: {si.value}")
+                break
+            yield status()
+    except Exception as exc:
+        push(f"❌ فشل الأرشيف: {exc}")
+    yield status()
 
 
 def _build_blocks_kwargs() -> Dict:
@@ -2147,9 +2422,10 @@ def build_ui() -> gr.Blocks:
                             with gr.Row():
                                 episode_name = gr.Textbox(
                                     label="📌 اسم الحلقة / مجلد الإخراج",
-                                    placeholder="مثال: Bleach_EP366 (أو اتركه فارغاً ليأخذ اسم الملف)",
-                                    scale=2,
+                                    placeholder="اتركه فاضي وهيتسحب من التورنت",
+                                    scale=3,
                                 )
+                                autoname_btn = gr.Button("⚡ من التورنت", size="sm", scale=0, min_width=100)
                                 with gr.Column(scale=2):
                                     series_picker = gr.Dropdown(
                                         choices=[(SERIES_NEW_OPT, SERIES_NEW_OPT)] + list_saved_series(),
@@ -2310,6 +2586,16 @@ def build_ui() -> gr.Blocks:
                                 enable_telegram = gr.Checkbox(value=bool(_tg0["enabled"]), label="ارفع كل حلقة على تيليجرام أول بأول بعد ما تخلص")
                                 tg_status = gr.Textbox(value=_tg0["status_text"], label="حالة تيليجرام", lines=4, interactive=False)
 
+                            with gr.Accordion("📦 أرشيف الحلقات الجاهزة", open=False, elem_classes=["sb-accordion"]):
+                                _sd0 = list_series_dirs()
+                                _eps0 = list_series_episodes(_sd0[0]) if _sd0 else []
+                                with gr.Row():
+                                    rar_series_dd = gr.Dropdown(choices=_sd0, value=(_sd0[0] if _sd0 else None), label="مجلد الأنمي", interactive=True)
+                                    rar_refresh_btn = gr.Button("🔄", size="sm", scale=0, min_width=36)
+                                rar_eps_cb = gr.CheckboxGroup(choices=_eps0, value=_eps0, label="الحلقات")
+                                rar_make_btn = gr.Button("📦 اعمل أرشيف للمختار", variant="primary")
+                                rar_status = gr.Textbox(label="النتيجة", lines=5, interactive=False)
+
                             step1_btn = gr.Button(
                                 "⚔️ ARISE · ابدأ الطحن — ترجمة وحرق وضغط MP4 [STRIKE]",
                                 variant="primary",
@@ -2333,6 +2619,14 @@ def build_ui() -> gr.Blocks:
                             )
 
                             back_btn = gr.Button("↩️ رجوع — تجهيز حلقة جديدة", size="sm")
+
+                        with gr.Column(visible=False, elem_classes=["sb-wiz-step"]) as archive_group:
+                            gr.HTML('<div style="font-weight:700;color:#9fe3ff;border:1px solid rgba(127,216,255,.35);background:rgba(20,40,70,.55);padding:8px 14px;border-radius:10px;margin:10px 0;letter-spacing:.5px;font-size:15px;">📦 أرشيف الدفعة</div>')
+                            archive_prompt_md = gr.HTML("")
+                            with gr.Row():
+                                archive_yes_btn = gr.Button("📦 اعمل أرشيف واحد", variant="primary")
+                                archive_no_btn = gr.Button("لا، سيبهم منفصلة", variant="secondary")
+                            archive_result = gr.Textbox(label="نتيجة الأرشيف", lines=6, interactive=False)
 
                     with gr.Column(scale=1):
                         preview_player = gr.Video(label="📺 مشغّل معاينة الحلقة بعد المحو والحرق")
@@ -2372,6 +2666,13 @@ def build_ui() -> gr.Blocks:
             tg_login_btn.click(fn=tgchan.ui_complete_login, inputs=[tg_code, tg_password], outputs=[tg_status])
             tg_setup_btn.click(fn=tgchan.ui_ensure_channel, inputs=[tg_channel_title], outputs=[tg_status])
             enable_telegram.change(fn=tgchan.ui_set_enabled, inputs=[enable_telegram], outputs=[tg_status])
+
+        autoname_btn.click(fn=step_autofill_name, inputs=[link_1080, file_1080, saved_raw_1080, link_720, file_720, link_480, file_480], outputs=[episode_name])
+        archive_yes_btn.click(fn=step_archive_batch, inputs=[job_state], outputs=[archive_result, log_box, out_video_files])
+        archive_no_btn.click(fn=_skip_archive, outputs=[archive_group])
+        rar_series_dd.change(fn=_rar_refresh_eps, inputs=[rar_series_dd], outputs=[rar_eps_cb])
+        rar_refresh_btn.click(fn=lambda: gr.update(choices=list_series_dirs()), outputs=[rar_series_dd])
+        rar_make_btn.click(fn=step_archive_selected, inputs=[rar_series_dd, rar_eps_cb], outputs=[rar_status])
 
         refresh_raw_btn.click(fn=lambda: gr.update(choices=[""] + list_cached_raw_videos()), outputs=[saved_raw_1080])
         refresh_local_btn.click(fn=lambda: gr.update(choices=list_local_outputs()), outputs=[local_dropdown])
@@ -2422,6 +2723,7 @@ def build_ui() -> gr.Blocks:
                 progress_hud, log_box, preview_player, local_dropdown, saved_raw_1080,
                 out_video_files, out_ass_file, job_state,
                 step1_group, step2_group, downloads_group, links_box,
+                archive_group, archive_prompt_md,
             ],
         )
 
@@ -2442,8 +2744,9 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=False),
                 gr.update(visible=False),
                 gr.update(value="", visible=False),
+                gr.update(visible=False),
             ),
-            outputs=[step1_group, step2_group, downloads_group, links_box],
+            outputs=[step1_group, step2_group, downloads_group, links_box, archive_group],
         )
 
     return demo
