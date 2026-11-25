@@ -1,0 +1,4 @@
+subber_secrets.json
+*.secrets.json
+.env
+__pycache__/
